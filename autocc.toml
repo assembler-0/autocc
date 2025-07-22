@@ -1,0 +1,11 @@
+# autocc configuration file
+
+# Add include directories here,
+# For example,
+# includes = ["/usr/include/custom_lib", "/home/user/another_lib/include"]
+includes = []
+
+# Add libraries to link against here
+# For example:
+# libs = ["-L/usr/lib -lcustom_lib", "-lanother_lib"]
+libs = []
