@@ -334,7 +334,7 @@ public:
         writeConfigCache();
         return_code = compileAndLink();
     }
-
+//testing
     explicit AutoCC() : is_fresh_build(false) {
         if (!readConfigCache()) {
             out::error("Cache not found. Please run 'autocc init' or 'autocc rescan' to configure the project.");
