@@ -21,7 +21,7 @@
 #define DATE __DATE__
 #define TIME __TIME__
 #define VERSION "v0.1"
-
+//TODO: FIX EVERYTHING
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
 
