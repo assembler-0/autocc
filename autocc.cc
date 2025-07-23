@@ -15,6 +15,10 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#define DATE __DATE__
+#define TIME __TIME__
+#define VERSION "v0.1"
+
 namespace fs = std::filesystem;
 
 // A global mutex for ensuring threads do not interleave cout/cerr writes
@@ -555,10 +559,15 @@ void show_help() {
         "  (no command)  Builds the project incrementally. If not configured, prompts for setup.\n"
         "  init          Prompts for configuration and creates a new build environment. Overwrites existing config.\n"
         "  rescan        Clears the cache and performs a full dependency scan before building.\n"
-        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all cxxflags manually.\n"
+        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all flags manually.\n"
         "  clean         Removes the build directory and cache.\n"
+        "  version       Show current version, built date and time.\n"
         "  help          Shows this help message.\n"
     );
+}
+
+void show_version() {
+    fmt::print("AutoCC {} compiled on {} {}", VERSION, TIME, DATE);
 }
 
 void user_init(Config& config) {
@@ -596,7 +605,10 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-
+        if (command == "version" || command == "--version" || command == "-v") {
+            show_version();
+            return 0;
+        }
         if (command == "help" || command == "--help") {
             show_help();
             return 0;
