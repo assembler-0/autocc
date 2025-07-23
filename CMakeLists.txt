@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.30)
 project(autocc LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_FLAGS "-O3 -march=native -ffast-math -mtune=native")
 add_executable(autocc autocc.cc)
 target_link_libraries(autocc fmt stdc++fs)
 install(TARGETS autocc DESTINATION ${CMAKE_INSTALL_BINDIR})
