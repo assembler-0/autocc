@@ -8,25 +8,34 @@
 #include <set>
 #include <unordered_set>
 #include <unordered_map>
-#include <cstdlib>
-#include <thread> // For parallel compilation
-#include <atomic> // For thread-safe operations
-#include <mutex>  // For thread-safe output
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <fmt/chrono.h>
+
+#include "log.hpp"
+#include "utils.hpp"
 
 #define DATE __DATE__
 #define TIME __TIME__
 #define VERSION "v0.1"
 
 namespace fs = std::filesystem;
+using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
 
-// A global mutex for ensuring threads do not interleave cout/cerr writes
-std::mutex g_output_mutex;
+std::mutex g_output_mutex; // Definition for the extern in out.hpp
+
+// --- Constants ---
+static constexpr auto CACHE_DIR_NAME = ".autocc_cache";
+static constexpr auto CONFIG_FILE_NAME = "config.cache";
+static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
+static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 
 template <>
-struct fmt::formatter<std::filesystem::path> : formatter<std::string_view> {
-    auto format(const std::filesystem::path& p, format_context& ctx) const {
+struct fmt::formatter<fs::path> : formatter<std::string_view> {
+    auto format(const fs::path& p, format_context& ctx) const {
         return formatter<std::string_view>::format(p.string(), ctx);
     }
 };
@@ -40,6 +49,7 @@ struct Config {
     std::string cflags = "-march=native -std=c11 -O2 -pipe";
     std::string ldflags;
     std::string build_dir = ".autocc_build";
+    bool use_pch = true;
     std::vector<std::string> include_dirs;
     std::vector<std::string> external_libs;
     bool manual_mode = false;
@@ -52,7 +62,8 @@ private:
         std::vector<std::string> pkg_configs;
     };
 
-
+    // The detection map remains largely the same...
+    // (This map is good, so I'll omit it for brevity to focus on the new logic)
     std::unordered_map<std::string, DetectionRule> detectionMap = {
         // --- Core System & Standard-ish Libraries ---
         // These are fundamental and very common.
@@ -138,6 +149,7 @@ private:
         {"gtest/gtest.h",   {.direct_libs = {"-lgtest", "-lgtest_main", "-lpthread"}}}, // Google Test
         {"catch2/catch.hpp",{/* Header-only */}},                // Catch2
     };
+    std::unordered_map<std::string, std::string> pkg_cache; // Cache for pkg-config results
 
 public:
     void detect(const std::vector<std::string>& includes, Config& config) {
@@ -148,230 +160,147 @@ public:
         for (const auto& include : includes) {
             for (const auto& [header_signature, rule] : detectionMap) {
                 if (include.find(header_signature) != std::string::npos) {
-                    // Add direct library cxxflags
-                    for (const auto& lib : rule.direct_libs) {
-                        found_direct_libs.insert(lib);
-                    }
-
-                    // Process pkg-config dependencies
+                    for (const auto& lib : rule.direct_libs) found_direct_libs.insert(lib);
                     for (const auto& pkg_name : rule.pkg_configs) {
-                        if (!processed_pkg_configs.contains(pkg_name)) {
-                            auto pkg_result = getPkgConfigFlags(pkg_name);
-                            if (!pkg_result.empty()) {
-                                additional_ldflags += " " + pkg_result;
-                                {
-                                    std::lock_guard lock(g_output_mutex);
-                                    fmt::print("[INFO] Found dependency '{}', adding cxxflags via pkg-config.\n", pkg_name);
-                                }
-                            } else {
-                                 std::lock_guard lock(g_output_mutex);
-                                 fmt::print(stderr, "[WARN] Found include for '{}' but 'pkg-config {}' failed. Is it installed?\n", pkg_name, pkg_name);
-                            }
-                            processed_pkg_configs.insert(pkg_name);
+                        if (processed_pkg_configs.contains(pkg_name)) continue;
+
+                        auto pkg_result = getPkgConfigFlags(pkg_name);
+                        if (!pkg_result.empty()) {
+                            additional_ldflags += " " + pkg_result;
+                            out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
+                        } else {
+                            out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
                         }
+                        processed_pkg_configs.insert(pkg_name);
                     }
                 }
             }
         }
-
         config.external_libs.assign(found_direct_libs.begin(), found_direct_libs.end());
-        // Prepend a space only if there are cxxflags to add
-        if (!additional_ldflags.empty()) {
-            config.ldflags += " " + additional_ldflags;
-        }
+        if (!additional_ldflags.empty()) config.ldflags += additional_ldflags;
     }
 
 private:
-    static std::string getPkgConfigFlags(const std::string& package) {
-        // Query for both library and compiler cxxflags from pkg-config
+    std::string getPkgConfigFlags(const std::string& package) {
+        if (pkg_cache.contains(package)) return pkg_cache[package];
+
         const std::string cmd = fmt::format("pkg-config --libs --cflags {} 2>/dev/null", package);
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) return "";
 
         std::string result;
         char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            result += buffer;
-        }
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) result += buffer;
         pclose(pipe);
 
-        if (!result.empty() && result.back() == '\n') {
-            result.pop_back();
-        }
-        return result;
+        if (!result.empty() && result.back() == '\n') result.pop_back();
+        return pkg_cache[package] = result;
     }
 };
 
 class IncludeParser {
-public:
-    static std::vector<std::string> getAllIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) {
-        std::unordered_set<std::string> unique_includes;
-        std::vector<fs::path> files_to_scan;
-        std::unordered_set<fs::path> scanned_files; // To prevent infinite loops
-
-        // Start by scanning the main source files (.cpp, .c)
-        files_to_scan.insert(files_to_scan.end(), sourceFiles.begin(), sourceFiles.end());
-
-        std::regex include_regex(R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_");
-
-        // --- The Recursive Scanning Loop ---
-        while (!files_to_scan.empty()) {
-            fs::path current_file = files_to_scan.back();
-            files_to_scan.pop_back();
-
-            // Skip files we've already processed to avoid cycles (e.g., a.h includes b.h, b.h includes a.h)
-            if (scanned_files.contains(current_file)) {
-                continue;
-            }
-            scanned_files.insert(current_file);
-
-            std::ifstream file_stream(current_file);
-            if (!file_stream.is_open()) {
-                // This can happen if a local header can't be found. We'll just skip it.
-                continue;
-            }
-
-            std::string line;
-            while (std::getline(file_stream, line)) {
-                std::smatch matches;
-                if (std::regex_search(line, matches, include_regex)) {
-                    bool is_system_include = matches[1].matched;
-                    const auto& match_str = is_system_include ? matches[1].str() : matches[2].str();
-
-                    unique_includes.insert(match_str);
-
-                    // If it's a local include ("..."), we need to find that file and scan it too.
-                    if (!is_system_include) {
-                        fs::path included_path = findHeader(match_str, current_file.parent_path(), include_dirs);
-                        if (!included_path.empty()) {
-                            files_to_scan.push_back(included_path);
-                        }
-                    }
-                }
-            }
-        }
-
-        return {unique_includes.begin(), unique_includes.end()};
-    }
-
 private:
-    // Helper function to find the full path of a local header file.
-    static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
-        // 1. Check relative to the current file's directory
-        fs::path potential_path = relative_to / header_name;
-        if (fs::exists(potential_path)) {
-            return potential_path;
-        }
+    std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
 
-        // 2. Check all the -I include directories
+    // Finds a header file in the search paths.
+    static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
+        fs::path potential_path = relative_to / header_name;
+        if (fs::exists(potential_path)) return fs::canonical(potential_path);
+
         for (const auto& dir_flag : include_dirs) {
             if (dir_flag.rfind("-I", 0) == 0) {
                 fs::path base_dir = dir_flag.substr(2);
                 potential_path = base_dir / header_name;
-                if (fs::exists(potential_path)) {
-                    return potential_path;
+                if (fs::exists(potential_path)) return fs::canonical(potential_path);
+            }
+        }
+        return {};
+    }
+
+public:
+    // This function now builds a complete dependency map for all source files.
+    [[nodiscard]] DependencyMap parseSourceDependencies(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
+        DependencyMap dep_map;
+        for (const auto& src_file : sourceFiles) {
+            std::unordered_set<fs::path> dependencies;
+            std::vector<fs::path> files_to_scan = {src_file};
+            std::unordered_set<fs::path> scanned_files;
+
+            while (!files_to_scan.empty()) {
+                fs::path current_file = files_to_scan.back();
+                files_to_scan.pop_back();
+
+                if (scanned_files.contains(current_file)) continue;
+                scanned_files.insert(current_file);
+
+                std::ifstream file_stream(current_file);
+                if (!file_stream.is_open()) continue;
+
+                std::string line;
+                while (std::getline(file_stream, line)) {
+                    std::smatch matches;
+                    if (std::regex_search(line, matches, include_regex)) {
+                        if (bool is_local_include = matches[2].matched) {
+                            const auto& header_name = matches[2].str();
+                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                                dependencies.insert(header_path);
+                                files_to_scan.push_back(header_path);
+                            }
+                        }
+                    }
+                }
+            }
+            dep_map[src_file] = dependencies;
+        }
+        return dep_map;
+    }
+
+    // A simpler function to get all unique includes for library detection.
+    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles) const {
+        std::unordered_set<std::string> unique_includes;
+        for (const auto& file : sourceFiles) {
+            std::ifstream stream(file);
+            std::string line;
+            while (std::getline(stream, line)) {
+                std::smatch matches;
+                if (std::regex_search(line, matches, include_regex)) {
+                    unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
                 }
             }
         }
-
-        return {}; // Return empty path if not found
+        return {unique_includes.begin(), unique_includes.end()};
     }
 };
 
 
-// --- The Main Build System Logic ---
-
 class AutoCC {
 public:
     int return_code = 0;
-
-    // Constructor for a fresh scan or re-scan
-    explicit AutoCC(Config cfg) : config(std::move(cfg)) {
-        source_files = findSourceFiles(root);
-        if (source_files.empty()) {
-            fmt::print(stderr, "[!] FATAL:  No source files (.c, .cpp, .s, etc.) found in the current directory.\n");
-            return_code = 1;
-            return;
-        }
-
-        if (!config.manual_mode) {
-            fmt::print("[?] Starting automatic dependency scan...\n");
-            scanLocalHeaders();
-            detectLibraries();
-        }
-
-        writeCache();
-        return_code = compileAndLink();
+    void writeConfigCache() const {
+        fs::create_directories(cache_dir);
+        std::ofstream file(config_file);
+        file << "cxx:" << config.cxx << "\n";
+        file << "cc:" << config.cc << "\n";
+        file << "as:" << config.as << "\n";
+        file << "name:" << config.name << "\n";
+        file << "cxxflags:" << config.cxxflags << "\n";
+        file << "cflags:" << config.cflags << "\n";
+        file << "ldflags:" << config.ldflags << "\n";
+        file << "build_dir:" << config.build_dir << "\n";
+        file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
+        for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
+        for (const auto& lib : config.external_libs) file << "lib:" << lib << "\n";
     }
 
-    // Constructor for building from cache
-    explicit AutoCC() {
-        if (!readCache()) {
-            fmt::print(stderr, "[!] FATAL:  Cache not found. Please run 'autocc init' to configure the project.\n");
-            return_code = 1;
-            return;
-        }
-        source_files = findSourceFiles(root);
-        if (source_files.empty()) {
-            fmt::print(stderr, "[!] FATAL:  No source files found.\n");
-            return_code = 1;
-            return;
-        }
-        return_code = compileAndLink();
-    }
-
-private:
-    Config config;
-    const fs::path root = ".";
-    const fs::path cache_file_path = root / ".autocc_cache" / "config.cache";
-    std::vector<fs::path> source_files;
-    LibraryDetector lib_detector;
-
-    void scanLocalHeaders() {
-        std::set<std::string> header_dirs;
-        for (const auto& entry : fs::recursive_directory_iterator(root)) {
-            if (entry.is_regular_file()) {
-                const std::string ext = entry.path().extension().string();
-                if (ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
-                    header_dirs.insert(entry.path().parent_path().string());
-                }
-            }
-        }
-        for (const auto& dir : header_dirs) {
-            config.include_dirs.push_back(fmt::format("-I{}", dir));
-        }
-    }
-
-    void detectLibraries() {
-        // The call to getAllIncludes now needs the include_dirs from the config
-        const auto all_includes = IncludeParser::getAllIncludes(source_files, config.include_dirs);
-        lib_detector.detect(all_includes, config);
-    }
-
-    void writeCache() const {
-        fs::create_directories(cache_file_path.parent_path());
-        std::ofstream cache_file(cache_file_path);
-        cache_file << "cxx:" << config.cxx << std::endl;
-        cache_file << "cc:" << config.cc << std::endl;
-        cache_file << "as:" << config.as << std::endl;
-        cache_file << "name:" << config.name << std::endl;
-        cache_file << "cxxflags:" << config.cxxflags << std::endl;
-        cache_file << "cflags:" << config.cflags << std::endl;
-        cache_file << "ldflags:" << config.ldflags << std::endl;
-        cache_file << "build_dir:" << config.build_dir << std::endl;
-        for (const auto& dir : config.include_dirs) cache_file << "include:" << dir << std::endl;
-        for (const auto& lib : config.external_libs) cache_file << "lib:" << lib << std::endl;
-    }
-
-    bool readCache() {
-        if (!fs::exists(cache_file_path)) return false;
-        std::ifstream cache_file(cache_file_path);
+    bool readConfigCache() {
+        if (!fs::exists(config_file)) return false;
+        std::ifstream file(config_file);
         std::string line;
-        while (std::getline(cache_file, line)) {
-            auto delimiter_pos = line.find(':');
-            if (delimiter_pos == std::string::npos) continue;
-            std::string_view key = std::string_view(line).substr(0, delimiter_pos);
-            std::string_view value = std::string_view(line).substr(delimiter_pos + 1);
+        while (std::getline(file, line)) {
+            auto pos = line.find(':');
+            if (pos == std::string::npos) continue;
+            std::string_view key = std::string_view(line).substr(0, pos);
+            std::string_view value = std::string_view(line).substr(pos + 1);
 
             if (key == "cxx") config.cxx = value;
             else if (key == "cc") config.cc = value;
@@ -381,170 +310,324 @@ private:
             else if (key == "cflags") config.cflags = value;
             else if (key == "ldflags") config.ldflags = value;
             else if (key == "build_dir") config.build_dir = value;
+            else if (key == "use_pch") config.use_pch = (value == "true");
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
         }
         return true;
     }
+    explicit AutoCC(Config cfg) : config(std::move(cfg)), is_fresh_build(true) {
+        const auto ignored_dirs = getIgnoredDirs();
+        source_files = find_source_files(root, ignored_dirs);
+        if (source_files.empty()) {
+            out::error("No source files (.c, .cpp, .s, etc.) found in the current directory.");
+            return_code = 1;
+            return;
+        }
+
+        if (!config.manual_mode) {
+            out::info("Starting automatic dependency scan...");
+            scanLocalHeaders();
+            detectLibraries();
+        }
+
+        writeConfigCache();
+        return_code = compileAndLink();
+    }
+
+    explicit AutoCC() : is_fresh_build(false) {
+        if (!readConfigCache()) {
+            out::error("Cache not found. Please run 'autocc init' or 'autocc rescan' to configure the project.");
+            return_code = 1;
+            return;
+        }
+        const auto ignored_dirs = getIgnoredDirs();
+        source_files = find_source_files(root, ignored_dirs);
+        if (source_files.empty()) {
+            out::error("No source files found.");
+            return_code = 1;
+            return;
+        }
+        return_code = compileAndLink();
+    }
+    Config config;
+private:
+
+    const fs::path root = ".";
+    const fs::path cache_dir = root / CACHE_DIR_NAME;
+    const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
+    const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
+    bool is_fresh_build;
+
+    std::vector<fs::path> source_files;
+    LibraryDetector lib_detector;
+    IncludeParser include_parser;
+    DependencyMap dependency_map;
+
+    std::unordered_set<std::string> getIgnoredDirs() const {
+        return {".git", config.build_dir, CACHE_DIR_NAME};
+    }
+
+    void scanLocalHeaders() {
+        std::set<fs::path> header_dirs;
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            if (entry.is_regular_file()) {
+                const std::string ext = entry.path().extension().string();
+                if (ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
+                    header_dirs.insert(entry.path().parent_path());
+                }
+            }
+        }
+        for (const auto& dir : header_dirs) {
+            config.include_dirs.push_back(fmt::format("-I{}", dir.string()));
+        }
+    }
+
+    void detectLibraries() {
+        const auto all_includes = include_parser.getAllUniqueIncludes(source_files);
+        lib_detector.detect(all_includes, config);
+    }
+
+    // --- Cache Management ---
+
+
+    void writeDepCache() const {
+        std::ofstream file(dep_cache_file);
+        for(const auto& [source, headers] : dependency_map) {
+            file << source.string() << ";";
+            for(const auto& header : headers) {
+                file << header.string() << ",";
+            }
+            file << "\n";
+        }
+    }
+
+    void readDepCache() {
+        if (!fs::exists(dep_cache_file)) return;
+        std::ifstream file(dep_cache_file);
+        std::string line;
+        while(std::getline(file, line)) {
+            auto semi_pos = line.find(';');
+            if (semi_pos == std::string::npos) continue;
+            fs::path source_file(line.substr(0, semi_pos));
+
+            std::string headers_str = line.substr(semi_pos + 1);
+            size_t start = 0;
+            size_t end = headers_str.find(',');
+            while(end != std::string::npos) {
+                dependency_map[source_file].insert(fs::path(headers_str.substr(start, end-start)));
+                start = end + 1;
+                end = headers_str.find(',', start);
+            }
+        }
+    }
+    // --- Build Logic ---
 
     std::string getCompiler(const fs::path& file) const {
         const std::string ext = file.extension().string();
         if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return config.cxx;
         if (ext == ".c") return config.cc;
         if (ext == ".s" || ext == ".S" || ext == ".asm") return config.as;
-        return config.cxx; // Default to C++ compiler
+        return config.cxx;
     }
 
-    static std::vector<fs::path> findSourceFiles(const fs::path& dir) {
-        std::vector<fs::path> files;
-        // Avoid recursing into build or cache directories
-        std::unordered_set<std::string> ignored_dirs = {".git", ".autocc_build", ".autocc_cache"};
-
-        for (auto& p : fs::recursive_directory_iterator(dir)) {
-            // Skip ignored directories
-            bool ignore = false;
-            for(const auto& part : p.path()){
-                if(ignored_dirs.contains(part.string())) {
-                    ignore = true;
-                    break;
-                }
-            }
-            if(ignore) continue;
-
-            if (p.is_regular_file()) {
-                const std::string ext = p.path().extension().string();
-                 if (ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".s" ||
-                     ext == ".S" || ext == ".asm" || ext == ".c++" || ext == ".cxx") {
-                    files.push_back(p.path());
+    // --- Pre-Compiled Header (PCH) Generation ---
+    fs::path generatePCH(const fs::path& build_path, std::string& pch_flags) {
+        out::info("Analyzing for Pre-Compiled Header generation...");
+        // Find headers included in > 50% of C++ files
+        std::unordered_map<std::string, int> include_counts;
+        int cpp_file_count = 0;
+        for (const auto& src : source_files) {
+            if (getCompiler(src) != config.cxx) continue;
+            cpp_file_count++;
+            // This is a simplified scan for PCH candidates.
+            std::ifstream stream(src);
+            std::string line;
+            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_"); // System headers only
+            while(std::getline(stream, line)) {
+                std::smatch matches;
+                if(std::regex_search(line, matches, pch_candidate_regex)) {
+                    include_counts[matches[1].str()]++;
                 }
             }
         }
-        return files;
+
+        if (cpp_file_count < 3) {
+            out::info("PCH skipped: Not enough C++ source files.");
+            return {};
+        }
+
+        std::vector<std::string> pch_headers;
+        for(const auto& [header, count] : include_counts) {
+            if (count > cpp_file_count / 2) {
+                pch_headers.push_back(header);
+            }
+        }
+
+        if (pch_headers.empty()) {
+             out::info("PCH skipped: No sufficiently common headers found.");
+             return {};
+        }
+
+        fs::path pch_source = build_path / PCH_HEADER_NAME;
+        fs::path pch_out = pch_source.string() + ".gch";
+        out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
+
+        std::ofstream pch_file(pch_source);
+        for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
+        pch_file.close();
+
+        const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
+            config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
+
+        out::command("{}", pch_compile_cmd);
+        auto result = execute(pch_compile_cmd);
+        if (result.exit_code != 0) {
+            out::warn("PCH generation failed. Continuing without it.");
+            out::warn("Compiler error: {}", result.stderr_output);
+            return {};
+        }
+
+        // Flag to use the PCH during compilation
+        pch_flags = fmt::format("-include {}", pch_source.string());
+        return pch_out;
     }
 
     int compileAndLink() {
         const fs::path build_path = config.build_dir;
         fs::create_directories(build_path);
 
-        // --- Step 1: Identify which files need to be recompiled ---
+        // --- Step 1: Update & Load Dependency Information ---
+        if(is_fresh_build) {
+            dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
+            writeDepCache();
+        } else {
+            readDepCache();
+        }
+
+        // --- Step 2: Generate PCH if enabled ---
+        std::string pch_flags;
+        fs::path pch_file;
+        auto pch_time = fs::file_time_type::min();
+        if (config.use_pch) {
+            pch_file = generatePCH(build_path, pch_flags);
+            if(fs::exists(pch_file)) pch_time = fs::last_write_time(pch_file);
+        }
+
+        // --- Step 3: Identify files needing recompilation (The Smart Way) ---
         std::vector<fs::path> files_to_compile;
         std::vector<fs::path> object_files;
-
-        // Get the latest modification time of any header file for dependency checking.
-        // A more advanced system would track per-file header dependencies.
-        auto latest_header_time = fs::file_time_type::min();
-        for (const auto& include_dir_str : config.include_dirs) {
-             if (include_dir_str.rfind("-I", 0) == 0) {
-                fs::path header_dir = include_dir_str.substr(2);
-                if (!fs::exists(header_dir)) continue;
-                for (const auto& entry : fs::recursive_directory_iterator(header_dir)) {
-                    if (entry.is_regular_file()) {
-                         const std::string ext = entry.path().extension().string();
-                         if (ext == ".h" || ext == ".hpp") {
-                             if (entry.last_write_time() > latest_header_time) {
-                                 latest_header_time = entry.last_write_time();
-                             }
-                         }
-                    }
-                }
-             }
-        }
+        out::info("Checking dependencies...");
 
         for (const auto& src_file : source_files) {
-            fs::path obj_file = build_path / (src_file.stem().string() + ".o");
+            fs::path obj_file = build_path / src_file.filename().replace_extension(".o");
             object_files.push_back(obj_file);
 
-            bool needs_compile = false;
             if (!fs::exists(obj_file)) {
-                needs_compile = true;
-            } else {
-                auto src_time = fs::last_write_time(src_file);
-                auto obj_time = fs::last_write_time(obj_file);
-                if (src_time > obj_time || latest_header_time > obj_time) {
-                    needs_compile = true;
-                }
+                files_to_compile.push_back(src_file);
+                continue;
             }
 
-            if (needs_compile) {
+            auto obj_time = fs::last_write_time(obj_file);
+            if (fs::last_write_time(src_file) > obj_time) {
                 files_to_compile.push_back(src_file);
+                continue;
+            }
+            // Check against PCH timestamp
+            if (!pch_file.empty() && pch_time > obj_time) {
+                 files_to_compile.push_back(src_file);
+                 continue;
+            }
+
+            // Check against this file's specific header dependencies
+            if (dependency_map.contains(src_file)) {
+                for (const auto& header : dependency_map.at(src_file)) {
+                    if (fs::exists(header) && fs::last_write_time(header) > obj_time) {
+                        files_to_compile.push_back(src_file);
+                        break; // Found one, no need to check others for this source file
+                    }
+                }
             }
         }
 
-        if (files_to_compile.empty()) {
-            fmt::print("[?] All files are up to date.\n");
-            return 0;
+        if (files_to_compile.empty() && !source_files.empty()) {
+            out::success("All {} files are up to date.", source_files.size());
         } else {
-            // --- Step 2: Compile needed files in parallel ---
-            fmt::print("[?] Compiling {}/{} source files...\n", files_to_compile.size(), source_files.size());
+            // --- Step 4: Compile needed files in parallel ---
+            out::info("Compiling {}/{} source files...", files_to_compile.size(), source_files.size());
             std::atomic<bool> compilation_failed = false;
             std::atomic<size_t> file_index = 0;
-            const unsigned int num_threads = std::thread::hardware_concurrency();
+            const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> workers;
 
-            workers.reserve(num_threads);
             for (unsigned int i = 0; i < num_threads; ++i) {
                 workers.emplace_back([&]() {
                     while (true) {
                         if (compilation_failed) return;
-                        const size_t index = file_index.fetch_add(1);
+                        size_t index = file_index.fetch_add(1);
                         if (index >= files_to_compile.size()) return;
 
-                        const auto& src_file = files_to_compile[index];
-                        std::string compiler = getCompiler(src_file);
-                        fs::path obj_file = build_path / (src_file.stem().string() + ".o");
-
+                        const auto& src = files_to_compile[index];
+                        std::string compiler = getCompiler(src);
+                        fs::path obj = build_path / src.filename().replace_extension(".o");
                         std::string cmd;
+
                         if (compiler == config.as) {
-                            cmd = fmt::format("{} {} -felf64 -o {}", compiler, src_file.string(), obj_file.string());
-                        } else if (compiler == config.cxx) {
-                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.cxxflags, fmt::join(config.include_dirs, " "));
+                            cmd = fmt::format("{} {} -felf64 -o {}", compiler, src, obj);
                         } else {
-                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.cflags, fmt::join(config.include_dirs, " "));
+                            std::string_view flags = (compiler == config.cxx) ? config.cxxflags : config.cflags;
+                            // Add PCH flags only for C++ files
+                            std::string current_pch_flags = (compiler == config.cxx) ? pch_flags : "";
+                            cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags, fmt::join(config.include_dirs, " "));
                         }
 
-                        {
-                            std::lock_guard lock(g_output_mutex);
-                            fmt::print("[C] {}\n", cmd);
-                        }
+                        out::command("{}", cmd);
 
-                        int result = system(cmd.c_str());
-                        if (result != 0) {
+                        if (auto [exit_code, stderr_output] = execute(cmd); exit_code != 0) {
+                            out::error("Failed to compile: {}", src);
                             std::lock_guard lock(g_output_mutex);
-                            fmt::print(stderr, "[!] FATAL:  Failed to compile: {}\n", src_file.string());
+                            fmt::print(stderr, "{}\n", stderr_output);
                             compilation_failed = true;
                         }
                     }
                 });
             }
-
-            for (auto& worker : workers) {
-                worker.join();
-            }
+            for (auto& w : workers) w.join();
 
             if (compilation_failed) {
-                fmt::print(stderr, "[!] FATAL:  Compilation failed. Aborting.\n");
+                out::error("Compilation failed. Aborting.");
                 return 1;
             }
         }
 
-        // --- Step 3: Link all object files ---
+        // --- Step 5: Link all object files ---
+        const fs::path target_path = fs::path(config.build_dir) / config.name;
+        // Check if linking is needed
+        if (files_to_compile.empty() && fs::exists(target_path)) {
+             out::success("Build complete. Executable '{}' is up to date.", target_path.string());
+             return 0;
+        }
+
         const std::string link_cmd = fmt::format("{} -o {} {} {} {} {}",
             config.cxx,
-            (build_path / config.name).string(),
+            target_path,
             fmt::join(object_files, " "),
-            config.cxxflags,
+            config.cxxflags, // Common flags like -march=native are often useful for linking too
             config.ldflags,
             fmt::join(config.external_libs, " ")
         );
 
-        fmt::print("[?] Linking target...\n");
-        fmt::print("[C] {}\n", link_cmd);
-        if (system(link_cmd.c_str()) != 0) {
-            fmt::print(stderr, "[!] FATAL:  Failed to link target: {}\n", config.name);
+        out::info("Linking target...");
+        out::command("{}", link_cmd);
+        auto result = execute(link_cmd);
+        if (result.exit_code != 0) {
+            out::error("Failed to link target: {}", config.name);
+            std::lock_guard lock(g_output_mutex);
+            fmt::print(stderr, "{}\n", result.stderr_output);
             return 1;
         }
 
-        fmt::print(stdout, "\n[+] Target '{}' built successfully in '{}'.\n", config.name, build_path.string());
+        out::success("Target '{}' built successfully in '{}'.", config.name, config.build_dir);
         return 0;
     }
 };
@@ -552,27 +635,46 @@ private:
 // --- User Interaction and Main ---
 
 void show_help() {
+    using fmt::styled;
+    out::info("AutoCC {} - A smarter C++ build system", VERSION);
     fmt::print(
-        "AutoCC - A zero-config C++ build system\n\n"
+        "\n"
         "Usage: autocc [command]\n\n"
         "Commands:\n"
-        "  (no command)  Builds the project incrementally. If not configured, prompts for setup.\n"
-        "  init          Prompts for configuration and creates a new build environment. Overwrites existing config.\n"
-        "  rescan        Clears the cache and performs a full dependency scan before building.\n"
-        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all flags manually.\n"
-        "  clean         Removes the build directory and cache.\n"
-        "  version       Show current version, built date and time.\n"
-        "  help          Shows this help message.\n"
+        "  (no command)  Builds the project incrementally using cached settings.\n"
+        "  {}          Prompts for configuration and creates a new build environment.\n"
+        "  {}        Clears the cache and performs a full dependency scan before building.\n"
+        "  {}        Interactive setup, but YOU must provide all compiler/linker flags manually.\n"
+        "  {} <key> <val> Set a single config value (e.g., 'autocc set cxxflags -O3').\n"
+        "  {}           Removes the build directory and cache.\n"
+        "  {}         Show current version and build date.\n"
+        "  {}/{}      Compile with default parameters (no config).\n"
+        "  {}          Shows this help message.\n",
+        styled("init", out::color_prompt),
+        styled("rescan", out::color_prompt),
+        styled("manual", out::color_prompt),
+        styled("set", out::color_prompt),
+        styled("clean", out::color_prompt),
+        styled("version", out::color_prompt),
+        styled("--autoconfig", out::color_prompt),
+        styled("--autocompile", out::color_prompt),
+        styled("help", out::color_prompt)
     );
 }
 
 void show_version() {
-    fmt::print("AutoCC {} compiled on {} {}", VERSION, TIME, DATE);
+    fmt::print("AutoCC {} compiled on {} at {}\n",
+        fmt::styled(VERSION, out::color_success),
+        fmt::styled(DATE, out::color_info),
+        fmt::styled(TIME, out::color_info)
+    );
 }
 
 void user_init(Config& config) {
     auto get_input = [](std::string_view prompt, std::string_view default_val) -> std::string {
-        fmt::print("[?] {} ({}): ", prompt, default_val);
+        fmt::print(stdout, "{} ({})? ",
+            fmt::styled(prompt, out::color_prompt),
+            fmt::styled(default_val, out::color_default));
         std::string input;
         std::getline(std::cin, input);
         return input.empty() ? std::string(default_val) : input;
@@ -586,68 +688,95 @@ void user_init(Config& config) {
     config.cflags = get_input("CC Flags", config.cflags);
     config.ldflags = get_input("Linker Flags", config.ldflags);
     config.build_dir = get_input("Build Directory", config.build_dir);
+    std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
+    config.use_pch = (pch_choice == "yes" || pch_choice == "y");
 }
 
-int main(int argc, char* argv[]) {
+int main(const int argc, char* argv[]) {
     if (argc > 1) {
         std::string command = argv[1];
-        fs::path build_dir = ".autocc_build"; // Cache, may override default
-        fs::path cache_dir = ".autocc_cache";
 
-        // Read build_dir from cache if it exists, to ensure `clean` works correctly
-        if (fs::exists(cache_dir / "config.cache")) {
-            std::ifstream cache_file(cache_dir / "config.cache");
-            std::string line;
-            while(std::getline(cache_file, line)) {
-                if (line.rfind("build_dir:", 0) == 0) {
-                    build_dir = line.substr(10);
-                    break;
-                }
-            }
-        }
-        if (command == "version" || command == "--version" || command == "-v") {
-            show_version();
-            return 0;
-        }
-        if (command == "help" || command == "--help") {
-            show_help();
-            return 0;
-        }
+        if (command == "version" || command == "--version" || command == "-v") { show_version(); return 0; }
+        if (command == "help" || command == "--help") { show_help(); return 0; }
+
         if (command == "clean") {
-            fmt::print("[?] Cleaning build directory '{}' and cache '{}'...\n", build_dir.string(), cache_dir.string());
-            fs::remove_all(build_dir);
-            fs::remove_all(cache_dir);
+            // Try to read build_dir from cache to clean the right place
+            Config temp_cfg;
+            if (const AutoCC a; a.return_code == 0) temp_cfg = a.config; // TODO: Needs a better way to get config
+
+            const fs::path build_dir_to_clean = temp_cfg.build_dir; // Use cached or default
+            const fs::path cache_dir_to_clean = CACHE_DIR_NAME;
+            out::info("Cleaning build dir '{}' and cache '{}'...", build_dir_to_clean.string(), cache_dir_to_clean.string());
+            fs::remove_all(build_dir_to_clean);
+            fs::remove_all(cache_dir_to_clean);
+            out::success("Clean complete.");
             return 0;
         }
+
         if (command == "init" || command == "rescan" || command == "manual") {
-            if (fs::exists(cache_dir)) {
-                fmt::print("[?] Invalidating cache for '{}' command...\n", command);
-                fs::remove_all(cache_dir);
+            if (fs::exists(CACHE_DIR_NAME)) {
+                out::info("Invalidating cache for '{}' command...", command);
+                fs::remove_all(CACHE_DIR_NAME);
             }
             Config config;
-            if (command != "rescan") { // 'init' and 'manual' require user input
-               user_init(config);
-            }
-            if (command == "manual") {
-                config.manual_mode = true;
-            }
+            if (command != "rescan") user_init(config);
+            if (command == "manual") config.manual_mode = true;
+
             AutoCC autocc(config);
             return autocc.return_code;
-        } else {
-            fmt::print(stderr, "[!] FATAL: Unknown command: '{}'. Use 'autocc help' for usage.\n", command);
-            return 1;
         }
+
+        if (command == "--autoconfig" || command == "--autocompile") {
+            Config config;
+            AutoCC autocc(config);
+            return autocc.return_code;
+        }
+
+        if (command == "set") {
+             if (argc != 4) {
+                 out::error("Usage: autocc set <key> <value>");
+                 return 1;
+             }
+             if (!fs::exists(CACHE_DIR_NAME) || !fs::exists(fs::path(CACHE_DIR_NAME) / CONFIG_FILE_NAME)) {
+                 out::error("'set' command requires a project to be initialized first. Run 'autocc init'.");
+                 return 1;
+             }
+             Config config;
+             AutoCC a; // Read existing config
+             if (a.return_code != 0) return 1; // Failed to read
+
+             std::string key = argv[2];
+             std::string value = argv[3];
+             if( key == "cxx") a.config.cxx = value;
+             else if (key == "cc") a.config.cc = value;
+             else if (key == "cflags") a.config.cflags = value;
+             else if (key == "cxxflags") a.config.cxxflags = value;
+             else if (key == "as") a.config.as = value;
+             else if (key == "name") a.config.name = value;
+             else if (key == "ldflags") a.config.ldflags = value;
+
+             else {
+                out::error("Unknown config key: '{}'", key);
+                return 1;
+             }
+             a.writeConfigCache(); // Save the modified config
+             out::success("Set '{}' to '{}'. Run 'autocc' to rebuild.", key, value);
+             return 0;
+        }
+
+        out::error("Unknown command: '{}'. Use 'autocc help' for usage.", command);
+        return 1;
     }
 
     // Default behavior: build from cache or prompt init
-    if (fs::exists(".autocc_cache/config.cache")) {
-        AutoCC autocc; // Reads from cache and builds incrementally
+    if (fs::exists(fs::path(CACHE_DIR_NAME) / CONFIG_FILE_NAME)) {
+        AutoCC autocc;
         return autocc.return_code;
     }
 
-    fmt::print("[?] No configuration found. Starting initial setup...\n");
+    out::info("No configuration found. Starting initial setup...");
     Config config;
     user_init(config);
-    AutoCC autocc(config); // Full scan and build
+    AutoCC autocc(config);
     return autocc.return_code;
 }
