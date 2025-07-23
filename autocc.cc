@@ -3,113 +3,183 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <optional>
+#include <string_view>
 #include <regex>
-#include <fmt/base.h>
-#include <fmt/ostream.h>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
 #include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <cstdlib>
+#include <thread> // For parallel compilation
+#include <atomic> // For thread-safe operations
+#include <mutex>  // For thread-safe output
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 namespace fs = std::filesystem;
 
-class Default {
-public:
-    static constexpr auto DEF_CC = "clang";
-    static constexpr auto DEF_CXX = "clang++";
-    static constexpr auto DEF_AS = "nasm";
-    static constexpr auto DEF_FLAGS = "-Wall -march=native -fopenmp -std=c++23";
-    static constexpr auto DEF_LDFLAGS = "";
-    static constexpr auto DEF_NAME = "target_default";
-    static constexpr auto DEF_BUILD = "autocc";
-    static constexpr auto DEF_MANUAL = false;
+// A global mutex for ensuring threads do not interleave cout/cerr writes
+std::mutex g_output_mutex;
+
+template <>
+struct fmt::formatter<std::filesystem::path> : formatter<std::string_view> {
+    auto format(const std::filesystem::path& p, format_context& ctx) const {
+        return formatter<std::string_view>::format(p.string(), ctx);
+    }
+};
+
+struct Config {
+    std::string cc = "clang";
+    std::string cxx = "clang++";
+    std::string as = "nasm";
+    std::string name = "a.out";
+    std::string flags = "-Wall -Wextra -march=native -std=c++23 -O2 -pipe";
+    std::string ldflags;
+    std::string build_dir = ".autocc_build";
+    std::vector<std::string> include_dirs;
+    std::vector<std::string> external_libs;
+    bool manual_mode = false;
 };
 
 class LibraryDetector {
 private:
-    std::unordered_map<std::string, std::vector<std::string>> headerToLibs = {
-        // Standard C++ libraries that need explicit linking
-        {"thread", {"-lpthread"}},
-        {"filesystem", {"-lstdc++fs"}}, // For older GCC versions
-
-        // Common system libraries
-        {"math.h", {"-lm"}},
-        {"cmath", {"-lm"}},
-        {"pthread.h", {"-lpthread"}},
-        {"X11/Xlib.h", {"-lX11"}},
-        {"GL/gl.h", {"-lGL"}},
-        {"GL/glu.h", {"-lGLU"}},
-        {"GLFW/glfw3.h", {"-lglfw", "-lGL", "-lX11", "-lpthread", "-ldl"}},
-        {"curl/curl.h", {"-lcurl"}},
-        {"sqlite3.h", {"-lsqlite3"}},
-        {"GL/", {"-lOpenGL"}},
-        {"allegro5/", {"-lallegro"}},
-        {"zlib.h", {"-lz"}},
-        {"lzma.h", {"-llzma"}},
-        {"openssl/ssl.h", {"-lssl", "-lcrypto"}},
-        {"openssl/sha.h", {"-lssl", "-lcrypto"}},
-        {"openssl/crypto.h", {"-lcrypto"}},
-        {"blake3.h", {"-lblake3"}}, // Added blake3
-        {"zstd.h", {"-lzstd"}},     // Added zstd
-        {"pcre.h", {"-lpcre"}},
-        {"yaml.h", {"-lyaml"}},
-        {"json/json.h", {"-ljsoncpp"}},
-        {"boost/", {"-lboost_system", "-lboost_filesystem"}},
-        {"fmt/", {"-lfmt"}},
-        {"spdlog/", {"-lfmt"}},
+    struct DetectionRule {
+        std::vector<std::string> direct_libs;
+        std::vector<std::string> pkg_configs;
     };
 
-    std::vector<std::string> pkgConfigLibs = {
-        "gtk+-3.0", "qt5-core", "opencv", "cairo", "pango", "glib-2.0"
+
+    std::unordered_map<std::string, DetectionRule> detectionMap = {
+        // --- Core System & Standard-ish Libraries ---
+        // These are fundamental and very common.
+        {"math.h",          {.direct_libs = {"-lm"}}},
+        {"cmath",           {.direct_libs = {"-lm"}}},
+        {"pthread.h",       {.direct_libs = {"-lpthread"}}}, // POSIX Threads
+        {"thread",          {.direct_libs = {"-lpthread"}}}, // C++ <thread> often needs this
+        {"dlfcn.h",         {.direct_libs = {"-ldl"}}},      // For dynamic library loading (dlopen)
+        {"ncurses.h",       {.pkg_configs = {"ncursesw"}}},  // Ncurses for terminal UI
+        {"curses.h",        {.pkg_configs = {"ncursesw"}}},  // A common alternative include name
+
+        // --- Graphics & Multimedia ---
+        // Best to use pkg-config for these as dependencies can be complex.
+        {"GL/gl.h",         {.pkg_configs = {"gl"}}},            // OpenGL
+        {"vulkan/", {.pkg_configs = {"vulkan"}}},        // Vulkan
+        {"SDL2/SDL.h",      {.pkg_configs = {"sdl2"}}},          // SDL2 Core
+        {"SDL2/SDL_image.h",{.pkg_configs = {"SDL2_image"}}},    // SDL2 Image
+        {"SDL2/SDL_ttf.h",  {.pkg_configs = {"SDL2_ttf"}}},      // SDL2 TrueType Fonts
+        {"SDL2/SDL_mixer.h",{.pkg_configs = {"SDL2_mixer"}}},    // SDL2 Audio Mixer
+        {"SFML/Graphics.hpp",{.pkg_configs = {"sfml-graphics"}}},// SFML Graphics
+        {"SFML/Window.hpp", {.pkg_configs = {"sfml-window"}}},  // SFML Window
+        {"SFML/System.hpp", {.pkg_configs = {"sfml-system"}}},  // SFML System
+        {"GLFW/glfw3.h",    {.direct_libs = {"-lglfw"}, .pkg_configs = {"gl"}}}, // GLFW
+        {"cairo.h",         {.pkg_configs = {"cairo"}}},         // Cairo 2D graphics
+        {"png.h",           {.pkg_configs = {"libpng"}}},        // libpng
+        {"jpeglib.h",       {.direct_libs = {"-ljpeg"}}},        // libjpeg
+        {"turbojpeg.h",     {.direct_libs = {"-lturbojpeg"}}},   // libjpeg-turbo
+        {"OpenAL/al.h",     {.pkg_configs = {"openal"}}},        // OpenAL 3D Audio
+        {"AL/al.h",         {.pkg_configs = {"openal"}}},        // Alternative OpenAL path
+        {"imgui.h",         {/* Header-only, but requires a backend (e.g., OpenGL, Vulkan) to be linked separately */}},
+
+        // --- GUI Toolkits ---
+        {"gtk/gtk.h",       {.pkg_configs = {"gtk+-3.0"}}}, // GTK+ 3
+        {"gtk-4.0/gtk/gtk.h",{.pkg_configs = {"gtk4"}}},     // GTK 4
+        {"QtWidgets/",      {.pkg_configs = {"Qt6Widgets", "Qt5Widgets"}}}, // Qt Widgets (tries Qt6 first)
+        {"QtCore/",         {.pkg_configs = {"Qt6Core", "Qt5Core"}}},       // Qt Core
+        {"wx/wx.h",         {.pkg_configs = {"wxwidgets"}}}, // wxWidgets (often needs a more specific .pc file like 'wxwidgets-3.2-gtk3-unicode')
+
+        // --- Data Handling (JSON, XML, YAML, Databases) ---
+        {"nlohmann/json.hpp", {/* Header-only */}},
+        {"rapidjson/document.h", {/* Header-only */}},
+        {"json/json.h",     {.pkg_configs = {"jsoncpp"}}},       // JsonCpp
+        {"jansson.h",       {.pkg_configs = {"jansson"}}},       // Jansson C JSON library
+        {"libxml/parser.h", {.pkg_configs = {"libxml-2.0"}}},    // libxml2
+        {"pugixml.hpp",     {/* Header-only */}},               // pugixml
+        {"yaml-cpp/yaml.h", {.pkg_configs = {"yaml-cpp"}}},      // yaml-cpp
+        {"sqlite3.h",       {.pkg_configs = {"sqlite3"}}},       // SQLite3
+        {"libpq-fe.h",      {.pkg_configs = {"libpq"}}},         // PostgreSQL client (libpq)
+        {"mysql.h",         {.direct_libs = {"-lmysqlclient"}}}, // MySQL/MariaDB client
+
+        // --- Networking & Web ---
+        {"curl/curl.h",     {.pkg_configs = {"libcurl"}}},       // libcurl
+        {"openssl/ssl.h",   {.pkg_configs = {"libssl", "libcrypto"}}}, // OpenSSL
+        {"openssl/crypto.h",{.pkg_configs = {"libcrypto"}}},     // OpenSSL (crypto part only)
+        {"grpcpp/grpcpp.h", {.pkg_configs = {"grpc++"}}},        // gRPC
+        {"httplib.h",       {.pkg_configs = {"libssl", "libcrypto"}}}, // cpp-httplib (header-only, but needs SSL for https)
+        {"zmq.h",           {.pkg_configs = {"libzmq"}}},        // ZeroMQ
+
+        // --- Compression & Cryptography ---
+        {"zlib.h",          {.direct_libs = {"-lz"}}},           // zlib
+        {"zstd.h",          {.pkg_configs = {"libzstd"}}},       // Zstandard
+        {"lzma.h",          {.pkg_configs = {"liblzma"}}},       // lzma (XZ Utils)
+        {"bzlib.h",         {.direct_libs = {"-lbz2"}}},         // bzip2
+        {"blake3.h",        {.direct_libs = {"-lblake3"}}},      // BLAKE3
+        {"sodium.h",        {.pkg_configs = {"libsodium"}}},     // libsodium
+
+        // --- General Utilities & Frameworks (Boost, Logging, etc.) ---
+        {"fmt/",      {.pkg_configs = {"fmt"}}},           // {fmt} library
+        {"spdlog/spdlog.h", {.pkg_configs = {"spdlog"}}},        // spdlog (often pulls in fmt)
+        {"glog/logging.h",  {.direct_libs = {"-lglog"}}},        // Google Log
+        {"boost/system/error_code.hpp", {.direct_libs = {"-lboost_system"}}},
+        {"boost/filesystem.hpp", {.direct_libs = {"-lboost_system", "-lboost_filesystem"}}},
+        {"boost/thread.hpp", {.direct_libs = {"-lboost_thread", "-lboost_system"}}},
+        {"boost/asio.hpp",   {.direct_libs = {"-lboost_system"}}},
+        {"tbb/tbb.h",       {.pkg_configs = {"tbb"}}},           // Intel TBB
+
+        // --- Numerics & Science ---
+        {"Eigen/Dense",     {/* Header-only */}},
+        {"gsl/gsl_sf_bessel.h", {.pkg_configs = {"gsl"}}},       // GNU Scientific Library
+        {"fftw3.h",         {.direct_libs = {"-lfftw3"}}},       // FFTW
+
+        // --- Testing Frameworks ---
+        {"gtest/gtest.h",   {.direct_libs = {"-lgtest", "-lgtest_main", "-lpthread"}}}, // Google Test
+        {"catch2/catch.hpp",{/* Header-only */}},                // Catch2
     };
 
 public:
-    struct DetectionResult {
-        std::vector<std::string> libraries;
-        std::vector<std::string> includePaths;
-        std::vector<std::string> pkgConfigFlags;
-        std::vector<std::string> compilerFlags; // New member for compiler-specific flags
-    };
-
-    DetectionResult detectFromIncludes(const std::vector<std::string>& includes) {
-        DetectionResult result;
-        std::unordered_set<std::string> addedLibs;
+    void detect(const std::vector<std::string>& includes, Config& config) {
+        std::unordered_set<std::string> found_direct_libs(config.external_libs.begin(), config.external_libs.end());
+        std::unordered_set<std::string> processed_pkg_configs;
+        std::string additional_ldflags;
 
         for (const auto& include : includes) {
-            // Direct header to library mapping
-            for (const auto& [header, libs] : headerToLibs) {
-                if (include.find(header) != std::string::npos) {
-                    for (const auto& lib : libs) {
-                        if (!addedLibs.contains(lib)) {
-                            result.libraries.push_back(lib);
-                            addedLibs.insert(lib);
-                        }
+            for (const auto& [header_signature, rule] : detectionMap) {
+                if (include.find(header_signature) != std::string::npos) {
+                    // Add direct library flags
+                    for (const auto& lib : rule.direct_libs) {
+                        found_direct_libs.insert(lib);
                     }
-                }
-            }
 
-            // Check for pkg-config managed libraries
-            for (const auto& pkgLib : pkgConfigLibs) {
-                if (include.find(pkgLib) != std::string::npos ||
-                    include.find("gtk") != std::string::npos && pkgLib == "gtk+-3.0") {
-                    auto pkgResult = getPkgConfigFlags(pkgLib);
-                    if (!pkgResult.empty()) {
-                        result.pkgConfigFlags.push_back(pkgResult);
+                    // Process pkg-config dependencies
+                    for (const auto& pkg_name : rule.pkg_configs) {
+                        if (!processed_pkg_configs.contains(pkg_name)) {
+                            auto pkg_result = getPkgConfigFlags(pkg_name);
+                            if (!pkg_result.empty()) {
+                                additional_ldflags += " " + pkg_result;
+                                {
+                                    std::lock_guard lock(g_output_mutex);
+                                    fmt::print("[INFO] Found dependency '{}', adding flags via pkg-config.\n", pkg_name);
+                                }
+                            } else {
+                                 std::lock_guard lock(g_output_mutex);
+                                 fmt::print(stderr, "[WARN] Found include for '{}' but 'pkg-config {}' failed. Is it installed?\n", pkg_name, pkg_name);
+                            }
+                            processed_pkg_configs.insert(pkg_name);
+                        }
                     }
                 }
             }
         }
 
-        return result;
+        config.external_libs.assign(found_direct_libs.begin(), found_direct_libs.end());
+        // Prepend a space only if there are flags to add
+        if (!additional_ldflags.empty()) {
+            config.ldflags += " " + additional_ldflags;
+        }
     }
 
 private:
     static std::string getPkgConfigFlags(const std::string& package) {
+        // Query for both library and compiler flags from pkg-config
         const std::string cmd = fmt::format("pkg-config --libs --cflags {} 2>/dev/null", package);
-
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) return "";
 
@@ -120,487 +190,446 @@ private:
         }
         pclose(pipe);
 
-        // Remove trailing newline
         if (!result.empty() && result.back() == '\n') {
             result.pop_back();
         }
-
         return result;
     }
 };
 
 class IncludeParser {
 public:
-    struct ParseResult {
-        std::vector<std::string> systemIncludes;
-        std::vector<std::string> localIncludes;
-    };
+    static std::vector<std::string> getAllIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) {
+        std::unordered_set<std::string> unique_includes;
+        std::vector<fs::path> files_to_scan;
+        std::unordered_set<fs::path> scanned_files; // To prevent infinite loops
 
-    static ParseResult parseFile(const fs::path& filePath) {
-        ParseResult result;
-        std::ifstream file(filePath);
-        std::string line;
+        // Start by scanning the main source files (.cpp, .c)
+        files_to_scan.insert(files_to_scan.end(), sourceFiles.begin(), sourceFiles.end());
 
-        // Regex patterns for different include formats
-        std::regex systemIncludeRegex(R"_((^\s*#\s*include\s*<([^>]+)>))_");
-        std::regex localIncludeRegex(R"_((^\s*#\s*include\s*"([^"]+)"))_");
+        std::regex include_regex(R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_");
 
-        while (std::getline(file, line)) {
-            std::smatch matches;
+        // --- The Recursive Scanning Loop ---
+        while (!files_to_scan.empty()) {
+            fs::path current_file = files_to_scan.back();
+            files_to_scan.pop_back();
 
-            if (std::regex_search(line, matches, systemIncludeRegex)) {
-                result.systemIncludes.push_back(matches[1].str());
-            } else if (std::regex_search(line, matches, localIncludeRegex)) {
-                result.localIncludes.push_back(matches[1].str());
+            // Skip files we've already processed to avoid cycles (e.g., a.h includes b.h, b.h includes a.h)
+            if (scanned_files.contains(current_file)) {
+                continue;
             }
-        }
+            scanned_files.insert(current_file);
 
-        return result;
-    }
-
-    static std::vector<std::string> getAllIncludes(const std::vector<fs::path>& sourceFiles) {
-        std::unordered_set<std::string> uniqueIncludes;
-
-        for (const auto& file : sourceFiles) {
-            if (file.extension() == ".c" || file.extension() == ".cpp" ||
-                file.extension() == ".cc" || file.extension() == ".cxx" ||
-                file.extension() == ".c++") {
-
-                auto parseResult = parseFile(file);
-
-                for (const auto& inc : parseResult.systemIncludes) {
-                    uniqueIncludes.insert(inc);
-                }
-                for (const auto& inc : parseResult.localIncludes) {
-                    uniqueIncludes.insert(inc);
-                }
+            std::ifstream file_stream(current_file);
+            if (!file_stream.is_open()) {
+                // This can happen if a local header can't be found. We'll just skip it.
+                continue;
             }
-        }
 
-        return {uniqueIncludes.begin(), uniqueIncludes.end()};
-    }
-};
+            std::string line;
+            while (std::getline(file_stream, line)) {
+                std::smatch matches;
+                if (std::regex_search(line, matches, include_regex)) {
+                    bool is_system_include = matches[1].matched;
+                    const auto& match_str = is_system_include ? matches[1].str() : matches[2].str();
 
-class SystemPathDetector {
-public:
-    static std::vector<std::string> getSystemIncludePaths() {
-        std::vector<std::string> paths;
+                    unique_includes.insert(match_str);
 
-        // Try to get the system include paths from compiler
-        auto gccPaths = getCompilerIncludePaths("gcc");
-        auto clangPaths = getCompilerIncludePaths("clang");
-
-        paths.insert(paths.end(), gccPaths.begin(), gccPaths.end());
-        paths.insert(paths.end(), clangPaths.begin(), clangPaths.end());
-
-        // Add common system paths
-        std::vector<std::string> commonPaths = {
-            "/usr/include",
-            "/usr/local/include",
-            "/opt/local/include",
-            "/usr/include/c++/11",
-            "/usr/include/c++/12",
-            "/usr/include/c++/13",
-            "/usr/include/x86_64-linux-gnu",
-        };
-
-        for (const auto& path : commonPaths) {
-            if (fs::exists(path)) {
-                paths.push_back("-I" + path);
-            }
-        }
-
-        return paths;
-    }
-
-    static std::vector<std::string> getSystemLibraryPaths() {
-        std::vector<std::string> paths;
-
-        std::vector<std::string> commonPaths = {
-            "/usr/lib",
-            "/usr/local/lib",
-            "/opt/local/lib",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-        };
-
-        for (const auto& path : commonPaths) {
-            if (fs::exists(path)) {
-                paths.push_back("-L" + path);
-            }
-        }
-
-        return paths;
-    }
-
-private:
-    static std::vector<std::string> getCompilerIncludePaths(const std::string& compiler) {
-        std::string cmd = fmt::format("{} -E -v -x c++ /dev/null 2>&1 | "
-                                     "sed -n '/#include <...> search starts here:/,/End of search list./p' | "
-                                     "grep '^/' || true", compiler);
-
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) return {};
-
-        std::vector<std::string> paths;
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            std::string path = buffer;
-            path.erase(path.find_last_not_of(" \n\r\t") + 1); // trim
-            if (!path.empty() && path[0] == '/') {
-                paths.push_back("-I" + path);
-            }
-        }
-        pclose(pipe);
-
-        return paths;
-    }
-};
-
-// Your existing Parser class remains the same
-class Parser {
-public:
-    std::string cc;
-    std::string cxx;
-    std::string name;
-    std::string flags;
-    std::string ldflags;
-    std::string as;
-    std::string build;
-
-    void UserInput() {
-        std::string input;
-        fmt::print("[?] C compiler? (clang) ");
-        std::getline(std::cin, input);
-        cc = input.empty() ? "clang" : input;
-
-        fmt::print("[?] C++ compiler? (clang++) ");
-        std::getline(std::cin, input);
-        cxx = input.empty() ? "clang++" : input;
-
-        fmt::print("[?] Assembler? (nasm) ");
-        std::getline(std::cin, input);
-        as = input.empty() ? "nasm" : input;
-
-        fmt::print("[?] Executable name? (default) ");
-        std::getline(std::cin, input);
-        name = input.empty() ? "default" : input;
-
-        fmt::print("[?] Compiler flags? (-Wall) ");
-        std::getline(std::cin, input);
-        flags = input.empty() ? "-Wall" : input;
-
-        fmt::print("[?] Linker flags? () ");
-        std::getline(std::cin, input);
-        ldflags = input.empty() ? "" : input;
-
-        fmt::print("[?] Build directory? (autocc) ");
-        std::getline(std::cin, input);
-        build = input.empty() ? "autocc" : input;
-    }
-};
-
-class AutoCC {
-public:
-    int Success = 0;
-
-    explicit AutoCC(const std::optional<std::string>& cxx,
-                    const std::optional<std::string>& cc,
-                    const std::optional<std::string>& name,
-                    const std::optional<std::string>& flags,
-                    const std::optional<std::string>& ldflags,
-                    const std::optional<std::string>& as,
-                    const std::optional<std::string>& build,
-                    bool manual_mode = false) // Added manual_mode with default false
-    : CXX(cxx.value_or("clang++")), CC(cc.value_or("clang")), AS(as.value_or("nasm")),
-      NAME(name.value_or("default")), FLAGS(flags.value_or("-Wall")),
-      LDFLAGS(ldflags.value_or("")), BUILD(build.value_or("autocc")) {
-
-        const auto sourceFiles = FindSourceFiles(root);
-        if (!manual_mode) { // Only perform auto-detection and cache if not in manual mode
-            HeaderScan();
-            DetectSystemDependencies(sourceFiles);
-            WriteCache();
-        }
-        Success = Compile(sourceFiles);
-    }
-
-    explicit AutoCC() {
-        ReadCache();
-        Success = Compile(FindSourceFiles(root));
-    }
-
-private:
-    std::string CXX;
-    std::string CC;
-    std::string AS;
-    std::string NAME;
-    std::string FLAGS;
-    std::string LDFLAGS;
-    std::string BUILD;
-    const fs::path root = ".";
-
-    std::vector<std::string> includeDirs;
-    std::vector<std::string> externalLibs;
-    LibraryDetector libDetector;
-
-    void DetectSystemDependencies(const std::vector<fs::path>& sourceFiles) {
-        fmt::print("[+] Analyzing source files for dependencies...\n");
-
-        // Parse all includes from source files
-        const auto allIncludes = IncludeParser::getAllIncludes(sourceFiles);
-
-        // Detect libraries based on includes
-        const auto detection = libDetector.detectFromIncludes(allIncludes);
-
-        // Add detected libraries
-        for (const auto& lib : detection.libraries) {
-            externalLibs.push_back(lib);
-            fmt::print("[+] Auto-detected library: {}\n", lib);
-        }
-
-        // Add pkg-config flags
-        for (const auto& pkgFlag : detection.pkgConfigFlags) {
-            LDFLAGS += " " + pkgFlag;
-            fmt::print("[+] Added pkg-config flags: {}\n", pkgFlag);
-        }
-
-        // Add system includes paths
-        for (const auto systemIncludes = SystemPathDetector::getSystemIncludePaths(); const auto& inc : systemIncludes) {
-            includeDirs.push_back(inc);
-        }
-
-        // Add system library paths to LDFLAGS
-        for (const auto systemLibPaths = SystemPathDetector::getSystemLibraryPaths(); const auto& libPath : systemLibPaths) {
-            LDFLAGS += " " + libPath;
-        }
-
-        fmt::print("[+] Final LDFLAGS: {}\n", LDFLAGS);
-        fmt::print("[+] Final externalLibs: {}\n", externalLibs);
-        fmt::print("[+] Found {} system includes, {} libraries\n",
-                  includeDirs.size(), externalLibs.size());
-    }
-
-    void HeaderScan(const fs::path& startDir = ".") {
-        std::set<std::string> headerDirs;
-
-        try {
-            for (const auto& entry : fs::recursive_directory_iterator(startDir)) {
-                if (entry.is_regular_file()) {
-                    const std::string ext = entry.path().extension().string();
-
-                    if (ext == ".h" || ext == ".hpp" || ext == ".hxx" ||
-                        ext == ".hh" || ext == ".pch") {
-
-                        std::string dir = entry.path().parent_path().string();
-                        if (!dir.empty()) {
-                            headerDirs.insert(dir);
+                    // If it's a local include ("..."), we need to find that file and scan it too.
+                    if (!is_system_include) {
+                        fs::path included_path = findHeader(match_str, current_file.parent_path(), include_dirs);
+                        if (!included_path.empty()) {
+                            files_to_scan.push_back(included_path);
                         }
                     }
                 }
             }
-        } catch (const fs::filesystem_error& e) {
-            fmt::print(stderr, "[!] Error scanning directories: {}\n", e.what());
         }
 
-        for (const auto& dir : headerDirs) {
-            includeDirs.push_back("-I" + dir);
-            fmt::print("[+] Found local headers in: {}\n", dir);
-        }
+        return {unique_includes.begin(), unique_includes.end()};
     }
 
-    void WriteCache() const {
-        fs::create_directory(root / ".autocc_cache");
-        std::ofstream cache_file(root / ".autocc_cache/libs.cache");
-        cache_file << "cxx:" << CXX << std::endl;
-        cache_file << "cc:" << CC << std::endl;
-        cache_file << "as:" << AS << std::endl;
-        cache_file << "name:" << NAME << std::endl;
-        cache_file << "flags:" << FLAGS << std::endl;
-        cache_file << "ldflags:" << LDFLAGS << std::endl;
-        cache_file << "build:" << BUILD << std::endl;
-        for (const auto& dir : includeDirs) {
-            cache_file << "include:" << dir << std::endl;
+private:
+    // Helper function to find the full path of a local header file.
+    static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
+        // 1. Check relative to the current file's directory
+        fs::path potential_path = relative_to / header_name;
+        if (fs::exists(potential_path)) {
+            return potential_path;
         }
-        for (const auto& lib : externalLibs) {
-            cache_file << "lib:" << lib << std::endl;
-        }
-    }
 
-    void ReadCache() {
-        std::ifstream cache_file(root / ".autocc_cache/libs.cache");
-        std::string line;
-        while (std::getline(cache_file, line)) {
-            if (line.rfind("cxx:", 0) == 0) {
-                CXX = line.substr(4);
-            } else if (line.rfind("cc:", 0) == 0) {
-                CC = line.substr(3);
-            } else if (line.rfind("as:", 0) == 0) {
-                AS = line.substr(3);
-            } else if (line.rfind("name:", 0) == 0) {
-                NAME = line.substr(5);
-            } else if (line.rfind("flags:", 0) == 0) {
-                FLAGS = line.substr(6);
-            } else if (line.rfind("ldflags:", 0) == 0) {
-                LDFLAGS = line.substr(8);
-            } else if (line.rfind("build:", 0) == 0) {
-                BUILD = line.substr(6);
-            } else if (line.rfind("include:", 0) == 0) {
-                includeDirs.push_back(line.substr(8));
-            } else if (line.rfind("lib:", 0) == 0) {
-                externalLibs.push_back(line.substr(4));
+        // 2. Check all the -I include directories
+        for (const auto& dir_flag : include_dirs) {
+            if (dir_flag.rfind("-I", 0) == 0) {
+                fs::path base_dir = dir_flag.substr(2);
+                potential_path = base_dir / header_name;
+                if (fs::exists(potential_path)) {
+                    return potential_path;
+                }
             }
         }
+
+        return {}; // Return empty path if not found
+    }
+};
+
+
+// --- The Main Build System Logic ---
+
+class AutoCC {
+public:
+    int return_code = 0;
+
+    // Constructor for a fresh scan or re-scan
+    explicit AutoCC(Config cfg) : config(std::move(cfg)) {
+        source_files = findSourceFiles(root);
+        if (source_files.empty()) {
+            fmt::print(stderr, "[ERROR] No source files (.c, .cpp, .s, etc.) found in the current directory.\n");
+            return_code = 1;
+            return;
+        }
+
+        if (!config.manual_mode) {
+            fmt::print("[?] Starting automatic dependency scan...\n");
+            scanLocalHeaders();
+            detectLibraries();
+        }
+
+        writeCache();
+        return_code = compileAndLink();
     }
 
-    [[nodiscard]] std::string GetCompiler(const fs::path& file) const {
+    // Constructor for building from cache
+    explicit AutoCC() {
+        if (!readCache()) {
+            fmt::print(stderr, "[ERROR] Cache not found. Please run 'autocc init' to configure the project.\n");
+            return_code = 1;
+            return;
+        }
+        source_files = findSourceFiles(root);
+        if (source_files.empty()) {
+            fmt::print(stderr, "[ERROR] No source files found.\n");
+            return_code = 1;
+            return;
+        }
+        return_code = compileAndLink();
+    }
+
+private:
+    Config config;
+    const fs::path root = ".";
+    const fs::path cache_file_path = root / ".autocc_cache" / "config.cache";
+    std::vector<fs::path> source_files;
+    LibraryDetector lib_detector;
+
+    void scanLocalHeaders() {
+        std::set<std::string> header_dirs;
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            if (entry.is_regular_file()) {
+                const std::string ext = entry.path().extension().string();
+                if (ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
+                    header_dirs.insert(entry.path().parent_path().string());
+                }
+            }
+        }
+        for (const auto& dir : header_dirs) {
+            config.include_dirs.push_back(fmt::format("-I{}", dir));
+        }
+    }
+
+    void detectLibraries() {
+        // The call to getAllIncludes now needs the include_dirs from the config
+        const auto all_includes = IncludeParser::getAllIncludes(source_files, config.include_dirs);
+        lib_detector.detect(all_includes, config);
+    }
+
+    void writeCache() const {
+        fs::create_directories(cache_file_path.parent_path());
+        std::ofstream cache_file(cache_file_path);
+        cache_file << "cxx:" << config.cxx << std::endl;
+        cache_file << "cc:" << config.cc << std::endl;
+        cache_file << "as:" << config.as << std::endl;
+        cache_file << "name:" << config.name << std::endl;
+        cache_file << "flags:" << config.flags << std::endl;
+        cache_file << "ldflags:" << config.ldflags << std::endl;
+        cache_file << "build_dir:" << config.build_dir << std::endl;
+        for (const auto& dir : config.include_dirs) cache_file << "include:" << dir << std::endl;
+        for (const auto& lib : config.external_libs) cache_file << "lib:" << lib << std::endl;
+    }
+
+    bool readCache() {
+        if (!fs::exists(cache_file_path)) return false;
+        std::ifstream cache_file(cache_file_path);
+        std::string line;
+        while (std::getline(cache_file, line)) {
+            auto delimiter_pos = line.find(':');
+            if (delimiter_pos == std::string::npos) continue;
+            std::string_view key = std::string_view(line).substr(0, delimiter_pos);
+            std::string_view value = std::string_view(line).substr(delimiter_pos + 1);
+
+            if (key == "cxx") config.cxx = value;
+            else if (key == "cc") config.cc = value;
+            else if (key == "as") config.as = value;
+            else if (key == "name") config.name = value;
+            else if (key == "flags") config.flags = value;
+            else if (key == "ldflags") config.ldflags = value;
+            else if (key == "build_dir") config.build_dir = value;
+            else if (key == "include") config.include_dirs.emplace_back(value);
+            else if (key == "lib") config.external_libs.emplace_back(value);
+        }
+        return true;
+    }
+
+    std::string getCompiler(const fs::path& file) const {
         const std::string ext = file.extension().string();
-        if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return CXX;
-        if (ext == ".c") return CC;
-        if (ext == ".s" || ext == ".S" || ext == ".asm") return AS;
-        return CXX;
+        if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return config.cxx;
+        if (ext == ".c") return config.cc;
+        if (ext == ".s" || ext == ".S" || ext == ".asm") return config.as;
+        return config.cxx; // Default to C++ compiler
     }
 
-    static std::vector<fs::path> FindSourceFiles(const fs::path& dir) {
+    static std::vector<fs::path> findSourceFiles(const fs::path& dir) {
         std::vector<fs::path> files;
+        // Avoid recursing into build or cache directories
+        std::unordered_set<std::string> ignored_dirs = {".git", ".autocc_build", ".autocc_cache"};
+
         for (auto& p : fs::recursive_directory_iterator(dir)) {
-            if (p.path().extension() == ".cpp" || p.path().extension() == ".c" ||
-                p.path().extension() == ".cc" || p.path().extension() == ".s" ||
-                p.path().extension() == ".S" || p.path().extension() == ".asm" ||
-                p.path().extension() == ".c++" || p.path().extension() == ".cxx") {
-                files.push_back(p.path());
+            // Skip ignored directories
+            bool ignore = false;
+            for(const auto& part : p.path()){
+                if(ignored_dirs.contains(part.string())) {
+                    ignore = true;
+                    break;
+                }
+            }
+            if(ignore) continue;
+
+            if (p.is_regular_file()) {
+                const std::string ext = p.path().extension().string();
+                 if (ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".s" ||
+                     ext == ".S" || ext == ".asm" || ext == ".c++" || ext == ".cxx") {
+                    files.push_back(p.path());
+                }
             }
         }
         return files;
     }
 
-    [[nodiscard]] int Compile(const std::vector<fs::path>& files) const {
-        std::vector<std::string> Objects;
-        if (files.empty()) {
-            fmt::print(std::cerr, "[!] FATAL: No source files found.\n");
-            return 1;
+    // *** NEW: Incremental and Parallel Build Logic ***
+    int compileAndLink() {
+        const fs::path build_path = config.build_dir;
+        fs::create_directories(build_path);
+
+        // --- Step 1: Identify which files need to be recompiled ---
+        std::vector<fs::path> files_to_compile;
+        std::vector<fs::path> object_files;
+
+        // Get the latest modification time of any header file for dependency checking.
+        // A more advanced system would track per-file header dependencies.
+        auto latest_header_time = fs::file_time_type::min();
+        for (const auto& include_dir_str : config.include_dirs) {
+             if (include_dir_str.rfind("-I", 0) == 0) {
+                fs::path header_dir = include_dir_str.substr(2);
+                if (!fs::exists(header_dir)) continue;
+                for (const auto& entry : fs::recursive_directory_iterator(header_dir)) {
+                    if (entry.is_regular_file()) {
+                         const std::string ext = entry.path().extension().string();
+                         if (ext == ".h" || ext == ".hpp") {
+                             if (entry.last_write_time() > latest_header_time) {
+                                 latest_header_time = entry.last_write_time();
+                             }
+                         }
+                    }
+                }
+             }
         }
 
-        if (const std::filesystem::path build_path = BUILD;
-            std::filesystem::create_directories(build_path)) {
-            fmt::print("[+] Build directory '{}' created.\n", BUILD);
-        }
+        for (const auto& src_file : source_files) {
+            fs::path obj_file = build_path / (src_file.stem().string() + ".o");
+            object_files.push_back(obj_file);
 
-        for (const auto& file : files) {
-            std::string compiler = GetCompiler(file);
-            std::string objFile = file.stem().string() + ".o";
-            std::string cmd;
-
-            if (compiler == AS) {
-                cmd = fmt::format("{} {} -felf64 -o {}/{}",
-                                compiler, file.string(), BUILD, objFile);
+            bool needs_compile = false;
+            if (!fs::exists(obj_file)) {
+                needs_compile = true;
             } else {
-                cmd = fmt::format("{} -c {} -o {}/{} {} {}",
-                                compiler, file.string(), BUILD, objFile,
-                                FLAGS, fmt::join(includeDirs, " "));
+                auto src_time = fs::last_write_time(src_file);
+                auto obj_time = fs::last_write_time(obj_file);
+                if (src_time > obj_time || latest_header_time > obj_time) {
+                    needs_compile = true;
+                }
             }
 
-            fmt::print("[+] Compiling {} with {}...\n", file.filename().string(), compiler);
-            if (system(cmd.c_str()) != 0) {
-                fmt::print(stderr, "[!] FATAL: Failed to compile: {}\n", file.string());
+            if (needs_compile) {
+                files_to_compile.push_back(src_file);
+            }
+        }
+
+        if (files_to_compile.empty()) {
+            fmt::print("[?] All files are up to date.\n");
+        } else {
+            // --- Step 2: Compile needed files in parallel ---
+            fmt::print("[?] Compiling {}/{} source files...\n", files_to_compile.size(), source_files.size());
+            std::atomic<bool> compilation_failed = false;
+            std::atomic<size_t> file_index = 0;
+            const unsigned int num_threads = std::thread::hardware_concurrency();
+            std::vector<std::thread> workers;
+
+            workers.reserve(num_threads);
+            for (unsigned int i = 0; i < num_threads; ++i) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        if (compilation_failed) return;
+                        size_t index = file_index.fetch_add(1);
+                        if (index >= files_to_compile.size()) return;
+
+                        const auto& src_file = files_to_compile[index];
+                        std::string compiler = getCompiler(src_file);
+                        fs::path obj_file = build_path / (src_file.stem().string() + ".o");
+
+                        std::string cmd;
+                        if (compiler == config.as) {
+                            cmd = fmt::format("{} {} -felf64 -o {}", compiler, src_file.string(), obj_file.string());
+                        } else {
+                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.flags, fmt::join(config.include_dirs, " "));
+                        }
+
+                        {
+                            std::lock_guard lock(g_output_mutex);
+                            fmt::print("[CMD] {}\n", cmd);
+                        }
+
+                        int result = system(cmd.c_str());
+                        if (result != 0) {
+                            std::lock_guard lock(g_output_mutex);
+                            fmt::print(stderr, "[ERROR] Failed to compile: {}\n", src_file.string());
+                            compilation_failed = true;
+                        }
+                    }
+                });
+            }
+
+            for (auto& worker : workers) {
+                worker.join();
+            }
+
+            if (compilation_failed) {
+                fmt::print(stderr, "[ERROR] Compilation failed. Aborting.\n");
                 return 1;
             }
-            Objects.push_back(objFile);
         }
 
-        // Link all object files
-        std::vector<std::string> FullObjectPaths;
-        FullObjectPaths.reserve(Objects.size());
-        for (const auto& obj : Objects) {
-            FullObjectPaths.push_back(fmt::format("{}/{}", BUILD, obj));
-        }
+        // --- Step 3: Link all object files ---
+        const std::string link_cmd = fmt::format("{} -o {} {} {} {} {}",
+            config.cxx,
+            (build_path / config.name).string(),
+            fmt::join(object_files, " "),
+            config.flags,
+            config.ldflags,
+            fmt::join(config.external_libs, " ")
+        );
 
-        const std::string LinkCmd = fmt::format("{} -o {}/{} {} {} {} {}",
-                                              CXX, BUILD, NAME,
-                                              fmt::join(FullObjectPaths, " "),
-                                              FLAGS, LDFLAGS,
-                                              fmt::join(externalLibs, " "));
-
-        fmt::print("[+] Linking with {}...\n", CXX);
-        if (system(LinkCmd.c_str()) != 0) {
-            fmt::print(stderr, "[!] FATAL: Failed to link target: {}\n", NAME);
+        fmt::print("[?] Linking target...\n");
+        fmt::print("[CMD] {}\n", link_cmd);
+        if (system(link_cmd.c_str()) != 0) {
+            fmt::print(stderr, "[ERROR] Failed to link target: {}\n", config.name);
             return 1;
         }
 
-        fmt::print("[+] Target '{}' compiled successfully\n", NAME);
+        fmt::print(stdout, "\n[SUCCESS] Target '{}' built successfully in '{}'.\n", config.name, build_path.string());
         return 0;
     }
 };
 
+// --- User Interaction and Main ---
+
+void show_help() {
+    fmt::print(
+        "AutoCC - A zero-config C++ build system\n\n"
+        "Usage: autocc [command]\n\n"
+        "Commands:\n"
+        "  (no command)  Builds the project incrementally. If not configured, prompts for setup.\n"
+        "  init          Prompts for configuration and creates a new build environment. Overwrites existing config.\n"
+        "  rescan        Clears the cache and performs a full dependency scan before building.\n"
+        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all flags manually.\n"
+        "  clean         Removes the build directory and cache.\n"
+        "  help          Shows this help message.\n"
+    );
+}
+
+void user_init(Config& config) {
+    auto get_input = [](std::string_view prompt, std::string_view default_val) -> std::string {
+        fmt::print("[?] {} ({}): ", prompt, default_val);
+        std::string input;
+        std::getline(std::cin, input);
+        return input.empty() ? std::string(default_val) : input;
+    };
+
+    config.cc = get_input("C Compiler", config.cc);
+    config.cxx = get_input("C++ Compiler", config.cxx);
+    config.as = get_input("Assembler", config.as);
+    config.name = get_input("Executable Name", config.name);
+    config.flags = get_input("Compiler Flags", config.flags);
+    config.ldflags = get_input("Linker Flags", config.ldflags);
+    config.build_dir = get_input("Build Directory", config.build_dir);
+}
+
 int main(int argc, char* argv[]) {
     if (argc > 1) {
-        if (std::string arg1 = argv[1]; arg1 == "override") {
-            if (fs::exists(".autocc_cache")) {
-                fmt::print("[+] Invalidating cache...\n");
-                fs::remove_all(".autocc_cache");
+        std::string command = argv[1];
+        fs::path build_dir = ".autocc_build"; // Cache, may override default
+        fs::path cache_dir = ".autocc_cache";
+
+        // Read build_dir from cache if it exists, to ensure `clean` works correctly
+        if (fs::exists(cache_dir / "config.cache")) {
+            std::ifstream cache_file(cache_dir / "config.cache");
+            std::string line;
+            while(std::getline(cache_file, line)) {
+                if (line.rfind("build_dir:", 0) == 0) {
+                    build_dir = line.substr(10);
+                    break;
+                }
             }
-            Parser parser;
-            parser.UserInput();
-            AutoCC autocc(parser.cxx, parser.cc, parser.name, parser.flags,
-                         parser.ldflags, parser.as, parser.build, false); // false for auto-scan/cache
-            if (autocc.Success != 0) {
-                fmt::print(std::cerr, "[!] FATAL: Compilation failed. Exiting...\n");
-                return 1;
-            }
+        }
+
+        if (command == "help" || command == "--help") {
+            show_help();
             return 0;
         }
-        else if (arg1 == "autoscan") {
-            if (fs::exists(".autocc_cache")) {
-                fmt::print("[+] Invalidating cache...\n");
-                fs::remove_all(".autocc_cache");
-            }
-            AutoCC autocc{Default::DEF_CXX, Default::DEF_CC, Default::DEF_NAME, Default::DEF_FLAGS, Default::DEF_LDFLAGS, Default::DEF_AS, Default::DEF_BUILD, Default::DEF_MANUAL};
-            if (autocc.Success != 0) {
-                fmt::print(std::cerr, "[!] FATAL: Compilation failed. Exiting...\n");
-                return 1;
-            }
+        if (command == "clean") {
+            fmt::print("[?] Cleaning build directory '{}' and cache '{}'...\n", build_dir.string(), cache_dir.string());
+            fs::remove_all(build_dir);
+            fs::remove_all(cache_dir);
             return 0;
         }
-        else if (arg1 == "manual") {
-            Parser parser;
-            parser.UserInput();
-            AutoCC autocc(parser.cxx, parser.cc, parser.name, parser.flags,
-                         parser.ldflags, parser.as, parser.build, true); // true for manual mode
-            if (autocc.Success != 0) {
-                fmt::print(std::cerr, "[!] FATAL: Compilation failed. Exiting...\n");
-                return 1;
+        if (command == "init" || command == "rescan" || command == "manual") {
+            if (fs::exists(cache_dir)) {
+                fmt::print("[?] Invalidating cache for '{}' command...\n", command);
+                fs::remove_all(cache_dir);
             }
-            return 0;
-        }
-        else if (arg1 == "rescan") {
-            if (fs::exists(".autocc_cache")) {
-                fmt::print("[+] Invalidating cache and rescanning...\n");
-                fs::remove_all(".autocc_cache");
+            Config config;
+            if (command != "rescan") { // 'init' and 'manual' require user input
+               user_init(config);
             }
-            // Fall through to the no-argument case, which will trigger a full scan and cache writing
+            if (command == "manual") {
+                config.manual_mode = true;
+            }
+            AutoCC autocc(config);
+            return autocc.return_code;
         } else {
-            fmt::print(std::cerr, "[!] FATAL: Unknown command: {}. Use 'override', 'manual', or 'rescan'.\n", arg1);
+            fmt::print(stderr, "[ERROR] Unknown command: '{}'. Use 'autocc help' for usage.\n", command);
             return 1;
         }
     }
 
-    // Default behavior (argc == 1 or after 'rescan')
-    if (fs::exists(".autocc_cache/libs.cache")) {
-        AutoCC autocc{}; // Reads from cache
-        if (autocc.Success != 0) {
-            fmt::print(std::cerr, "[!] FATAL: Compilation failed. Exiting...\n");
-            return 1;
-        }
-        return 0;
-    } // No cache found, perform a full scan and new build
-    fmt::print("[+] No cache found. Performing full scan and building...\n");
-    Parser parser;
-    parser.UserInput();
-    AutoCC autocc(parser.cxx, parser.cc, parser.name, parser.flags,
-                 parser.ldflags, parser.as, parser.build, false); // false for auto-scan/cache
-    if (autocc.Success != 0) {
-        fmt::print(std::cerr, "[!] FATAL: Compilation failed. Exiting...\n");
-        return 1;
+    // Default behavior: build from cache or prompt init
+    if (fs::exists(".autocc_cache/config.cache")) {
+        AutoCC autocc; // Reads from cache and builds incrementally
+        return autocc.return_code;
     }
-    return 0;
+
+    fmt::print("[?] No configuration found. Starting initial setup...\n");
+    Config config;
+    user_init(config);
+    AutoCC autocc(config); // Full scan and build
+    return autocc.return_code;
 }
