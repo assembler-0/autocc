@@ -1,0 +1,42 @@
+#compdef autocc
+
+# zsh completion script for autocc (Corrected Version)
+#
+# To install:
+# 1. Save this file as '_autocc' in ~/.zsh/completions/
+# 2. Ensure fpath=(~/.zsh/completions $fpath) is in your ~/.zshrc
+# 3. Reload your shell (exec zsh)
+
+# This is the function that _arguments will call to get the list of commands.
+_autocc_cmds() {
+    local -a commands
+
+    # Define all available subcommands with their descriptions.
+    commands=(
+        'init:Prompts for configuration and creates a new build environment'
+        'rescan:Clears the cache and performs a full dependency scan'
+        'manual:Prompts for configuration but does NOT scan for dependencies'
+        'clean:Removes the build directory and cache'
+        'version:Show current version, build time and date'
+        'help:Shows the help message'
+    )
+
+    # _describe is a helper to list completions with their descriptions.
+    _describe -t commands "autocc commands" commands
+}
+
+# This is the main completion entry point.
+_autocc() {
+    # _arguments is the main Zsh completion helper function.
+    # '1:: :->cmds' means:
+    #   '1:'     - This rule applies to the first argument.
+    #   ':'      - An optional argument name (we leave it empty).
+    #   '->cmds' - If a completion is inserted, jump to the 'cmds' state.
+    # The action part is now directly calling our function.
+    _arguments \
+        '1: :_call_function 1 _autocc_cmds' \
+        '*:: :->args'
+}
+
+# It's good practice to call the main function at the end.
+_autocc "$@"
