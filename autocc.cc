@@ -32,7 +32,8 @@ struct Config {
     std::string cxx = "clang++";
     std::string as = "nasm";
     std::string name = "a.out";
-    std::string flags = "-Wall -Wextra -march=native -std=c++23 -O2 -pipe";
+    std::string cxxflags = "-march=native -std=c++23 -O2 -pipe";
+    std::string cflags = "-march=native -std=c11 -O2 -pipe";
     std::string ldflags;
     std::string build_dir = ".autocc_build";
     std::vector<std::string> include_dirs;
@@ -143,7 +144,7 @@ public:
         for (const auto& include : includes) {
             for (const auto& [header_signature, rule] : detectionMap) {
                 if (include.find(header_signature) != std::string::npos) {
-                    // Add direct library flags
+                    // Add direct library cxxflags
                     for (const auto& lib : rule.direct_libs) {
                         found_direct_libs.insert(lib);
                     }
@@ -156,7 +157,7 @@ public:
                                 additional_ldflags += " " + pkg_result;
                                 {
                                     std::lock_guard lock(g_output_mutex);
-                                    fmt::print("[INFO] Found dependency '{}', adding flags via pkg-config.\n", pkg_name);
+                                    fmt::print("[INFO] Found dependency '{}', adding cxxflags via pkg-config.\n", pkg_name);
                                 }
                             } else {
                                  std::lock_guard lock(g_output_mutex);
@@ -170,7 +171,7 @@ public:
         }
 
         config.external_libs.assign(found_direct_libs.begin(), found_direct_libs.end());
-        // Prepend a space only if there are flags to add
+        // Prepend a space only if there are cxxflags to add
         if (!additional_ldflags.empty()) {
             config.ldflags += " " + additional_ldflags;
         }
@@ -178,7 +179,7 @@ public:
 
 private:
     static std::string getPkgConfigFlags(const std::string& package) {
-        // Query for both library and compiler flags from pkg-config
+        // Query for both library and compiler cxxflags from pkg-config
         const std::string cmd = fmt::format("pkg-config --libs --cflags {} 2>/dev/null", package);
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) return "";
@@ -284,7 +285,7 @@ public:
     explicit AutoCC(Config cfg) : config(std::move(cfg)) {
         source_files = findSourceFiles(root);
         if (source_files.empty()) {
-            fmt::print(stderr, "[ERROR] No source files (.c, .cpp, .s, etc.) found in the current directory.\n");
+            fmt::print(stderr, "[!] FATAL:  No source files (.c, .cpp, .s, etc.) found in the current directory.\n");
             return_code = 1;
             return;
         }
@@ -302,13 +303,13 @@ public:
     // Constructor for building from cache
     explicit AutoCC() {
         if (!readCache()) {
-            fmt::print(stderr, "[ERROR] Cache not found. Please run 'autocc init' to configure the project.\n");
+            fmt::print(stderr, "[!] FATAL:  Cache not found. Please run 'autocc init' to configure the project.\n");
             return_code = 1;
             return;
         }
         source_files = findSourceFiles(root);
         if (source_files.empty()) {
-            fmt::print(stderr, "[ERROR] No source files found.\n");
+            fmt::print(stderr, "[!] FATAL:  No source files found.\n");
             return_code = 1;
             return;
         }
@@ -350,7 +351,8 @@ private:
         cache_file << "cc:" << config.cc << std::endl;
         cache_file << "as:" << config.as << std::endl;
         cache_file << "name:" << config.name << std::endl;
-        cache_file << "flags:" << config.flags << std::endl;
+        cache_file << "cxxflags:" << config.cxxflags << std::endl;
+        cache_file << "cflags:" << config.cflags << std::endl;
         cache_file << "ldflags:" << config.ldflags << std::endl;
         cache_file << "build_dir:" << config.build_dir << std::endl;
         for (const auto& dir : config.include_dirs) cache_file << "include:" << dir << std::endl;
@@ -371,7 +373,8 @@ private:
             else if (key == "cc") config.cc = value;
             else if (key == "as") config.as = value;
             else if (key == "name") config.name = value;
-            else if (key == "flags") config.flags = value;
+            else if (key == "cxxflags") config.cxxflags = value;
+            else if (key == "cflags") config.cflags = value;
             else if (key == "ldflags") config.ldflags = value;
             else if (key == "build_dir") config.build_dir = value;
             else if (key == "include") config.include_dirs.emplace_back(value);
@@ -415,7 +418,6 @@ private:
         return files;
     }
 
-    // *** NEW: Incremental and Parallel Build Logic ***
     int compileAndLink() {
         const fs::path build_path = config.build_dir;
         fs::create_directories(build_path);
@@ -466,6 +468,7 @@ private:
 
         if (files_to_compile.empty()) {
             fmt::print("[?] All files are up to date.\n");
+            return 0;
         } else {
             // --- Step 2: Compile needed files in parallel ---
             fmt::print("[?] Compiling {}/{} source files...\n", files_to_compile.size(), source_files.size());
@@ -479,7 +482,7 @@ private:
                 workers.emplace_back([&]() {
                     while (true) {
                         if (compilation_failed) return;
-                        size_t index = file_index.fetch_add(1);
+                        const size_t index = file_index.fetch_add(1);
                         if (index >= files_to_compile.size()) return;
 
                         const auto& src_file = files_to_compile[index];
@@ -489,19 +492,21 @@ private:
                         std::string cmd;
                         if (compiler == config.as) {
                             cmd = fmt::format("{} {} -felf64 -o {}", compiler, src_file.string(), obj_file.string());
+                        } else if (compiler == config.cxx) {
+                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.cxxflags, fmt::join(config.include_dirs, " "));
                         } else {
-                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.flags, fmt::join(config.include_dirs, " "));
+                            cmd = fmt::format("{} -c {} -o {} {} {}", compiler, src_file.string(), obj_file.string(), config.cflags, fmt::join(config.include_dirs, " "));
                         }
 
                         {
                             std::lock_guard lock(g_output_mutex);
-                            fmt::print("[CMD] {}\n", cmd);
+                            fmt::print("[C] {}\n", cmd);
                         }
 
                         int result = system(cmd.c_str());
                         if (result != 0) {
                             std::lock_guard lock(g_output_mutex);
-                            fmt::print(stderr, "[ERROR] Failed to compile: {}\n", src_file.string());
+                            fmt::print(stderr, "[!] FATAL:  Failed to compile: {}\n", src_file.string());
                             compilation_failed = true;
                         }
                     }
@@ -513,7 +518,7 @@ private:
             }
 
             if (compilation_failed) {
-                fmt::print(stderr, "[ERROR] Compilation failed. Aborting.\n");
+                fmt::print(stderr, "[!] FATAL:  Compilation failed. Aborting.\n");
                 return 1;
             }
         }
@@ -523,19 +528,19 @@ private:
             config.cxx,
             (build_path / config.name).string(),
             fmt::join(object_files, " "),
-            config.flags,
+            config.cxxflags,
             config.ldflags,
             fmt::join(config.external_libs, " ")
         );
 
         fmt::print("[?] Linking target...\n");
-        fmt::print("[CMD] {}\n", link_cmd);
+        fmt::print("[C] {}\n", link_cmd);
         if (system(link_cmd.c_str()) != 0) {
-            fmt::print(stderr, "[ERROR] Failed to link target: {}\n", config.name);
+            fmt::print(stderr, "[!] FATAL:  Failed to link target: {}\n", config.name);
             return 1;
         }
 
-        fmt::print(stdout, "\n[SUCCESS] Target '{}' built successfully in '{}'.\n", config.name, build_path.string());
+        fmt::print(stdout, "\n[+] Target '{}' built successfully in '{}'.\n", config.name, build_path.string());
         return 0;
     }
 };
@@ -550,7 +555,7 @@ void show_help() {
         "  (no command)  Builds the project incrementally. If not configured, prompts for setup.\n"
         "  init          Prompts for configuration and creates a new build environment. Overwrites existing config.\n"
         "  rescan        Clears the cache and performs a full dependency scan before building.\n"
-        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all flags manually.\n"
+        "  manual        Prompts for configuration but does NOT scan for headers or libraries. You must provide all cxxflags manually.\n"
         "  clean         Removes the build directory and cache.\n"
         "  help          Shows this help message.\n"
     );
@@ -568,7 +573,8 @@ void user_init(Config& config) {
     config.cxx = get_input("C++ Compiler", config.cxx);
     config.as = get_input("Assembler", config.as);
     config.name = get_input("Executable Name", config.name);
-    config.flags = get_input("Compiler Flags", config.flags);
+    config.cxxflags = get_input("CXX Flags", config.cxxflags);
+    config.cflags = get_input("CC Flags", config.cflags);
     config.ldflags = get_input("Linker Flags", config.ldflags);
     config.build_dir = get_input("Build Directory", config.build_dir);
 }
@@ -616,7 +622,7 @@ int main(int argc, char* argv[]) {
             AutoCC autocc(config);
             return autocc.return_code;
         } else {
-            fmt::print(stderr, "[ERROR] Unknown command: '{}'. Use 'autocc help' for usage.\n", command);
+            fmt::print(stderr, "[!] FATAL: Unknown command: '{}'. Use 'autocc help' for usage.\n", command);
             return 1;
         }
     }
