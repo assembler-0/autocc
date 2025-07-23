@@ -21,7 +21,7 @@ public:
     static constexpr auto DEF_CC = "clang";
     static constexpr auto DEF_CXX = "clang++";
     static constexpr auto DEF_AS = "nasm";
-    static constexpr auto DEF_FLAGS = "-Wall -march=native -fopenmp";
+    static constexpr auto DEF_FLAGS = "-Wall -march=native -fopenmp -std=c++23";
     static constexpr auto DEF_LDFLAGS = "";
     static constexpr auto DEF_NAME = "target_default";
     static constexpr auto DEF_BUILD = "autocc";
@@ -45,7 +45,10 @@ private:
         {"GLFW/glfw3.h", {"-lglfw", "-lGL", "-lX11", "-lpthread", "-ldl"}},
         {"curl/curl.h", {"-lcurl"}},
         {"sqlite3.h", {"-lsqlite3"}},
+        {"GL/", {"-lOpenGL"}},
+        {"allegro5/", {"-lallegro"}},
         {"zlib.h", {"-lz"}},
+        {"lzma.h", {"-llzma"}},
         {"openssl/ssl.h", {"-lssl", "-lcrypto"}},
         {"openssl/sha.h", {"-lssl", "-lcrypto"}},
         {"openssl/crypto.h", {"-lcrypto"}},
