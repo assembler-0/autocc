@@ -1,11 +1,20 @@
-# autocc configuration file
+[compilers]
+as = 'nasm'
+cc = 'clang'
+cxx = 'clang++'
 
-# Add include directories here,
-# For example,
-# includes = ["/usr/include/custom_lib", "/home/user/another_lib/include"]
-includes = []
+[features]
+use_pch = true
 
-# Add libraries to link against here
-# For example:
-# libs = ["-L/usr/lib -lcustom_lib", "-lanother_lib"]
-libs = []
+[flags]
+cflags = '-march=native -std=c11 -O2 -pipe'
+cxxflags = '-march=native -std=c++23 -O2 -pipe'
+ldflags = '  -lfmt'
+
+[paths]
+external_libs = [ '-lpthread' ]
+include_dirs = [ '-Iinclude' ]
+
+[project]
+build_dir = '.autocc_build'
+name = 'a.out'

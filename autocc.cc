@@ -15,9 +15,10 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
+#include "include/toml.hpp"
 
-#include "log.hpp"
-#include "utils.hpp"
+#include "include/log.hpp"
+#include "include/utils.hpp"
 
 #define DATE __DATE__
 #define TIME __TIME__
@@ -55,6 +56,93 @@ struct Config {
     std::vector<std::string> external_libs;
     bool manual_mode = false;
 };
+
+// Corrected function.
+// Replace the old one with this.
+void write_config_to_toml(const Config& config, const fs::path& toml_path) {
+    // --- New Part: Manually create TOML arrays ---
+    auto includes_arr = toml::array{};
+    for (const auto& dir : config.include_dirs) {
+        includes_arr.push_back(dir);
+    }
+
+    auto libs_arr = toml::array{};
+    for (const auto& lib : config.external_libs) {
+        libs_arr.push_back(lib);
+    }
+    // --- End of New Part ---
+
+    toml::table tbl = toml::table{
+            {"project", toml::table{
+                {"name", config.name},
+                {"build_dir", config.build_dir}
+            }},
+            {"compilers", toml::table{
+                {"cxx", config.cxx},
+                {"cc", config.cc},
+                {"as", config.as}
+            }},
+            {"flags", toml::table{
+                {"cxxflags", config.cxxflags},
+                {"cflags", config.cflags},
+                {"ldflags", config.ldflags}
+            }},
+            {"features", toml::table{
+                {"use_pch", config.use_pch}
+            }},
+            {"paths", toml::table{
+                // Now we use the arrays we created above
+                {"include_dirs", includes_arr},
+                {"external_libs", libs_arr}
+            }}
+    };
+
+    std::ofstream file(toml_path);
+    file << tbl;
+    out::success("Configuration saved to '{}'.", toml_path);
+}
+
+std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
+    if (!fs::exists(toml_path)) {
+        return std::nullopt;
+    }
+
+    try {
+        toml::table tbl = toml::parse_file(toml_path.string());
+        Config config;
+
+        // Helper to safely get values
+        auto get_or = [&](const toml::node* node, const std::string& default_val) {
+            return node ? node->value_or(default_val) : default_val;
+        };
+        auto get_bool_or = [&](const toml::node* node, bool default_val) {
+            return node ? node->value_or(default_val) : default_val;
+        };
+
+        config.name      = get_or(tbl["project"]["name"].as_string(), "a.out");
+        config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
+        config.cxx       = get_or(tbl["compilers"]["cxx"].as_string(), "clang++");
+        config.cc        = get_or(tbl["compilers"]["cc"].as_string(), "clang");
+        config.as        = get_or(tbl["compilers"]["as"].as_string(), "nasm");
+        config.cxxflags  = get_or(tbl["flags"]["cxxflags"].as_string(), "-march=native -std=c++23 -O2 -pipe");
+        config.cflags    = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
+        config.ldflags   = get_or(tbl["flags"]["ldflags"].as_string(), "");
+        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), true);
+
+        if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
+            for (const auto& elem : *includes) { config.include_dirs.push_back(elem.value_or("")); }
+        }
+        if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
+            for (const auto& elem : *libs) { config.external_libs.push_back(elem.value_or("")); }
+        }
+
+        return config;
+
+    } catch (const toml::parse_error& err) {
+        out::error("Failed to parse '{}':\n{}", toml_path, err.description());
+        return std::nullopt;
+    }
+}
 
 class LibraryDetector {
 private:
@@ -302,23 +390,19 @@ public:
         return instance;
     }
 
-    // Scans dependencies, detects libraries, and writes the configuration and dependency caches.
-    // Call this for a fresh setup ('init', 'rescan'). Returns true on success.
-    bool scan_and_cache() {
+    bool scan_and_cache_dependencies() { // Renamed for clarity
         if (source_files.empty()) {
             out::error("No source files (.c, .cpp, .s, etc.) found in the current directory.");
             return false;
         }
 
         if (!config.manual_mode) {
-            out::info("Starting automatic dependency scan...");
+            out::info("Scanning for local headers and external libraries...");
             scanLocalHeaders();
             detectLibraries();
         }
 
-        writeConfigCache();
-
-        // Also create the initial dependency cache
+        // Create the dependency cache
         out::info("Creating dependency cache...");
         dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
         writeDepCache();
@@ -664,28 +748,27 @@ private:
 
 void show_help() {
     using fmt::styled;
-    out::info("AutoCC {} - A smarter C++ build system", VERSION);
+    out::info("AutoCC {} - A smaller C++ build system", VERSION);
     fmt::print(
         "\n"
         "Usage: autocc [command]\n\n"
         "Commands:\n"
-        "  (no command)  Builds the project incrementally using cached settings.\n"
-        "  {}          Prompts for configuration and creates a new build environment.\n"
-        "  {}        Clears the cache and performs a full dependency scan before building.\n"
-        "  {}        Interactive setup, but YOU must provide all compiler/linker flags manually.\n"
-        "  {} <key> <val> Set a single config value (e.g., 'autocc set cxxflags -O3').\n"
-        "  {}           Removes the build directory and cache.\n"
-        "  {}         Show current version and build date.\n"
-        "  {}/{}      Compile with default parameters (no config).\n"
-        "  {}          Shows this help message.\n",
-        styled("init", out::color_prompt),
-        styled("rescan", out::color_prompt),
-        styled("manual", out::color_prompt),
-        styled("set", out::color_prompt),
+        "  {}               Builds the project incrementally using cached settings.\n"
+        "  {}        Auto-generated autocc.toml.\n"
+        "  {}        Convert autocc.toml to autocc build cache.\n"
+        "  {}              Same as no command (argc = 1).\n"
+        "  {}                Remove build directory.\n"
+        "  {}                Removes all autocc generated files\n"
+        "  {}                 Show current version and build date.\n"
+        "  {}              Shows this help message.\n",
+        styled("<none>", out::color_prompt),
+        styled("ac/autoconfig", out::color_prompt),
+        styled("setup/sync/sc", out::color_prompt),
+        styled("compile", out::color_prompt),
         styled("clean", out::color_prompt),
+        styled("clean", out::color_prompt),
+        styled("wipe", out::color_prompt),
         styled("version", out::color_prompt),
-        styled("--autoconfig", out::color_prompt),
-        styled("--autocompile", out::color_prompt),
         styled("help", out::color_prompt)
     );
 }
@@ -719,111 +802,114 @@ void user_init(Config& config) {
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = (pch_choice == "yes" || pch_choice == "y");
 }
-
 int main(const int argc, char* argv[]) {
-    if (argc > 1) {
-        std::string command = argv[1];
+    const fs::path config_toml_path = "autocc.toml";
+    const fs::path cache_dir = CACHE_DIR_NAME;
 
-        if (command == "version" || command == "--version" || command == "-v") { show_version(); return 0; }
-        if (command == "help" || command == "--help") { show_help(); return 0; }
-
-        if (command == "clean") {
-            Config temp_cfg; // Use default config as a fallback
-            // Safely try to load config from cache to find the correct build dir
-            if (fs::exists(fs::path(CACHE_DIR_NAME) / CONFIG_FILE_NAME)) {
-                if (auto autocc_opt = AutoCC::load_from_cache()) {
-                    temp_cfg = autocc_opt->config;
-                } else {
-                    out::warn("Could not read cache file, using default build directory name for cleaning.");
-                }
-            }
-
-            const fs::path build_dir_to_clean = temp_cfg.build_dir;
-            const fs::path cache_dir_to_clean = CACHE_DIR_NAME;
-            out::info("Cleaning build dir '{}' and cache '{}'...", build_dir_to_clean.string(), cache_dir_to_clean.string());
-            fs::remove_all(build_dir_to_clean);
-            fs::remove_all(cache_dir_to_clean);
-            out::success("Clean complete.");
-            return 0;
+    if (argc < 2) { // Default command is 'compile'
+        // --- COMPILE command logic (and default) ---
+        // 1. Check if setup has been run (cache exists)
+        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
+            out::error("Project not set up. Run 'autocc setup' first.");
+            out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
+            return 1;
         }
 
-        if (command == "init" || command == "rescan" || command == "manual") {
-            if (fs::exists(CACHE_DIR_NAME)) {
-                out::info("Invalidating cache for '{}' command...", command);
-                fs::remove_all(CACHE_DIR_NAME);
-            }
-            Config config;
-            if (command != "rescan") user_init(config);
-            if (command == "manual") config.manual_mode = true;
-
-            AutoCC autocc(config);
-            if (!autocc.scan_and_cache()) {
-                out::error("Project setup and scanning failed.");
-                return 1;
-            }
-            return autocc.build();
+        // 2. Check for sync (autocc.toml is newer than cache)
+        if (fs::exists(config_toml_path) && fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
+             out::warn("'autocc.toml' has been modified. Run 'autocc setup' to sync changes.");
         }
 
-        if (command == "--autoconfig" || command == "--autocompile") {
-            Config config;
-            AutoCC autocc(config);
-             if (!autocc.scan_and_cache()) {
-                out::error("Automatic project setup failed.");
-                return 1;
-            }
-            return autocc.build();
+        // 3. Load from cache and build
+        auto autocc_opt = AutoCC::load_from_cache();
+        if (!autocc_opt) {
+            out::error("Failed to load project from cache. Try running 'autocc setup' again.");
+            return 1;
         }
-
-        if (command == "set") {
-             if (argc != 4) {
-                 out::error("Usage: autocc set <key> <value>");
-                 return 1;
-             }
-             auto autocc_opt = AutoCC::load_from_cache();
-             if (!autocc_opt) {
-                 out::error("'set' command requires a project to be initialized first. Run 'autocc init'.");
-                 return 1;
-             }
-
-             AutoCC autocc = std::move(*autocc_opt);
-             std::string key = argv[2];
-             std::string value = argv[3];
-
-             if( key == "cxx") autocc.config.cxx = value;
-             else if (key == "cc") autocc.config.cc = value;
-             else if (key == "cflags") autocc.config.cflags = value;
-             else if (key == "cxxflags") autocc.config.cxxflags = value;
-             else if (key == "as") autocc.config.as = value;
-             else if (key == "name") autocc.config.name = value;
-             else if (key == "ldflags") autocc.config.ldflags = value;
-             else {
-                out::error("Unknown config key: '{}'", key);
-                return 1;
-             }
-             autocc.writeConfigCache(); // Save the modified config
-             out::success("Set '{}' to '{}'. Run 'autocc' to rebuild.", key, value);
-             return 0;
-        }
-
-        out::error("Unknown command: '{}'. Use 'autocc help' for usage.", command);
-        return 1;
+        return autocc_opt->build();
     }
 
-    // Default behavior: build from cache or prompt init
-    if (fs::exists(fs::path(CACHE_DIR_NAME) / CONFIG_FILE_NAME)) {
+    std::string command = argv[1];
+
+    if (command == "help") { show_help(); return 0; }
+    if (command == "version") { show_version(); return 0; }
+
+    // --- AUTOCONFIG command ---
+    if (command == "autoconfig" || command == "ac") {
+        if (fs::exists(config_toml_path)) {
+            out::warn("'autocc.toml' already exists. Overwriting.");
+        }
+        out::info("Starting interactive configuration...");
+        Config config;
+        user_init(config); // This is your existing user input function
+
+        out::info("Performing a deep scan for headers and libraries...");
+        AutoCC scanner(config); // Create a temporary instance to use its scanning methods
+        scanner.scan_and_cache_dependencies(); // This will populate the config object with scanned paths
+
+        write_config_to_toml(scanner.config, config_toml_path);
+        out::info("Now run 'autocc setup' to prepare the build environment.");
+        return 0;
+    }
+
+    // --- SETUP command ---
+    if (command == "setup" || command == "sync" || command == "sc") {
+        out::info("Setting up build environment from '{}'...", config_toml_path);
+        auto config_opt = load_config_from_toml(config_toml_path);
+        if (!config_opt) {
+            out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
+            return 1;
+        }
+
+        // Invalidate old cache
+        if (fs::exists(cache_dir)) {
+            fs::remove_all(cache_dir);
+        }
+
+        AutoCC autocc(*config_opt);
+        autocc.writeConfigCache(); // This is the core of "setup": create the internal cache
+
+        // Also create the initial dependency cache
+        out::info("Creating dependency cache...");
+        autocc.scan_and_cache_dependencies(); // Re-use the scan_and_cache_dependencies, it's perfect for this.
+
+        out::success("Setup complete. You can now run 'autocc compile' or just 'autocc'.");
+        return 0;
+    }
+
+    // --- COMPILE command (explicit) ---
+    if (command == "compile") {
+        return main(1, nullptr); // first time using recursive main, famous last words - assembler-0 @ 9:26AM 24/07/25
+    }
+
+    // --- CLEAN command ---
+    if (command == "clean") {
+        Config temp_cfg;
         if (auto autocc_opt = AutoCC::load_from_cache()) {
-            return autocc_opt->build();
+            temp_cfg = autocc_opt->config;
+            out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
+            fs::remove_all(temp_cfg.build_dir);
+            out::success("Clean complete. Targets and objects removed.");
+        } else {
+            out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
         }
-        return 1; // load_from_cache prints the error
+        return 0;
     }
 
-    out::info("No configuration found. Starting initial setup (like 'autocc init')...");
-    Config config;
-    user_init(config);
-    AutoCC autocc(config);
-    if (!autocc.scan_and_cache()) {
-        out::error("Project setup failed.");
-        return 1;
+    // --- WIPE command ---
+    if (command == "wipe") {
+        Config temp_cfg;
+        if (auto autocc_opt = AutoCC::load_from_cache()) {
+            temp_cfg = autocc_opt->config;
+        }
+        out::warn("Wiping all autocc files (build dir and cache)...");
+        fs::remove_all(temp_cfg.build_dir);
+        fs::remove_all(cache_dir);
+        out::success("Wipe complete. 'autocc.toml' was not removed.");
+        return 0;
     }
-    return autocc.build();
+
+
+    out::error("Unknown command: '{}'. Use 'autocc help' for usage.", command);
+    return 1;
 }
