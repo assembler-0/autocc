@@ -9,14 +9,14 @@
 extern std::mutex g_output_mutex;
 
 namespace out {
-    // Define our color scheme
-    constexpr auto color_info = fmt::fg(fmt::color::steel_blue);
-    constexpr auto color_warn = fmt::fg(fmt::color::golden_rod);
-    constexpr auto color_error = fmt::fg(fmt::color::indian_red) | fmt::emphasis::bold;
-    constexpr auto color_success = fmt::fg(fmt::color::medium_sea_green) | fmt::emphasis::bold;
-    constexpr auto color_cmd = fmt::fg(fmt::color::slate_gray);
-    constexpr auto color_prompt = fmt::fg(fmt::color::medium_turquoise);
-    constexpr auto color_default = fmt::fg(fmt::color::light_slate_gray);
+
+    constexpr auto color_info = fmt::fg(fmt::color::dodger_blue) | fmt::emphasis::bold;
+    constexpr auto color_warn = fmt::fg(fmt::color::orange) | fmt::emphasis::bold;
+    constexpr auto color_error = fmt::fg(fmt::color::crimson) | fmt::emphasis::bold;
+    constexpr auto color_success = fmt::fg(fmt::color::lime_green) | fmt::emphasis::bold;
+    constexpr auto color_cmd = fmt::fg(fmt::color::cyan);
+    constexpr auto color_prompt = fmt::fg(fmt::color::dodger_blue) | fmt::emphasis::bold;
+    constexpr auto color_default = fmt::fg(fmt::color::white);
 
     template<typename... T>
     void info(fmt::format_string<T...> fmt, T&&... args) {
