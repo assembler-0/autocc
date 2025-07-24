@@ -210,6 +210,7 @@ public:
                 out::error("Download failed. Could not connect or invalid response.");
                 auto err = res.error();
                 out::error("Reason: {}", httplib::to_string(err));
+                delete client;
                 return false;
             }
 
@@ -339,6 +340,8 @@ private:
     }
 };
 
+// --- START OF MODIFIED SECTION ---
+
 class IncludeParser {
 
     std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
@@ -380,10 +383,14 @@ public:
                 std::string line;
                 while (std::getline(file_stream, line)) {
                     if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
-                        const auto& header_name = matches[2].str();
-                        if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
-                            dependencies.insert(header_path);
-                            files_to_scan.push_back(header_path);
+                        // BUGFIX: Only track and recurse on local "..." includes.
+                        // The `matches[2].matched` check is crucial to avoid bugs with <...> includes.
+                        if (matches[2].matched) {
+                            const auto& header_name = matches[2].str();
+                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                                dependencies.insert(header_path);
+                                files_to_scan.push_back(header_path);
+                            }
                         }
                     }
                 }
@@ -393,15 +400,36 @@ public:
         return dep_map;
     }
 
-    // A simpler function to get all unique includes for library detection.
-    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles) const {
+    // A new recursive function to get all unique includes for library detection.
+    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
         std::unordered_set<std::string> unique_includes;
-        for (const auto& file : sourceFiles) {
-            std::ifstream stream(file);
+        std::vector<fs::path> files_to_scan = sourceFiles;
+        std::unordered_set<fs::path> scanned_files;
+
+        while (!files_to_scan.empty()) {
+            fs::path current_file = files_to_scan.back();
+            files_to_scan.pop_back();
+
+            if (scanned_files.contains(current_file)) continue;
+            scanned_files.insert(current_file);
+
+            std::ifstream file_stream(current_file);
+            if (!file_stream.is_open()) continue;
+
             std::string line;
-            while (std::getline(stream, line)) {
+            while (std::getline(file_stream, line)) {
                 if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                    // 1. Add the found include string (e.g., "fmt/format.h" or "my_header.h") to our set.
+                    // This captures both <...> and "..." includes for library detection.
                     unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
+
+                    // 2. If it's a local include ("..."), we need to find it and add it to the scan queue to parse it too.
+                    if (matches[2].matched) {
+                        const auto& header_name = matches[2].str();
+                        if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                            files_to_scan.push_back(header_path);
+                        }
+                    }
                 }
             }
         }
@@ -409,6 +437,7 @@ public:
     }
 };
 
+// --- END OF MODIFIED SECTION ---
 
 class AutoCC {
 public:
@@ -731,7 +760,8 @@ private:
     }
 
     void detectLibraries() {
-        const auto all_includes = include_parser.getAllUniqueIncludes(source_files);
+        // MODIFIED: Pass include_dirs to the new recursive `getAllUniqueIncludes`.
+        const auto all_includes = include_parser.getAllUniqueIncludes(source_files, config.include_dirs);
         lib_detector.detect(all_includes, config);
     }
 
@@ -912,7 +942,7 @@ int main(const int argc, char* argv[]) {
         }
 
         // 2. Check for sync (autocc.toml is newer than cache)
-        if (fs::exists(config_toml_path) && fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
+        if (fs::exists(config_toml_path) && fs::exists(cache_dir / CONFIG_FILE_NAME) && fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
              out::warn("'autocc.toml' has been modified. Run 'autocc setup' to sync changes.");
         }
 
@@ -932,7 +962,7 @@ int main(const int argc, char* argv[]) {
         Fetcher::download_file(BASE_DB_URL, base_db_path);
         return 0;
     }
-    
+
     if (command == "help") { show_help(); return 0; }
     if (command == "version") { show_version(); return 0; }
 
@@ -1004,7 +1034,9 @@ int main(const int argc, char* argv[]) {
         if (const auto optional = AutoCC::load_from_cache()) {
             Config temp_cfg = optional->config;
             out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
-            fs::remove_all(temp_cfg.build_dir);
+            if (fs::exists(temp_cfg.build_dir)) {
+                fs::remove_all(temp_cfg.build_dir);
+            }
             out::success("Clean complete. Targets and objects removed.");
         } else {
             out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
@@ -1019,9 +1051,9 @@ int main(const int argc, char* argv[]) {
             temp_cfg = optional->config;
         }
         out::warn("Wiping all autocc files (build dir and cache)...");
-        fs::remove_all(temp_cfg.build_dir);
-        fs::remove_all(cache_dir);
-        fs::remove_all(DB_FILE_NAME);
+        if(fs::exists(temp_cfg.build_dir)) fs::remove_all(temp_cfg.build_dir);
+        if(fs::exists(cache_dir)) fs::remove_all(cache_dir);
+        if(fs::exists(DB_FILE_NAME)) fs::remove(DB_FILE_NAME);
         out::success("Wipe complete. 'autocc.toml' was not removed.");
         return 0;
     }
