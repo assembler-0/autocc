@@ -9,12 +9,21 @@ use_pch = true
 [flags]
 cflags = '-march=native -std=c11 -O2 -pipe'
 cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = '  -lfmt'
+ldflags = '  -lssl  -lcrypto  -lxxhash  -lfmt'
 
 [paths]
 external_libs = [ '-lpthread' ]
-include_dirs = [ '-Iinclude' ]
+include_dirs = [
+    '-I./cmake-build-release/_deps/tomlplusplus-src',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/examples',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/include/toml++',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/include/toml++/impl',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/tests',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/toml-test',
+    '-I./cmake-build-release/_deps/tomlplusplus-src/vendor',
+    '-I./include'
+]
 
 [project]
 build_dir = '.autocc_build'
-name = 'a.out'
+name = 'autocc'

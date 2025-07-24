@@ -8,6 +8,7 @@
     "ncurses.h": { "pkg_configs": ["ncursesw", "ncurses"] },
     "curses.h": { "pkg_configs": ["ncursesw", "ncurses"] },
     "GL/gl.h": { "pkg_configs": ["gl"] },
+    "xxhash.h": { "pkg_configs": ["libxxhash"] },
     "vulkan/": { "pkg_configs": ["vulkan"] },
     "SDL2/SDL.h": { "pkg_configs": ["sdl2"] },
     "SDL2/SDL_image.h": { "pkg_configs": ["SDL2_image"] },
