@@ -15,10 +15,14 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
-#include "include/toml.hpp"
+#include <xxhash.h>
 
-#include "include/log.hpp"
-#include "include/utils.hpp"
+#include "toml.hpp"
+#include "log.hpp"
+#include "utils.hpp"
+#include "json.hpp"
+
+using json = nlohmann::json;
 
 #define DATE __DATE__
 #define TIME __TIME__
@@ -37,7 +41,7 @@ static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 
 template <>
 struct fmt::formatter<fs::path> : formatter<std::string_view> {
-    auto format(const fs::path& p, format_context& ctx) const {
+    auto format(const fs::path& p, format_context& ctx) const{
         return formatter<std::string_view>::format(p.string(), ctx);
     }
 };
@@ -57,8 +61,31 @@ struct Config {
     bool manual_mode = false;
 };
 
-// Corrected function.
-// Replace the old one with this.
+std::string hash_file(const fs::path& path) {
+    constexpr size_t buffer_size = 65536; // 64KB buffer
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return "";
+    }
+
+    std::vector<char> buffer(buffer_size);
+    XXH64_state_t* const state = XXH64_createState();
+    XXH64_reset(state, 0); // Use seed 0
+
+    while (file.read(buffer.data(), buffer_size)) {
+        XXH64_update(state, buffer.data(), file.gcount());
+    }
+    // Handle the last chunk
+    if (file.gcount() > 0) {
+        XXH64_update(state, buffer.data(), file.gcount());
+    }
+
+    XXH64_hash_t const hash_val = XXH64_digest(state);
+    XXH64_freeState(state);
+
+    return fmt::format("{:016x}", hash_val);
+}
+
 void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     // --- New Part: Manually create TOML arrays ---
     auto includes_arr = toml::array{};
@@ -72,7 +99,7 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     }
     // --- End of New Part ---
 
-    toml::table tbl = toml::table{
+    auto tbl = toml::table{
             {"project", toml::table{
                 {"name", config.name},
                 {"build_dir", config.build_dir}
@@ -145,104 +172,49 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
 }
 
 class LibraryDetector {
-private:
     struct DetectionRule {
         std::vector<std::string> direct_libs;
         std::vector<std::string> pkg_configs;
     };
 
-    // The detection map remains largely the same...
-    // (This map is good, so I'll omit it for brevity to focus on the new logic)
-    std::unordered_map<std::string, DetectionRule> detectionMap = {
-        // --- Core System & Standard-ish Libraries ---
-        // These are fundamental and very common.
-        {"math.h",          {.direct_libs = {"-lm"}}},
-        {"cmath",           {.direct_libs = {"-lm"}}},
-        {"pthread.h",       {.direct_libs = {"-lpthread"}}}, // POSIX Threads
-        {"thread",          {.direct_libs = {"-lpthread"}}}, // C++ <thread> often needs this
-        {"dlfcn.h",         {.direct_libs = {"-ldl"}}},      // For dynamic library loading (dlopen)
-        {"ncurses.h",       {.pkg_configs = {"ncursesw"}}},  // Ncurses for terminal UI
-        {"curses.h",        {.pkg_configs = {"ncursesw"}}},  // A common alternative include name
+    // The map is now a member, not a static initializer
+    std::unordered_map<std::string, DetectionRule> detectionMap;
+    bool rules_loaded = false;
 
-        // --- Graphics & Multimedia ---
-        // Best to use pkg-config for these as dependencies can be complex.
-        {"GL/gl.h",         {.pkg_configs = {"gl"}}},            // OpenGL
-        {"vulkan/", {.pkg_configs = {"vulkan"}}},        // Vulkan
-        {"SDL2/SDL.h",      {.pkg_configs = {"sdl2"}}},          // SDL2 Core
-        {"SDL2/SDL_image.h",{.pkg_configs = {"SDL2_image"}}},    // SDL2 Image
-        {"SDL2/SDL_ttf.h",  {.pkg_configs = {"SDL2_ttf"}}},      // SDL2 TrueType Fonts
-        {"SDL2/SDL_mixer.h",{.pkg_configs = {"SDL2_mixer"}}},    // SDL2 Audio Mixer
-        {"SFML/Graphics.hpp",{.pkg_configs = {"sfml-graphics"}}},// SFML Graphics
-        {"SFML/Window.hpp", {.pkg_configs = {"sfml-window"}}},  // SFML Window
-        {"SFML/System.hpp", {.pkg_configs = {"sfml-system"}}},  // SFML System
-        {"GLFW/glfw3.h",    {.direct_libs = {"-lglfw"}, .pkg_configs = {"gl"}}}, // GLFW
-        {"cairo.h",         {.pkg_configs = {"cairo"}}},         // Cairo 2D graphics
-        {"png.h",           {.pkg_configs = {"libpng"}}},        // libpng
-        {"jpeglib.h",       {.direct_libs = {"-ljpeg"}}},        // libjpeg
-        {"turbojpeg.h",     {.direct_libs = {"-lturbojpeg"}}},   // libjpeg-turbo
-        {"OpenAL/al.h",     {.pkg_configs = {"openal"}}},        // OpenAL 3D Audio
-        {"AL/al.h",         {.pkg_configs = {"openal"}}},        // Alternative OpenAL path
-        {"imgui.h",         {/* Header-only, but requires a backend (e.g., OpenGL, Vulkan) to be linked separately */}},
+    // A new method to load the rules
+    void load_rules_from_file(const fs::path& db_path) {
+        if (!fs::exists(db_path)) {
+            out::warn("Library database '{}' not found. Library detection will be limited.", db_path);
+            return;
+        }
+        try {
+            std::ifstream f(db_path);
 
-        // --- GUI Toolkits ---
-        {"gtk/gtk.h",       {.pkg_configs = {"gtk+-3.0"}}}, // GTK+ 3
-        {"gtk-4.0/gtk/gtk.h",{.pkg_configs = {"gtk4"}}},     // GTK 4
-        {"QtWidgets/",      {.pkg_configs = {"Qt6Widgets", "Qt5Widgets"}}}, // Qt Widgets (tries Qt6 first)
-        {"QtCore/",         {.pkg_configs = {"Qt6Core", "Qt5Core"}}},       // Qt Core
-        {"wx/wx.h",         {.pkg_configs = {"wxwidgets"}}}, // wxWidgets (often needs a more specific .pc file like 'wxwidgets-3.2-gtk3-unicode')
+            for (json data = json::parse(f); auto& [header, rule_json] : data["libraries"].items()) {
+                DetectionRule rule;
+                if (rule_json.contains("direct_libs")) {
+                    rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                }
+                if (rule_json.contains("pkg_configs")) {
+                    rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                }
+                detectionMap[header] = rule;
+            }
+            out::info("Loaded {} library detection rules.", detectionMap.size());
+            rules_loaded = true;
+        } catch (const json::parse_error& e) {
+            out::error("Failed to parse library database '{}': {}", db_path, e.what());
+        }
+    }
 
-        // --- Data Handling (JSON, XML, YAML, Databases) ---
-        {"nlohmann/json.hpp", {/* Header-only */}},
-        {"rapidjson/document.h", {/* Header-only */}},
-        {"json/json.h",     {.pkg_configs = {"jsoncpp"}}},       // JsonCpp
-        {"jansson.h",       {.pkg_configs = {"jansson"}}},       // Jansson C JSON library
-        {"libxml/parser.h", {.pkg_configs = {"libxml-2.0"}}},    // libxml2
-        {"pugixml.hpp",     {/* Header-only */}},               // pugixml
-        {"yaml-cpp/yaml.h", {.pkg_configs = {"yaml-cpp"}}},      // yaml-cpp
-        {"sqlite3.h",       {.pkg_configs = {"sqlite3"}}},       // SQLite3
-        {"libpq-fe.h",      {.pkg_configs = {"libpq"}}},         // PostgreSQL client (libpq)
-        {"mysql.h",         {.direct_libs = {"-lmysqlclient"}}}, // MySQL/MariaDB client
-
-        // --- Networking & Web ---
-        {"curl/curl.h",     {.pkg_configs = {"libcurl"}}},       // libcurl
-        {"openssl/ssl.h",   {.pkg_configs = {"libssl", "libcrypto"}}}, // OpenSSL
-        {"openssl/crypto.h",{.pkg_configs = {"libcrypto"}}},     // OpenSSL (crypto part only)
-        {"grpcpp/grpcpp.h", {.pkg_configs = {"grpc++"}}},        // gRPC
-        {"httplib.h",       {.pkg_configs = {"libssl", "libcrypto"}}}, // cpp-httplib (header-only, but needs SSL for https)
-        {"zmq.h",           {.pkg_configs = {"libzmq"}}},        // ZeroMQ
-
-        // --- Compression & Cryptography ---
-        {"zlib.h",          {.direct_libs = {"-lz"}}},           // zlib
-        {"zstd.h",          {.pkg_configs = {"libzstd"}}},       // Zstandard
-        {"lzma.h",          {.pkg_configs = {"liblzma"}}},       // lzma (XZ Utils)
-        {"bzlib.h",         {.direct_libs = {"-lbz2"}}},         // bzip2
-        {"blake3.h",        {.direct_libs = {"-lblake3"}}},      // BLAKE3
-        {"sodium.h",        {.pkg_configs = {"libsodium"}}},     // libsodium
-
-        // --- General Utilities & Frameworks (Boost, Logging, etc.) ---
-        {"fmt/",      {.pkg_configs = {"fmt"}}},           // {fmt} library
-        {"spdlog/spdlog.h", {.pkg_configs = {"spdlog"}}},        // spdlog (often pulls in fmt)
-        {"glog/logging.h",  {.direct_libs = {"-lglog"}}},        // Google Log
-        {"boost/system/error_code.hpp", {.direct_libs = {"-lboost_system"}}},
-        {"boost/filesystem.hpp", {.direct_libs = {"-lboost_system", "-lboost_filesystem"}}},
-        {"boost/thread.hpp", {.direct_libs = {"-lboost_thread", "-lboost_system"}}},
-        {"boost/asio.hpp",   {.direct_libs = {"-lboost_system"}}},
-        {"tbb/tbb.h",       {.pkg_configs = {"tbb"}}},           // Intel TBB
-
-        // --- Numerics & Science ---
-        {"Eigen/Dense",     {/* Header-only */}},
-        {"gsl/gsl_sf_bessel.h", {.pkg_configs = {"gsl"}}},       // GNU Scientific Library
-        {"fftw3.h",         {.direct_libs = {"-lfftw3"}}},       // FFTW
-
-        // --- Testing Frameworks ---
-        {"gtest/gtest.h",   {.direct_libs = {"-lgtest", "-lgtest_main", "-lpthread"}}}, // Google Test
-        {"catch2/catch.hpp",{/* Header-only */}},                // Catch2
-    };
     std::unordered_map<std::string, std::string> pkg_cache; // Cache for pkg-config results
 
 public:
+    LibraryDetector() {
+        load_rules_from_file("autocc.base.json");
+    }
     void detect(const std::vector<std::string>& includes, Config& config) {
-        std::unordered_set<std::string> found_direct_libs(config.external_libs.begin(), config.external_libs.end());
+        std::unordered_set found_direct_libs(config.external_libs.begin(), config.external_libs.end());
         std::unordered_set<std::string> processed_pkg_configs;
         std::string additional_ldflags;
 
@@ -253,8 +225,7 @@ public:
                     for (const auto& pkg_name : rule.pkg_configs) {
                         if (processed_pkg_configs.contains(pkg_name)) continue;
 
-                        auto pkg_result = getPkgConfigFlags(pkg_name);
-                        if (!pkg_result.empty()) {
+                        if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
                             additional_ldflags += " " + pkg_result;
                             out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
                         } else {
@@ -288,7 +259,7 @@ private:
 };
 
 class IncludeParser {
-private:
+
     std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
 
     // Finds a header file in the search paths.
@@ -327,14 +298,11 @@ public:
 
                 std::string line;
                 while (std::getline(file_stream, line)) {
-                    std::smatch matches;
-                    if (std::regex_search(line, matches, include_regex)) {
-                        if (bool is_local_include = matches[2].matched) {
-                            const auto& header_name = matches[2].str();
-                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
-                                dependencies.insert(header_path);
-                                files_to_scan.push_back(header_path);
-                            }
+                    if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                        const auto& header_name = matches[2].str();
+                        if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                            dependencies.insert(header_path);
+                            files_to_scan.push_back(header_path);
                         }
                     }
                 }
@@ -351,8 +319,7 @@ public:
             std::ifstream stream(file);
             std::string line;
             while (std::getline(stream, line)) {
-                std::smatch matches;
-                if (std::regex_search(line, matches, include_regex)) {
+                if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
                     unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
                 }
             }
@@ -364,18 +331,13 @@ public:
 
 class AutoCC {
 public:
-    // Public member for easy access to configuration, e.g., for the 'set' command.
     Config config;
 
-    // Constructor for creating an instance with a new configuration.
-    // Used for 'init', 'rescan', and 'manual' commands.
     explicit AutoCC(Config cfg) : config(std::move(cfg)) {
         const auto ignored_dirs = getIgnoredDirs();
         source_files = find_source_files(root, ignored_dirs);
     }
 
-    // Factory method to load an instance from a cached configuration.
-    // Returns an empty optional if the cache doesn't exist or is invalid.
     static std::optional<AutoCC> load_from_cache() {
         AutoCC instance; // Uses private default constructor
         if (!instance.readConfigCache()) {
@@ -405,7 +367,9 @@ public:
         // Create the dependency cache
         out::info("Creating dependency cache...");
         dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
-        writeDepCache();
+        std::ofstream out_cache(dep_cache_file);
+        out_cache << "{}"; // Write an empty JSON object
+        out_cache.close();
 
         return true;
     }
@@ -438,60 +402,110 @@ public:
         const fs::path build_path = config.build_dir;
         fs::create_directories(build_path);
 
+        out::info("Parsing source file dependencies...");
+        dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
         // --- Step 1: Update & Load Dependency Information ---
         if (fs::exists(dep_cache_file)) {
-            readDepCache();
+            // nothing here
         } else {
             // This is a fallback in case the dependency cache was deleted but the config cache wasn't.
             out::warn("Dependency cache not found. Performing a one-time dependency scan.");
             dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
-            writeDepCache();
         }
 
+        json build_cache;
         // --- Step 2: Generate PCH if enabled ---
         std::string pch_flags;
-        fs::path pch_file;
         auto pch_time = fs::file_time_type::min();
         if (config.use_pch) {
+            fs::path pch_file;
             pch_file = generatePCH(build_path, pch_flags);
             if(fs::exists(pch_file)) pch_time = fs::last_write_time(pch_file);
         }
 
-        // --- Step 3: Identify files needing recompilation (The Smart Way) ---
+        if (fs::exists(dep_cache_file)) {
+            std::ifstream f(dep_cache_file);
+            build_cache = json::parse(f, nullptr, false); // No-throw parse
+            if (build_cache.is_discarded()) {
+                out::warn("Dependency cache is corrupt. Forcing a full rebuild.");
+                build_cache = json::object();
+            }
+        }
+
+        json new_build_cache = json::object();
         std::vector<fs::path> files_to_compile;
         std::vector<fs::path> object_files;
-        out::info("Checking dependencies...");
+
+        out::info("Checking dependencies with content hashing...");
 
         for (const auto& src_file : source_files) {
             fs::path obj_file = build_path / src_file.filename().replace_extension(".o");
             object_files.push_back(obj_file);
 
+            bool needs_recompile = false;
+            std::string reason;
+
+            // A. Check if object file even exists
             if (!fs::exists(obj_file)) {
-                files_to_compile.push_back(src_file);
-                continue;
+                needs_recompile = true;
+                reason = "object file missing";
             }
 
-            auto obj_time = fs::last_write_time(obj_file);
-            if (fs::last_write_time(src_file) > obj_time) {
-                files_to_compile.push_back(src_file);
-                continue;
-            }
-            // Check against PCH timestamp
-            if (!pch_file.empty() && pch_time > obj_time) {
-                 files_to_compile.push_back(src_file);
-                 continue;
+            // B. Calculate current build signature
+            std::string current_source_hash = hash_file(src_file);
+            if (current_source_hash.empty()) {
+                out::error("Could not hash source file: {}. Aborting.", src_file);
+                return 1;
             }
 
-            // Check against this file's specific header dependencies
+            std::string current_flags;
+            if (const std::string compiler = getCompiler(src_file); compiler == config.cxx) {
+                current_flags = config.cxxflags;
+            } else if (compiler == config.cc) {
+                current_flags = config.cflags;
+            }
+
+            json current_dep_hashes = json::object();
             if (dependency_map.contains(src_file)) {
                 for (const auto& header : dependency_map.at(src_file)) {
-                    if (fs::exists(header) && fs::last_write_time(header) > obj_time) {
-                        files_to_compile.push_back(src_file);
-                        break; // Found one, no need to check others for this source file
+                    current_dep_hashes[header.string()] = hash_file(header);
+                }
+            }
+
+            // C. Compare with cached signature
+            if (!needs_recompile) {
+                if (!build_cache.contains(obj_file.string())) {
+                    needs_recompile = true;
+                    reason = "not in cache";
+                } else {
+                    const auto& cached_info = build_cache[obj_file.string()];
+                    if (cached_info.value("source_hash", "") != current_source_hash) {
+                        needs_recompile = true;
+                        reason = "source file changed";
+                    } else if (cached_info.value("flags", "") != current_flags) {
+                        needs_recompile = true;
+                        reason = "compiler flags changed";
+                    } else if (cached_info.value("dep_hashes", json::object()) != current_dep_hashes) {
+                        needs_recompile = true;
+                        reason = "a header dependency changed";
                     }
                 }
             }
+
+            if (needs_recompile) {
+                files_to_compile.push_back(src_file);
+                out::info("Will recompile {}: {}.", src_file, reason);
+            }
+
+            // D. Store the NEW build info for saving later
+            new_build_cache[obj_file.string()] = {
+                {"source", src_file.string()},
+                {"source_hash", current_source_hash},
+                {"dep_hashes", current_dep_hashes},
+                {"flags", current_flags}
+            };
         }
+
 
         if (files_to_compile.empty() && !source_files.empty()) {
             out::success("All {} files are up to date.", source_files.size());
@@ -507,7 +521,7 @@ public:
                 workers.emplace_back([&]() {
                     while (true) {
                         if (compilation_failed) return;
-                        size_t index = file_index.fetch_add(1);
+                        const size_t index = file_index.fetch_add(1);
                         if (index >= files_to_compile.size()) return;
 
                         const auto& src = files_to_compile[index];
@@ -569,10 +583,12 @@ public:
             fmt::print(stderr, "{}\n", result.stderr_output);
             return 1;
         }
-
+        std::ofstream out_cache(dep_cache_file);
+        out_cache << new_build_cache.dump(2);
         out::success("Target '{}' built successfully in '{}'.", config.name, config.build_dir);
         return 0;
     }
+
 private:
     // Private constructor for use by the factory method.
     AutoCC() = default;
@@ -595,9 +611,9 @@ private:
         config.include_dirs.clear();
         config.external_libs.clear();
         while (std::getline(file, line)) {
-            auto pos = line.find(':');
+            const auto pos = line.find(':');
             if (pos == std::string::npos) continue;
-            std::string_view key = std::string_view(line).substr(0, pos);
+            const std::string_view key = std::string_view(line).substr(0, pos);
             std::string_view value = std::string_view(line).substr(pos + 1);
 
             if (key == "cxx") config.cxx = value;
@@ -611,6 +627,7 @@ private:
             else if (key == "use_pch") config.use_pch = (value == "true");
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
+
         }
         return true;
     }
@@ -695,8 +712,7 @@ private:
             std::string line;
             std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_"); // System headers only
             while(std::getline(stream, line)) {
-                std::smatch matches;
-                if(std::regex_search(line, matches, pch_candidate_regex)) {
+                if(std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
                     include_counts[matches[1].str()]++;
                 }
             }
@@ -731,10 +747,9 @@ private:
             config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
 
         out::command("{}", pch_compile_cmd);
-        auto result = execute(pch_compile_cmd);
-        if (result.exit_code != 0) {
+        if (const auto [exit_code, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
             out::warn("PCH generation failed. Continuing without it.");
-            out::warn("Compiler error: {}", result.stderr_output);
+            out::warn("Compiler error: {}", stderr_output);
             return {};
         }
 
@@ -782,7 +797,7 @@ void show_version() {
 }
 
 void user_init(Config& config) {
-    auto get_input = [](std::string_view prompt, std::string_view default_val) -> std::string {
+    auto get_input = [](const std::string_view prompt, const std::string_view default_val) -> std::string {
         fmt::print(stdout, "{} ({})? ",
             fmt::styled(prompt, out::color_prompt),
             fmt::styled(default_val, out::color_default));
@@ -801,14 +816,14 @@ void user_init(Config& config) {
     config.build_dir = get_input("Build Directory", config.build_dir);
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = (pch_choice == "yes" || pch_choice == "y");
+
 }
 int main(const int argc, char* argv[]) {
     const fs::path config_toml_path = "autocc.toml";
     const fs::path cache_dir = CACHE_DIR_NAME;
 
-    if (argc < 2) { // Default command is 'compile'
-        // --- COMPILE command logic (and default) ---
-        // 1. Check if setup has been run (cache exists)
+    if (argc < 2) {
+
         if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
             out::error("Project not set up. Run 'autocc setup' first.");
             out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
@@ -855,7 +870,7 @@ int main(const int argc, char* argv[]) {
     // --- SETUP command ---
     if (command == "setup" || command == "sync" || command == "sc") {
         out::info("Setting up build environment from '{}'...", config_toml_path);
-        auto config_opt = load_config_from_toml(config_toml_path);
+        const auto config_opt = load_config_from_toml(config_toml_path);
         if (!config_opt) {
             out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
             return 1;
@@ -879,14 +894,24 @@ int main(const int argc, char* argv[]) {
 
     // --- COMPILE command (explicit) ---
     if (command == "compile") {
-        return main(1, nullptr); // first time using recursive main, famous last words - assembler-0 @ 9:26AM 24/07/25
+        if (command == "compile") {
+            if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
+                out::error("Project not set up. Run 'autocc setup' first.");
+                return 1;
+            }
+            auto autocc_opt = AutoCC::load_from_cache();
+            if (!autocc_opt) {
+                out::error("Failed to load project from cache. Try running 'autocc setup' again.");
+                return 1;
+            }
+            return autocc_opt->build();
+        }
     }
 
     // --- CLEAN command ---
     if (command == "clean") {
-        Config temp_cfg;
-        if (auto autocc_opt = AutoCC::load_from_cache()) {
-            temp_cfg = autocc_opt->config;
+        if (const auto optional = AutoCC::load_from_cache()) {
+            Config temp_cfg = optional->config;
             out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
             fs::remove_all(temp_cfg.build_dir);
             out::success("Clean complete. Targets and objects removed.");
@@ -899,8 +924,8 @@ int main(const int argc, char* argv[]) {
     // --- WIPE command ---
     if (command == "wipe") {
         Config temp_cfg;
-        if (auto autocc_opt = AutoCC::load_from_cache()) {
-            temp_cfg = autocc_opt->config;
+        if (const auto optional = AutoCC::load_from_cache()) {
+            temp_cfg = optional->config;
         }
         out::warn("Wiping all autocc files (build dir and cache)...");
         fs::remove_all(temp_cfg.build_dir);
