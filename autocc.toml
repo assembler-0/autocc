@@ -9,7 +9,7 @@ use_pch = true
 [flags]
 cflags = '-march=native -std=c11 -O2 -pipe'
 cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = '  -lfmt'
+ldflags = '  -lfmt -lxxhash -lcrypto -lssl'
 
 [paths]
 external_libs = [ '-lpthread' ]

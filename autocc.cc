@@ -17,10 +17,13 @@
 #include <fmt/chrono.h>
 #include <xxhash.h>
 
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+
 #include "toml.hpp"
 #include "log.hpp"
 #include "utils.hpp"
 #include "json.hpp"
+#include "httplib.h"
 
 using json = nlohmann::json;
 
@@ -38,6 +41,8 @@ static constexpr auto CACHE_DIR_NAME = ".autocc_cache";
 static constexpr auto CONFIG_FILE_NAME = "config.cache";
 static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
+static constexpr auto DB_FILE_NAME = "autocc.base.json";
+static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
 
 template <>
 struct fmt::formatter<fs::path> : formatter<std::string_view> {
@@ -171,6 +176,83 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
     }
 }
 
+class Fetcher {
+public:
+
+    bool download_file(const std::string& url, const fs::path& dest_path) {
+        out::info("Attempting to download from {}...", url);
+
+        try {
+            std::string host, path;
+            if (!parse_url(url, host, path)) {
+                out::error("Invalid URL format: {}", url);
+                return false;
+            }
+
+            // 1. Declare a unique_ptr to the BASE class in the outer scope.
+            std::unique_ptr<httplib::Client> client;
+
+            if (url.rfind("https://", 0) == 0) {
+                auto client = std::make_unique<httplib::SSLClient>(host);
+
+                if (auto* ssl_client = client.get()) {
+                    ssl_client->set_ca_cert_path("/etc/ssl/certs/ca-certificates.crt");
+                }
+            } else {
+                // Or create a regular Client.
+                client = std::make_unique<httplib::Client>(host);
+            }
+
+            // Now you can use `client` polymorphically.
+            client->set_follow_location(true);
+
+            auto res = client->Get(path.c_str());
+
+            if (!res) {
+                out::error("Download failed. Could not connect or invalid response.");
+                auto err = res.error();
+                out::error("Reason: {}", httplib::to_string(err));
+                return false;
+            }
+
+            if (res->status == 200) {
+                std::ofstream file(dest_path, std::ios::binary);
+                file.write(res->body.c_str(), res->body.size());
+                // No need for file.close(), it happens automatically when `file` goes out of scope.
+                out::success("Successfully downloaded and saved to '{}'.", dest_path);
+                return true;
+            } else {
+                out::error("Download failed. Server responded with status code: {}", res->status);
+                return false;
+            }
+
+        } catch (const std::exception& e) {
+            out::error("An exception occurred during download: {}", e.what());
+            return false;
+        }
+    }
+
+private:
+    bool parse_url(const std::string& url, std::string& host, std::string& path) {
+        const std::string protocol_end = "://";
+        size_t host_start = url.find(protocol_end);
+        if (host_start == std::string::npos) {
+            return false; // Invalid URL format
+        }
+        host_start += protocol_end.length();
+
+        size_t path_start = url.find('/', host_start);
+        if (path_start == std::string::npos) {
+            host = url.substr(host_start);
+            path = "/";
+        } else {
+            host = url.substr(host_start, path_start - host_start);
+            path = url.substr(path_start);
+        }
+        return true;
+    }
+};
+
 class LibraryDetector {
     struct DetectionRule {
         std::vector<std::string> direct_libs;
@@ -211,7 +293,7 @@ class LibraryDetector {
 
 public:
     LibraryDetector() {
-        load_rules_from_file("autocc.base.json");
+        load_rules_from_file(DB_FILE_NAME);
     }
     void detect(const std::vector<std::string>& includes, Config& config) {
         std::unordered_set found_direct_libs(config.external_libs.begin(), config.external_libs.end());
@@ -774,6 +856,7 @@ void show_help() {
         "  {}              Same as no command (argc = 1).\n"
         "  {}                Remove build directory.\n"
         "  {}                Removes all autocc generated files\n"
+        "  {}               Download/update the library detection database.\n"
         "  {}                 Show current version and build date.\n"
         "  {}              Shows this help message.\n",
         styled("<none>", out::color_prompt),
@@ -782,6 +865,7 @@ void show_help() {
         styled("compile", out::color_prompt),
         styled("clean", out::color_prompt),
         styled("clean", out::color_prompt),
+        styled("fetch", out::color_prompt),
         styled("wipe", out::color_prompt),
         styled("version", out::color_prompt),
         styled("help", out::color_prompt)
@@ -821,9 +905,9 @@ void user_init(Config& config) {
 int main(const int argc, char* argv[]) {
     const fs::path config_toml_path = "autocc.toml";
     const fs::path cache_dir = CACHE_DIR_NAME;
+    const fs::path base_db_path = "autocc.base.json";
 
     if (argc < 2) {
-
         if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
             out::error("Project not set up. Run 'autocc setup' first.");
             out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
@@ -846,6 +930,13 @@ int main(const int argc, char* argv[]) {
 
     std::string command = argv[1];
 
+    if (command == "fetch") {
+        out::info("Fetching latest library database...");
+        Fetcher fetch;
+        fetch.download_file(BASE_DB_URL, base_db_path);
+        return 0;
+    }
+    
     if (command == "help") { show_help(); return 0; }
     if (command == "version") { show_version(); return 0; }
 
@@ -930,6 +1021,7 @@ int main(const int argc, char* argv[]) {
         out::warn("Wiping all autocc files (build dir and cache)...");
         fs::remove_all(temp_cfg.build_dir);
         fs::remove_all(cache_dir);
+        fs::remove_all(DB_FILE_NAME);
         out::success("Wipe complete. 'autocc.toml' was not removed.");
         return 0;
     }
