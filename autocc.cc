@@ -162,10 +162,10 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), true);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
-            for (const auto& elem : *includes) { config.include_dirs.push_back(elem.value_or("")); }
+            for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
         }
         if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
-            for (const auto& elem : *libs) { config.external_libs.push_back(elem.value_or("")); }
+            for (const auto& elem : *libs) { config.external_libs.emplace_back(elem.value_or("")); }
         }
 
         return config;
@@ -179,7 +179,7 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
 class Fetcher {
 public:
 
-    bool download_file(const std::string& url, const fs::path& dest_path) {
+    static bool download_file(const std::string& url, const fs::path& dest_path) {
         out::info("Attempting to download from {}...", url);
 
         try {
@@ -204,7 +204,7 @@ public:
 
             client->set_follow_location(true);
 
-            auto res = client->Get(path.c_str());
+            auto res = client->Get(path);
 
             if (!res) {
                 out::error("Download failed. Could not connect or invalid response.");
@@ -232,7 +232,7 @@ public:
     }
 
 private:
-    bool parse_url(const std::string& url, std::string& host, std::string& path) {
+    static bool parse_url(const std::string& url, std::string& host, std::string& path) {
         const std::string protocol_end = "://";
         size_t host_start = url.find(protocol_end);
         if (host_start == std::string::npos) {
@@ -497,11 +497,9 @@ public:
         json build_cache;
         // --- Step 2: Generate PCH if enabled ---
         std::string pch_flags;
-        auto pch_time = fs::file_time_type::min();
         if (config.use_pch) {
             fs::path pch_file;
             pch_file = generatePCH(build_path, pch_flags);
-            if(fs::exists(pch_file)) pch_time = fs::last_write_time(pch_file);
         }
 
         if (fs::exists(dep_cache_file)) {
@@ -931,8 +929,7 @@ int main(const int argc, char* argv[]) {
 
     if (command == "fetch") {
         out::info("Fetching latest library database...");
-        Fetcher fetch;
-        fetch.download_file(BASE_DB_URL, base_db_path);
+        Fetcher::download_file(BASE_DB_URL, base_db_path);
         return 0;
     }
     
@@ -943,8 +940,7 @@ int main(const int argc, char* argv[]) {
     if (command == "autoconfig" || command == "ac") {
         if (!fs::exists(DB_FILE_NAME)) {
             out::info("Fetching latest library database...");
-            Fetcher fetch;
-            fetch.download_file(BASE_DB_URL, base_db_path);
+            Fetcher::download_file(BASE_DB_URL, base_db_path);
         }
         if (fs::exists(config_toml_path)) {
             out::warn("'autocc.toml' already exists. Overwriting.");
