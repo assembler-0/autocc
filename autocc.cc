@@ -103,30 +103,34 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     }
 
     auto tbl = toml::table{
-            {"project", toml::table{
-                {"name", config.name},
-                {"build_dir", config.build_dir}
-            }},
-            {"compilers", toml::table{
-                {"cxx", config.cxx},
-                {"cc", config.cc},
-                {"as", config.as}
-            }},
-            {"flags", toml::table{
-                {"cxxflags", config.cxxflags},
-                {"cflags", config.cflags},
-                {"ldflags", config.ldflags}
-            }},
-            {"features", toml::table{
-                {"use_pch", config.use_pch}
-            }},
-            {"paths", toml::table{
-                {"include_dirs", includes_arr},
-                {"external_libs", libs_arr}
-            }}
+        {"project", toml::table{
+            {"name", config.name},
+            {"build_dir", config.build_dir}
+        }},
+        {"compilers", toml::table{
+            {"cxx", config.cxx},
+            {"cc", config.cc},
+            {"as", config.as}
+        }},
+        {"flags", toml::table{
+            {"cxxflags", config.cxxflags},
+            {"cflags", config.cflags},
+            {"ldflags", config.ldflags}
+        }},
+        {"features", toml::table{
+            {"use_pch", config.use_pch}
+        }},
+        {"paths", toml::table{
+            {"include_dirs", includes_arr},
+            {"external_libs", libs_arr}
+        }}
     };
 
     std::ofstream file(toml_path);
+    if (!file.is_open()) {
+        out::error("Failed to open '{}' for writing configuration.", toml_path);
+        return;
+    }
     file << tbl;
     out::success("Configuration saved to '{}'.", toml_path);
 }
@@ -155,7 +159,7 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.cxxflags  = get_or(tbl["flags"]["cxxflags"].as_string(), "-march=native -std=c++23 -O2 -pipe");
         config.cflags    = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
         config.ldflags   = get_or(tbl["flags"]["ldflags"].as_string(), "");
-        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), true);
+        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
             for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
@@ -204,7 +208,7 @@ public:
                         out::error("Failed to open file for writing: {}", dest_path);
                         return false;
                     }
-                    file.write(res->body.c_str(), res->body.size());
+                    file.write(res->body.c_str(), static_cast<std::streamsize>(res->body.size()));
                     out::success("Successfully downloaded and saved to '{}'.", dest_path);
                     return true;
                 }
@@ -270,7 +274,11 @@ class LibraryDetector {
             out::info("Loaded {} library detection rules.", detectionMap.size());
         } catch (const json::parse_error& e) {
             out::error("Failed to parse library database '{}': {}. Attempting to re-download and parse.", db_path, e.what());
-            fs::remove(db_path); // Remove corrupt file
+            try {
+                fs::remove(db_path); // Remove corrupt file
+            } catch (const fs::filesystem_error& fs_error) {
+                out::error("Failed to remove corrupt database file '{}': {}", db_path, fs_error.what());
+            }
             if (Fetcher::download_file(BASE_DB_URL, db_path)) {
                 // Try parsing again after successful download
                 try {
@@ -371,7 +379,10 @@ public:
                 if (scanned_files.contains(current_file)) continue;
                 scanned_files.insert(current_file);
                 std::ifstream file_stream(current_file);
-                if (!file_stream.is_open()) continue;
+                if (!file_stream.is_open()) {
+                    out::warn("Could not open file for dependency parsing: {}", current_file);
+                    continue;
+                }
                 std::string line;
                 while (std::getline(file_stream, line)) {
                     if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
@@ -399,7 +410,10 @@ public:
             if (scanned_files.contains(current_file)) continue;
             scanned_files.insert(current_file);
             std::ifstream file_stream(current_file);
-            if (!file_stream.is_open()) continue;
+            if (!file_stream.is_open()) {
+                out::warn("Could not open file for unique includes parsing: {}", current_file);
+                continue;
+            }
             std::string line;
             while (std::getline(file_stream, line)) {
                 if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
@@ -455,8 +469,17 @@ public:
     }
 
     void writeConfigCache() const {
-        fs::create_directories(cache_dir);
+        try {
+            fs::create_directories(cache_dir);
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to create cache directory '{}': {}", cache_dir, e.what());
+            return;
+        }
         std::ofstream file(config_file);
+        if (!file.is_open()) {
+            out::error("Failed to open config cache file for writing: {}", config_file);
+            return;
+        }
         file << "cxx:" << config.cxx << "\n";
         file << "cc:" << config.cc << "\n";
         file << "as:" << config.as << "\n";
@@ -480,7 +503,12 @@ public:
         run_auto_detection();
 
         const fs::path build_path = config.build_dir;
-        fs::create_directories(build_path);
+        try {
+            fs::create_directories(build_path);
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to create build directory '{}': {}", build_path, e.what());
+            return 1;
+        }
 
         out::info("Parsing source file dependencies for build...");
         dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
@@ -649,6 +677,10 @@ private:
     bool readConfigCache() {
         if (!fs::exists(config_file)) return false;
         std::ifstream file(config_file);
+        if (!file.is_open()) {
+            out::error("Failed to open config cache file for reading: {}", config_file);
+            return false;
+        }
         std::string line;
         config.include_dirs.clear();
         config.external_libs.clear();
@@ -702,6 +734,10 @@ private:
             if (getCompiler(src) != config.cxx) continue;
             cpp_file_count++;
             std::ifstream stream(src);
+        if (!stream.is_open()) {
+            out::warn("Could not open source file for PCH analysis: {}", src);
+            continue;
+        }
             std::string line;
             std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_" );
             while(std::getline(stream, line)) {
@@ -728,6 +764,10 @@ private:
         fs::path pch_out = pch_source.string() + ".gch";
         out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
         std::ofstream pch_file(pch_source);
+        if (!pch_file.is_open()) {
+            out::error("Failed to create PCH source file: {}", pch_source);
+            return "";
+        }
         for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
         pch_file.close();
         const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
@@ -869,7 +909,11 @@ int main(const int argc, char* argv[]) {
             return 1;
         }
         if (fs::exists(cache_dir)) {
-            fs::remove_all(cache_dir);
+            try {
+                fs::remove_all(cache_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
+            }
         }
         AutoCC autocc(*config_opt);
         autocc.writeConfigCache(); // Core of "setup": create the internal cache from TOML.
@@ -900,9 +944,16 @@ int main(const int argc, char* argv[]) {
         if (const auto optional = AutoCC::load_from_cache()) {
             Config temp_cfg = optional->config;
             out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
-            if (fs::exists(temp_cfg.build_dir)) fs::remove_all(temp_cfg.build_dir);
+            if (fs::exists(temp_cfg.build_dir)) {
+                try {
+                    fs::remove_all(temp_cfg.build_dir);
+                } catch (const fs::filesystem_error& e) {
+                    out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
+                }
+            }
             out::success("Clean complete. Targets and objects removed.");
-        } else {
+        }
+        else {
             out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
         }
         return 0;
@@ -914,9 +965,27 @@ int main(const int argc, char* argv[]) {
             temp_cfg = optional->config;
         }
         out::warn("Wiping all autocc files (build dir and cache)...");
-        if (fs::exists(temp_cfg.build_dir)) fs::remove_all(temp_cfg.build_dir);
-        if (fs::exists(cache_dir)) fs::remove_all(cache_dir);
-        if (fs::exists(base_db_path)) fs::remove(base_db_path);
+        if (fs::exists(temp_cfg.build_dir)) {
+            try {
+                fs::remove_all(temp_cfg.build_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
+            }
+        }
+        if (fs::exists(cache_dir)) {
+            try {
+                fs::remove_all(cache_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
+            }
+        }
+        if (fs::exists(base_db_path)) {
+            try {
+                fs::remove(base_db_path);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove database file '{}': {}", base_db_path, e.what());
+            }
+        }
         out::success("Wipe complete. 'autocc.toml' was not removed.");
         return 0;
     }
