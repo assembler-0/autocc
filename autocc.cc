@@ -103,30 +103,34 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     }
 
     auto tbl = toml::table{
-            {"project", toml::table{
-                {"name", config.name},
-                {"build_dir", config.build_dir}
-            }},
-            {"compilers", toml::table{
-                {"cxx", config.cxx},
-                {"cc", config.cc},
-                {"as", config.as}
-            }},
-            {"flags", toml::table{
-                {"cxxflags", config.cxxflags},
-                {"cflags", config.cflags},
-                {"ldflags", config.ldflags}
-            }},
-            {"features", toml::table{
-                {"use_pch", config.use_pch}
-            }},
-            {"paths", toml::table{
-                {"include_dirs", includes_arr},
-                {"external_libs", libs_arr}
-            }}
+        {"project", toml::table{
+            {"name", config.name},
+            {"build_dir", config.build_dir}
+        }},
+        {"compilers", toml::table{
+            {"cxx", config.cxx},
+            {"cc", config.cc},
+            {"as", config.as}
+        }},
+        {"flags", toml::table{
+            {"cxxflags", config.cxxflags},
+            {"cflags", config.cflags},
+            {"ldflags", config.ldflags}
+        }},
+        {"features", toml::table{
+            {"use_pch", config.use_pch}
+        }},
+        {"paths", toml::table{
+            {"include_dirs", includes_arr},
+            {"external_libs", libs_arr}
+        }}
     };
 
     std::ofstream file(toml_path);
+    if (!file.is_open()) {
+        out::error("Failed to open '{}' for writing configuration.", toml_path);
+        return;
+    }
     file << tbl;
     out::success("Configuration saved to '{}'.", toml_path);
 }
@@ -155,7 +159,7 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.cxxflags  = get_or(tbl["flags"]["cxxflags"].as_string(), "-march=native -std=c++23 -O2 -pipe");
         config.cflags    = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
         config.ldflags   = get_or(tbl["flags"]["ldflags"].as_string(), "");
-        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), true);
+        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
             for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
@@ -174,38 +178,53 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
 
 class Fetcher {
 public:
-    static bool download_file(const std::string& url, const fs::path& dest_path) {
+    static bool download_file(const std::string& url, const fs::path& dest_path, int max_retries = 3) {
         out::info("Attempting to download from {}...", url);
-        try {
-            std::string host, path;
-            if (!parse_url(url, host, path)) {
-                out::error("Invalid URL format: {}", url);
-                return false;
-            }
-            httplib::SSLClient client(host);
-            client.set_ca_cert_path("/etc/ssl/certs/ca-certificates.crt");
-            client.set_follow_location(true);
+        for (int retry_count = 0; retry_count < max_retries; ++retry_count) {
+            try {
+                std::string host, path;
+                if (!parse_url(url, host, path)) {
+                    out::error("Invalid URL format: {}", url);
+                    return false;
+                }
+                httplib::SSLClient client(host);
+                client.set_ca_cert_path("/etc/ssl/certs/ca-certificates.crt");
+                client.set_follow_location(true);
+                client.set_connection_timeout(std::chrono::seconds(5)); // 5-second connection timeout
+                client.set_read_timeout(std::chrono::seconds(10));    // 10-second read timeout
 
-            auto res = client.Get(path);
+                auto res = client.Get(path);
 
-            if (!res) {
-                out::error("Download failed. Could not connect or invalid response.");
-                out::error("Reason: {}", httplib::to_string(res.error()));
-                return false;
+                if (!res) {
+                    out::error("Download failed (Attempt {}/{}). Reason: {}", retry_count + 1, max_retries, httplib::to_string(res.error()));
+                    if (retry_count < max_retries - 1) {
+                        std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait before retrying
+                    }
+                    continue;
+                }
+                if (res->status == 200) {
+                    std::ofstream file(dest_path, std::ios::binary);
+                    if (!file.is_open()) {
+                        out::error("Failed to open file for writing: {}", dest_path);
+                        return false;
+                    }
+                    file.write(res->body.c_str(), static_cast<std::streamsize>(res->body.size()));
+                    out::success("Successfully downloaded and saved to '{}'.", dest_path);
+                    return true;
+                }
+                out::error("Download failed (Attempt {}/{}). Server responded with status code: {}", retry_count + 1, max_retries, res->status);
+                if (retry_count < max_retries - 1) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait before retrying
+                }
+            } catch (const std::exception& e) {
+                out::error("An exception occurred during download (Attempt {}/{}): {}", retry_count + 1, max_retries, e.what());
+                if (retry_count < max_retries - 1) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait before retrying
+                }
             }
-            if (res->status == 200) {
-                std::ofstream file(dest_path, std::ios::binary);
-                file.write(res->body.c_str(), res->body.size());
-                out::success("Successfully downloaded and saved to '{}'.", dest_path);
-                return true;
-            }
-            out::error("Download failed. Server responded with status code: {}", res->status);
-            return false;
-
-        } catch (const std::exception& e) {
-            out::error("An exception occurred during download: {}", e.what());
-            return false;
         }
+        out::error("Failed to download {} after {} attempts.", url, max_retries);
+        return false;
     }
 private:
     static bool parse_url(const std::string& url, std::string& host, std::string& path) {
@@ -234,11 +253,18 @@ class LibraryDetector {
     std::unordered_map<std::string, std::string> pkg_cache;
     void load_rules_from_file(const fs::path& db_path) {
         if (!fs::exists(db_path)) {
-            out::warn("Library database '{}' not found. Library detection will be limited.", db_path);
-            return;
+            out::warn(fmt::runtime("Library database '{}' not found. Attempting to download..."));
+            if (!Fetcher::download_file(BASE_DB_URL, db_path)) {
+                out::error("Failed to download library database. Library detection will be limited.");
+                return;
+            }
         }
         try {
             std::ifstream f(db_path);
+            if (!f.is_open()) {
+                out::error("Failed to open library database '{}'. Library detection will be limited.", db_path);
+                return;
+            }
             for (json data = json::parse(f); auto& [header, rule_json] : data["libraries"].items()) {
                 DetectionRule rule;
                 if (rule_json.contains("direct_libs")) rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
@@ -247,7 +273,33 @@ class LibraryDetector {
             }
             out::info("Loaded {} library detection rules.", detectionMap.size());
         } catch (const json::parse_error& e) {
-            out::error("Failed to parse library database '{}': {}", db_path, e.what());
+            out::error("Failed to parse library database '{}': {}. Attempting to re-download and parse.", db_path, e.what());
+            try {
+                fs::remove(db_path); // Remove corrupt file
+            } catch (const fs::filesystem_error& fs_error) {
+                out::error("Failed to remove corrupt database file '{}': {}", db_path, fs_error.what());
+            }
+            if (Fetcher::download_file(BASE_DB_URL, db_path)) {
+                // Try parsing again after successful download
+                try {
+                    std::ifstream f(db_path);
+                    if (!f.is_open()) {
+                        out::error("Failed to open re-downloaded library database '{}'. Library detection will be limited.", db_path);
+                        return;
+                    }
+                    for (json data = json::parse(f); auto& [header, rule_json] : data["libraries"].items()) {
+                        DetectionRule rule;
+                        if (rule_json.contains("direct_libs")) rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                        if (rule_json.contains("pkg_configs")) rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                        detectionMap[header] = rule;
+                    }
+                    out::info("Successfully re-downloaded and loaded {} library detection rules.", detectionMap.size());
+                } catch (const json::parse_error& e2) {
+                    out::error("Failed to parse re-downloaded library database '{}': {}. Library detection will be limited.", db_path, e2.what());
+                }
+            } else {
+                out::error("Failed to re-download library database. Library detection will be limited.");
+            }
         }
     }
 public:
@@ -279,15 +331,23 @@ public:
 private:
     std::string getPkgConfigFlags(const std::string& package) {
         if (pkg_cache.contains(package)) return pkg_cache[package];
-        const std::string cmd = fmt::format("pkg-config --libs --cflags {} 2>/dev/null", package);
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (!pipe) return "";
-        std::string result;
-        char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) result += buffer;
-        pclose(pipe);
-        if (!result.empty() && result.back() == '\n') result.pop_back();
-        return pkg_cache[package] = result;
+        const std::string cmd = fmt::format("pkg-config --libs --cflags {}", package);
+        CommandResult result = execute(cmd);
+
+        if (result.exit_code != 0) {
+            if (result.stderr_output.find("not found") != std::string::npos) {
+                out::warn("pkg-config for '{}' failed: Package not found. Is it installed?", package);
+            } else if (!result.stderr_output.empty()) {
+                out::warn("pkg-config for '{}' failed with error: {}", package, result.stderr_output);
+            } else {
+                out::warn("pkg-config for '{}' failed with unknown error.", package);
+            }
+            return "";
+        }
+
+        std::string stdout_result = result.stdout_output;
+        if (!stdout_result.empty() && stdout_result.back() == '\n') stdout_result.pop_back();
+        return pkg_cache[package] = stdout_result;
     }
 };
 // --- START OF MODIFIED SECTION ---
@@ -319,7 +379,10 @@ public:
                 if (scanned_files.contains(current_file)) continue;
                 scanned_files.insert(current_file);
                 std::ifstream file_stream(current_file);
-                if (!file_stream.is_open()) continue;
+                if (!file_stream.is_open()) {
+                    out::warn("Could not open file for dependency parsing: {}", current_file);
+                    continue;
+                }
                 std::string line;
                 while (std::getline(file_stream, line)) {
                     if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
@@ -347,7 +410,10 @@ public:
             if (scanned_files.contains(current_file)) continue;
             scanned_files.insert(current_file);
             std::ifstream file_stream(current_file);
-            if (!file_stream.is_open()) continue;
+            if (!file_stream.is_open()) {
+                out::warn("Could not open file for unique includes parsing: {}", current_file);
+                continue;
+            }
             std::string line;
             while (std::getline(file_stream, line)) {
                 if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
@@ -403,8 +469,17 @@ public:
     }
 
     void writeConfigCache() const {
-        fs::create_directories(cache_dir);
+        try {
+            fs::create_directories(cache_dir);
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to create cache directory '{}': {}", cache_dir, e.what());
+            return;
+        }
         std::ofstream file(config_file);
+        if (!file.is_open()) {
+            out::error("Failed to open config cache file for writing: {}", config_file);
+            return;
+        }
         file << "cxx:" << config.cxx << "\n";
         file << "cc:" << config.cc << "\n";
         file << "as:" << config.as << "\n";
@@ -428,7 +503,12 @@ public:
         run_auto_detection();
 
         const fs::path build_path = config.build_dir;
-        fs::create_directories(build_path);
+        try {
+            fs::create_directories(build_path);
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to create build directory '{}': {}", build_path, e.what());
+            return 1;
+        }
 
         out::info("Parsing source file dependencies for build...");
         dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
@@ -536,7 +616,7 @@ public:
                             cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags, fmt::join(config.include_dirs, " "));
                         }
                         out::command("{}", cmd);
-                        if (auto [exit_code, stderr_output] = execute(cmd); exit_code != 0) {
+                        if (auto [exit_code, stdout_output, stderr_output] = execute(cmd); exit_code != 0) {
                             out::error("Failed to compile: {}", src);
                             std::lock_guard lock(g_output_mutex);
                             fmt::print(stderr, "{}\n", stderr_output);
@@ -564,7 +644,7 @@ public:
             config.cxxflags, config.ldflags, fmt::join(config.external_libs, " "));
         out::command("{}", link_cmd);
 
-        if (auto [exit_code, stderr_output] = execute(link_cmd); exit_code != 0) {
+        if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
             out::error("Failed to link target: {}", config.name);
             std::lock_guard lock(g_output_mutex);
             fmt::print(stderr, "{}\n", stderr_output);
@@ -597,6 +677,10 @@ private:
     bool readConfigCache() {
         if (!fs::exists(config_file)) return false;
         std::ifstream file(config_file);
+        if (!file.is_open()) {
+            out::error("Failed to open config cache file for reading: {}", config_file);
+            return false;
+        }
         std::string line;
         config.include_dirs.clear();
         config.external_libs.clear();
@@ -650,8 +734,12 @@ private:
             if (getCompiler(src) != config.cxx) continue;
             cpp_file_count++;
             std::ifstream stream(src);
+        if (!stream.is_open()) {
+            out::warn("Could not open source file for PCH analysis: {}", src);
+            continue;
+        }
             std::string line;
-            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_");
+            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_" );
             while(std::getline(stream, line)) {
                 if(std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
                     include_counts[matches[1].str()]++;
@@ -676,12 +764,16 @@ private:
         fs::path pch_out = pch_source.string() + ".gch";
         out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
         std::ofstream pch_file(pch_source);
+        if (!pch_file.is_open()) {
+            out::error("Failed to create PCH source file: {}", pch_source);
+            return "";
+        }
         for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
         pch_file.close();
         const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
             config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
         out::command("{}", pch_compile_cmd);
-        if (auto [exit_code, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
+        if (auto [exit_code, stdout_output, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
             out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
             return "";
         }
@@ -789,7 +881,9 @@ int main(const int argc, char* argv[]) {
     if (command == "autoconfig" || command == "ac") {
         if (!fs::exists(DB_FILE_NAME)) {
             out::info("Fetching latest library database for initial configuration...");
-            Fetcher::download_file(BASE_DB_URL, base_db_path);
+            if (!Fetcher::download_file(BASE_DB_URL, base_db_path)) {
+                out::warn("Failed to download library database. Library detection might be limited.");
+            }
         }
         if (fs::exists(config_toml_path)) {
             out::warn("'autocc.toml' already exists. Overwriting.");
@@ -811,11 +905,15 @@ int main(const int argc, char* argv[]) {
         out::info("Syncing build environment from '{}'...", config_toml_path);
         const auto config_opt = load_config_from_toml(config_toml_path);
         if (!config_opt) {
-            out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
+            out::error(fmt::runtime("Could not load '{}'. Run 'autocc autoconfig' to create it."));
             return 1;
         }
         if (fs::exists(cache_dir)) {
-            fs::remove_all(cache_dir);
+            try {
+                fs::remove_all(cache_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
+            }
         }
         AutoCC autocc(*config_opt);
         autocc.writeConfigCache(); // Core of "setup": create the internal cache from TOML.
@@ -846,9 +944,16 @@ int main(const int argc, char* argv[]) {
         if (const auto optional = AutoCC::load_from_cache()) {
             Config temp_cfg = optional->config;
             out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
-            if (fs::exists(temp_cfg.build_dir)) fs::remove_all(temp_cfg.build_dir);
+            if (fs::exists(temp_cfg.build_dir)) {
+                try {
+                    fs::remove_all(temp_cfg.build_dir);
+                } catch (const fs::filesystem_error& e) {
+                    out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
+                }
+            }
             out::success("Clean complete. Targets and objects removed.");
-        } else {
+        }
+        else {
             out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
         }
         return 0;
@@ -860,9 +965,27 @@ int main(const int argc, char* argv[]) {
             temp_cfg = optional->config;
         }
         out::warn("Wiping all autocc files (build dir and cache)...");
-        if (fs::exists(temp_cfg.build_dir)) fs::remove_all(temp_cfg.build_dir);
-        if (fs::exists(cache_dir)) fs::remove_all(cache_dir);
-        if (fs::exists(base_db_path)) fs::remove(base_db_path);
+        if (fs::exists(temp_cfg.build_dir)) {
+            try {
+                fs::remove_all(temp_cfg.build_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
+            }
+        }
+        if (fs::exists(cache_dir)) {
+            try {
+                fs::remove_all(cache_dir);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
+            }
+        }
+        if (fs::exists(base_db_path)) {
+            try {
+                fs::remove(base_db_path);
+            } catch (const fs::filesystem_error& e) {
+                out::error("Failed to remove database file '{}': {}", base_db_path, e.what());
+            }
+        }
         out::success("Wipe complete. 'autocc.toml' was not removed.");
         return 0;
     }
