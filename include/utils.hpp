@@ -19,27 +19,45 @@ namespace fs = std::filesystem;
 // A struct to hold the result of a command execution
 struct CommandResult {
     int exit_code;
+    std::string stdout_output;
     std::string stderr_output;
 };
 
-// Executes a command and captures its exit code and stderr.
+// Executes a command and captures its exit code, stdout, and stderr.
 [[nodiscard]]
 inline CommandResult execute(const std::string& cmd) {
+    std::array<char, 128> buffer;
+    std::string stdout_result;
+    std::string stderr_result;
+
+    // Create temporary files for stdout and stderr
+    fs::path stdout_path = fs::temp_directory_path() / "autocc_stdout.log";
     fs::path stderr_path = fs::temp_directory_path() / "autocc_stderr.log";
-    std::string full_cmd = cmd + " 2> " + stderr_path.string();
+
+    // Construct the command to redirect stdout and stderr to files
+    std::string full_cmd = cmd + " > " + stdout_path.string() + " 2> " + stderr_path.string();
 
     int exit_code = system(full_cmd.c_str());
 
-    std::string stderr_output;
+    // Read stdout from file
+    if (fs::exists(stdout_path)) {
+        std::ifstream stdout_file(stdout_path);
+        std::stringstream ss_stdout;
+        ss_stdout << stdout_file.rdbuf();
+        stdout_result = ss_stdout.str();
+        fs::remove(stdout_path);
+    }
+
+    // Read stderr from file
     if (fs::exists(stderr_path)) {
         std::ifstream stderr_file(stderr_path);
-        std::stringstream buffer;
-        buffer << stderr_file.rdbuf();
-        stderr_output = buffer.str();
+        std::stringstream ss_stderr;
+        ss_stderr << stderr_file.rdbuf();
+        stderr_result = ss_stderr.str();
         fs::remove(stderr_path);
     }
 
-    return {exit_code, stderr_output};
+    return {exit_code, stdout_result, stderr_result};
 }
 
 
