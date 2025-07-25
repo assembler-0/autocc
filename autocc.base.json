@@ -10,7 +10,6 @@
     "execinfo.h": {},
     "readline/readline.h": { "direct_libs": ["-lreadline"] },
     "editline/readline.h": { "direct_libs": ["-ledit"] },
-
     "GL/gl.h": { "pkg_configs": ["gl"] },
     "GL/glew.h": { "pkg_configs": ["glew"] },
     "glad/gl.h": {},
@@ -24,7 +23,7 @@
     "SFML/System.hpp": { "pkg_configs": ["sfml-system"] },
     "SFML/Audio.hpp": { "pkg_configs": ["sfml-audio"] },
     "SFML/Network.hpp": { "pkg_configs": ["sfml-network"] },
-    "GLFW/glfw3.h": { "direct_libs": ["-lglfw"], "pkg_configs": ["glfw3"] },
+    "GLFW/glfw3.h": { "direct_libs": ["-lglfw"], "pkg_configs": ["glfw3", "gl"]},
     "cairo.h": { "pkg_configs": ["cairo"] },
     "pango/pangocairo.h": { "pkg_configs": ["pango", "pangocairo"] },
     "ft2build.h": { "pkg_configs": ["freetype2"] },
