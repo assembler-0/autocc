@@ -12,6 +12,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <algorithm>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
@@ -25,11 +26,19 @@
 #include "json.hpp"
 #include "httplib.h"
 
+// FTXUI includes
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/screen.hpp>
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/component/event.hpp>
+
 using json = nlohmann::json;
+using namespace ftxui;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.1" // Incremented version for changes
+#define VERSION "v0.2.0" // Enhanced version with FTXUI
 
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
@@ -43,6 +52,7 @@ static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 static constexpr auto DB_FILE_NAME = "autocc.base.json";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
+static constexpr auto SELECTED_FILES_CACHE = "selected_files.cache";
 
 template <>
 struct fmt::formatter<fs::path> : formatter<std::string_view> {
@@ -64,6 +74,264 @@ struct Config {
     std::vector<std::string> include_dirs;
     std::vector<std::string> external_libs;
     bool manual_mode = false;
+    bool cherry_pick_mode = false;
+    std::vector<fs::path> selected_files;
+    bool smart_include_detection = true;
+    int max_include_depth = 10;
+};
+
+// Enhanced file selection component
+class FileSelector : public Component {
+private:
+    std::vector<fs::path> all_files;
+    std::vector<bool> selected;
+    std::vector<std::string> file_display_names;
+    int focused_index = 0;
+    std::string search_term;
+    std::vector<int> filtered_indices;
+    
+    Component search_input = Input(&search_term, "Search files...");
+    Component select_all_button = Button("Select All", [this] { select_all(); });
+    Component deselect_all_button = Button("Deselect All", [this] { deselect_all(); });
+    Component confirm_button = Button("Confirm Selection", [this] { exit(); });
+    Component cancel_button = Button("Cancel", [this] { exit(); });
+
+public:
+    FileSelector(const std::vector<fs::path>& files) : all_files(files) {
+        selected.resize(files.size(), false);
+        file_display_names.resize(files.size());
+        filtered_indices.resize(files.size());
+        
+        for (size_t i = 0; i < files.size(); ++i) {
+            file_display_names[i] = files[i].string();
+            filtered_indices[i] = i;
+        }
+        
+        Add(search_input);
+        Add(select_all_button);
+        Add(deselect_all_button);
+        Add(confirm_button);
+        Add(cancel_button);
+    }
+
+    std::vector<fs::path> get_selected_files() const {
+        std::vector<fs::path> result;
+        for (size_t i = 0; i < all_files.size(); ++i) {
+            if (selected[i]) {
+                result.push_back(all_files[i]);
+            }
+        }
+        return result;
+    }
+
+private:
+    void select_all() {
+        for (auto& sel : selected) sel = true;
+    }
+
+    void deselect_all() {
+        for (auto& sel : selected) sel = false;
+    }
+
+    void update_filter() {
+        filtered_indices.clear();
+        for (size_t i = 0; i < all_files.size(); ++i) {
+            if (search_term.empty() || 
+                file_display_names[i].find(search_term) != std::string::npos) {
+                filtered_indices.push_back(i);
+            }
+        }
+        if (focused_index >= static_cast<int>(filtered_indices.size())) {
+            focused_index = std::max(0, static_cast<int>(filtered_indices.size()) - 1);
+        }
+    }
+
+    Element Render() override {
+        update_filter();
+        
+        std::vector<Element> file_elements;
+        for (size_t i = 0; i < filtered_indices.size(); ++i) {
+            int file_index = filtered_indices[i];
+            auto checkbox = Checkbox(file_display_names[file_index], &selected[file_index]);
+            if (i == focused_index) {
+                checkbox = checkbox | focus;
+            }
+            file_elements.push_back(checkbox);
+        }
+
+        auto file_list = vbox(file_elements) | vscroll_indicator | frame | flex;
+        
+        return vbox({
+            text("Select files to compile:") | bold,
+            search_input->Render(),
+            hbox({
+                select_all_button->Render(),
+                deselect_all_button->Render(),
+            }),
+            separator(),
+            file_list | flex,
+            separator(),
+            hbox({
+                confirm_button->Render(),
+                cancel_button->Render(),
+            })
+        });
+    }
+
+    bool OnEvent(Event event) override {
+        if (event == Event::Character('j') || event == Event::ArrowDown) {
+            focused_index = std::min(focused_index + 1, static_cast<int>(filtered_indices.size()) - 1);
+            return true;
+        }
+        if (event == Event::Character('k') || event == Event::ArrowUp) {
+            focused_index = std::max(focused_index - 1, 0);
+            return true;
+        }
+        if (event == Event::Character(' ')) {
+            if (focused_index < static_cast<int>(filtered_indices.size())) {
+                int file_index = filtered_indices[focused_index];
+                selected[file_index] = !selected[file_index];
+            }
+            return true;
+        }
+        if (event == Event::Character('a')) {
+            select_all();
+            return true;
+        }
+        if (event == Event::Character('d')) {
+            deselect_all();
+            return true;
+        }
+        if (event == Event::Escape) {
+            exit();
+            return true;
+        }
+        if (event == Event::Return) {
+            exit();
+            return true;
+        }
+        
+        return Component::OnEvent(event);
+    }
+};
+
+// Enhanced include scanner with deep analysis
+class SmartIncludeScanner {
+private:
+    std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
+    std::regex pragma_once_regex{R"_(#pragma\s+once)_"};
+    std::regex ifndef_regex{R"_(#ifndef\s+([A-Za-z_][A-Za-z0-9_]*))_"};
+    std::regex define_regex{R"_(#define\s+([A-Za-z_][A-Za-z0-9_]*))_"};
+    
+    struct HeaderInfo {
+        fs::path path;
+        std::string guard_name;
+        bool has_pragma_once = false;
+        std::unordered_set<std::string> includes;
+        std::unordered_set<std::string> defines;
+        int dependency_depth = 0;
+    };
+    
+    std::unordered_map<fs::path, HeaderInfo> header_cache;
+    std::unordered_set<fs::path> scanned_headers;
+
+public:
+    struct IncludeAnalysis {
+        std::vector<std::string> system_includes;
+        std::vector<std::string> local_includes;
+        std::vector<std::string> missing_includes;
+        std::unordered_map<std::string, std::vector<fs::path>> include_locations;
+        int max_depth = 0;
+    };
+
+    IncludeAnalysis analyze_includes(const std::vector<fs::path>& source_files, 
+                                   const std::vector<std::string>& include_dirs,
+                                   int max_depth = 10) {
+        IncludeAnalysis analysis;
+        header_cache.clear();
+        scanned_headers.clear();
+        
+        for (const auto& src_file : source_files) {
+            scan_file_includes(src_file, include_dirs, analysis, 0, max_depth);
+        }
+        
+        return analysis;
+    }
+
+private:
+    void scan_file_includes(const fs::path& file_path, 
+                           const std::vector<std::string>& include_dirs,
+                           IncludeAnalysis& analysis, 
+                           int depth, 
+                           int max_depth) {
+        if (depth > max_depth || scanned_headers.contains(file_path)) {
+            return;
+        }
+        
+        scanned_headers.insert(file_path);
+        
+        std::ifstream file(file_path);
+        if (!file.is_open()) {
+            analysis.missing_includes.push_back(file_path.string());
+            return;
+        }
+        
+        std::string line;
+        while (std::getline(file, line)) {
+            if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                std::string header_name;
+                bool is_system_include = false;
+                
+                if (matches[1].matched) {
+                    header_name = matches[1].str();
+                    is_system_include = true;
+                } else if (matches[2].matched) {
+                    header_name = matches[2].str();
+                    is_system_include = false;
+                }
+                
+                if (is_system_include) {
+                    analysis.system_includes.push_back(header_name);
+                } else {
+                    analysis.local_includes.push_back(header_name);
+                    
+                    // Try to find the actual header file
+                    fs::path header_path = find_header_file(header_name, file_path.parent_path(), include_dirs);
+                    if (!header_path.empty()) {
+                        analysis.include_locations[header_name].push_back(header_path);
+                        scan_file_includes(header_path, include_dirs, analysis, depth + 1, max_depth);
+                    } else {
+                        analysis.missing_includes.push_back(header_name);
+                    }
+                }
+            }
+        }
+        
+        analysis.max_depth = std::max(analysis.max_depth, depth);
+    }
+    
+    fs::path find_header_file(const std::string& header_name, 
+                             const fs::path& relative_to, 
+                             const std::vector<std::string>& include_dirs) {
+        // Try relative path first
+        fs::path potential_path = relative_to / header_name;
+        if (fs::exists(potential_path)) {
+            return fs::canonical(potential_path);
+        }
+        
+        // Try include directories
+        for (const auto& dir_flag : include_dirs) {
+            if (dir_flag.rfind("-I", 0) == 0) {
+                fs::path base_dir = dir_flag.substr(2);
+                potential_path = base_dir / header_name;
+                if (fs::exists(potential_path)) {
+                    return fs::canonical(potential_path);
+                }
+            }
+        }
+        
+        return {};
+    }
 };
 
 std::string hash_file(const fs::path& path) {
@@ -102,6 +370,11 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         libs_arr.push_back(lib);
     }
 
+    auto selected_files_arr = toml::array{};
+    for (const auto& file : config.selected_files) {
+        selected_files_arr.push_back(file.string());
+    }
+
     auto tbl = toml::table{
         {"project", toml::table{
             {"name", config.name},
@@ -118,11 +391,15 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
             {"ldflags", config.ldflags}
         }},
         {"features", toml::table{
-            {"use_pch", config.use_pch}
+            {"use_pch", config.use_pch},
+            {"cherry_pick_mode", config.cherry_pick_mode},
+            {"smart_include_detection", config.smart_include_detection},
+            {"max_include_depth", config.max_include_depth}
         }},
         {"paths", toml::table{
             {"include_dirs", includes_arr},
-            {"external_libs", libs_arr}
+            {"external_libs", libs_arr},
+            {"selected_files", selected_files_arr}
         }}
     };
 
@@ -150,6 +427,9 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         auto get_bool_or = [&](const toml::node* node, bool default_val) {
             return node ? node->value_or(default_val) : default_val;
         };
+        auto get_int_or = [&](const toml::node* node, int default_val) {
+            return node ? node->value_or(default_val) : default_val;
+        };
 
         config.name      = get_or(tbl["project"]["name"].as_string(), "a.out");
         config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
@@ -160,12 +440,20 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.cflags    = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
         config.ldflags   = get_or(tbl["flags"]["ldflags"].as_string(), "");
         config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
+        config.cherry_pick_mode = get_bool_or(tbl["features"]["cherry_pick_mode"].as_boolean(), false);
+        config.smart_include_detection = get_bool_or(tbl["features"]["smart_include_detection"].as_boolean(), true);
+        config.max_include_depth = get_int_or(tbl["features"]["max_include_depth"].as_integer(), 10);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
             for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
         }
         if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
             for (const auto& elem : *libs) { config.external_libs.emplace_back(elem.value_or("")); }
+        }
+        if (auto* selected = tbl["paths"]["selected_files"].as_array()) {
+            for (const auto& elem : *selected) { 
+                config.selected_files.emplace_back(elem.value_or("")); 
+            }
         }
 
         return config;
@@ -251,6 +539,7 @@ class LibraryDetector {
     };
     std::unordered_map<std::string, DetectionRule> detectionMap;
     std::unordered_map<std::string, std::string> pkg_cache;
+    
     void load_rules_from_file(const fs::path& db_path) {
         if (!fs::exists(db_path)) {
             out::warn(fmt::runtime("Library database '{}' not found. Attempting to download..."));
@@ -303,131 +592,45 @@ class LibraryDetector {
         }
     }
 public:
-    LibraryDetector() { load_rules_from_file(DB_FILE_NAME); }
+    LibraryDetector() {
+        load_rules_from_file(DB_FILE_NAME);
+    }
+    
     void detect(const std::vector<std::string>& includes, Config& config) {
-        std::unordered_set<std::string> found_direct_libs(config.external_libs.begin(), config.external_libs.end());
-        std::unordered_set<std::string> processed_pkg_configs;
-        std::string additional_ldflags;
+        std::unordered_set<std::string> detected_libs;
         for (const auto& include : includes) {
-            for (const auto& [header_signature, rule] : detectionMap) {
-                if (include.find(header_signature) != std::string::npos) {
-                    for (const auto& lib : rule.direct_libs) found_direct_libs.insert(lib);
-                    for (const auto& pkg_name : rule.pkg_configs) {
-                        if (processed_pkg_configs.contains(pkg_name)) continue;
-                        if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
-                            additional_ldflags += " " + pkg_result;
-                            out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
-                        } else {
-                            out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
-                        }
-                        processed_pkg_configs.insert(pkg_name);
+            if (detectionMap.contains(include)) {
+                const auto& rule = detectionMap[include];
+                for (const auto& lib : rule.direct_libs) {
+                    detected_libs.insert(lib);
+                }
+                for (const auto& pkg : rule.pkg_configs) {
+                    std::string pkg_output = get_pkg_config_output(pkg);
+                    if (!pkg_output.empty()) {
+                        detected_libs.insert(pkg_output);
                     }
                 }
             }
         }
-        config.external_libs.assign(found_direct_libs.begin(), found_direct_libs.end());
-        if (!additional_ldflags.empty()) config.ldflags += additional_ldflags;
+        for (const auto& lib : detected_libs) {
+            if (std::find(config.external_libs.begin(), config.external_libs.end(), lib) == config.external_libs.end()) {
+                config.external_libs.push_back(lib);
+            }
+        }
+        if (!detected_libs.empty()) {
+            out::info("Auto-detected libraries: {}", fmt::join(detected_libs, ", "));
+        }
     }
 private:
-    std::string getPkgConfigFlags(const std::string& package) {
-        if (pkg_cache.contains(package)) return pkg_cache[package];
-        const std::string cmd = fmt::format("pkg-config --libs --cflags {}", package);
-        CommandResult result = execute(cmd);
-
-        if (result.exit_code != 0) {
-            if (result.stderr_output.find("not found") != std::string::npos) {
-                out::warn("pkg-config for '{}' failed: Package not found. Is it installed?", package);
-            } else if (!result.stderr_output.empty()) {
-                out::warn("pkg-config for '{}' failed with error: {}", package, result.stderr_output);
-            } else {
-                out::warn("pkg-config for '{}' failed with unknown error.", package);
-            }
-            return "";
+    std::string get_pkg_config_output(const std::string& package) {
+        if (pkg_cache.contains(package)) {
+            return pkg_cache[package];
         }
-
-        std::string stdout_result = result.stdout_output;
-        if (!stdout_result.empty() && stdout_result.back() == '\n') stdout_result.pop_back();
+        auto [exit_code, stdout_result, stderr_result] = execute(fmt::format("pkg-config --libs {}", package));
+        if (exit_code != 0) {
+            return pkg_cache[package] = "";
+        }
         return pkg_cache[package] = stdout_result;
-    }
-};
-// --- START OF MODIFIED SECTION ---
-
-class IncludeParser {
-    std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
-    static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
-        fs::path potential_path = relative_to / header_name;
-        if (fs::exists(potential_path)) return fs::canonical(potential_path);
-        for (const auto& dir_flag : include_dirs) {
-            if (dir_flag.rfind("-I", 0) == 0) {
-                fs::path base_dir = dir_flag.substr(2);
-                potential_path = base_dir / header_name;
-                if (fs::exists(potential_path)) return fs::canonical(potential_path);
-            }
-        }
-        return {};
-    }
-public:
-    [[nodiscard]] DependencyMap parseSourceDependencies(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
-        DependencyMap dep_map;
-        for (const auto& src_file : sourceFiles) {
-            std::unordered_set<fs::path> dependencies;
-            std::vector<fs::path> files_to_scan = {src_file};
-            std::unordered_set<fs::path> scanned_files;
-            while (!files_to_scan.empty()) {
-                fs::path current_file = files_to_scan.back();
-                files_to_scan.pop_back();
-                if (scanned_files.contains(current_file)) continue;
-                scanned_files.insert(current_file);
-                std::ifstream file_stream(current_file);
-                if (!file_stream.is_open()) {
-                    out::warn("Could not open file for dependency parsing: {}", current_file);
-                    continue;
-                }
-                std::string line;
-                while (std::getline(file_stream, line)) {
-                    if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
-                        if (matches[2].matched) { // Only track local "..." includes
-                            const auto& header_name = matches[2].str();
-                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
-                                dependencies.insert(header_path);
-                                files_to_scan.push_back(header_path);
-                            }
-                        }
-                    }
-                }
-            }
-            dep_map[src_file] = dependencies;
-        }
-        return dep_map;
-    }
-    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
-        std::unordered_set<std::string> unique_includes;
-        std::vector<fs::path> files_to_scan = sourceFiles;
-        std::unordered_set<fs::path> scanned_files;
-        while (!files_to_scan.empty()) {
-            fs::path current_file = files_to_scan.back();
-            files_to_scan.pop_back();
-            if (scanned_files.contains(current_file)) continue;
-            scanned_files.insert(current_file);
-            std::ifstream file_stream(current_file);
-            if (!file_stream.is_open()) {
-                out::warn("Could not open file for unique includes parsing: {}", current_file);
-                continue;
-            }
-            std::string line;
-            while (std::getline(file_stream, line)) {
-                if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
-                    unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
-                    if (matches[2].matched) { // Recurse on local "..." includes
-                        const auto& header_name = matches[2].str();
-                        if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
-                            files_to_scan.push_back(header_path);
-                        }
-                    }
-                }
-            }
-        }
-        return {unique_includes.begin(), unique_includes.end()};
     }
 };
 
@@ -438,7 +641,13 @@ public:
 
     explicit AutoCC(Config cfg) : config(std::move(cfg)) {
         const auto ignored_dirs = getIgnoredDirs();
-        source_files = find_source_files(root, ignored_dirs);
+        all_source_files = find_source_files(root, ignored_dirs);
+        
+        if (config.cherry_pick_mode && !config.selected_files.empty()) {
+            source_files = config.selected_files;
+        } else {
+            source_files = all_source_files;
+        }
     }
 
     static std::optional<AutoCC> load_from_cache() {
@@ -447,12 +656,48 @@ public:
             return std::nullopt;
         }
         const auto ignored_dirs = instance.getIgnoredDirs();
-        instance.source_files = find_source_files(instance.root, ignored_dirs);
+        instance.all_source_files = find_source_files(instance.root, ignored_dirs);
+        
+        if (instance.config.cherry_pick_mode && !instance.config.selected_files.empty()) {
+            instance.source_files = instance.config.selected_files;
+        } else {
+            instance.source_files = instance.all_source_files;
+        }
+        
         if (instance.source_files.empty()) {
             out::error("No source files found.");
             return std::nullopt;
         }
         return instance;
+    }
+
+    // Interactive file selection using FTXUI
+    bool select_files_interactively() {
+        if (all_source_files.empty()) {
+            out::error("No source files found to select from.");
+            return false;
+        }
+
+        auto file_selector = std::make_shared<FileSelector>(all_source_files);
+        auto screen = ScreenInteractive::Fullscreen();
+        
+        file_selector->Add(Button("Exit", [&screen] { screen.Exit(); }));
+        
+        screen.Loop(file_selector);
+        
+        config.selected_files = file_selector->get_selected_files();
+        source_files = config.selected_files;
+        
+        if (source_files.empty()) {
+            out::warn("No files selected. Aborting build.");
+            return false;
+        }
+        
+        // Save selected files to cache
+        save_selected_files_cache();
+        
+        out::success("Selected {} files for compilation.", source_files.size());
+        return true;
     }
 
     // This function is now only used by 'autoconfig' to discover and pre-populate the TOML.
@@ -489,8 +734,12 @@ public:
         file << "ldflags:" << config.ldflags << "\n";
         file << "build_dir:" << config.build_dir << "\n";
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
+        file << "cherry_pick_mode:" << (config.cherry_pick_mode ? "true" : "false") << "\n";
+        file << "smart_include_detection:" << (config.smart_include_detection ? "true" : "false") << "\n";
+        file << "max_include_depth:" << config.max_include_depth << "\n";
         for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
         for (const auto& lib : config.external_libs) file << "lib:" << lib << "\n";
+        for (const auto& file : config.selected_files) file << "selected:" << file.string() << "\n";
     }
 
     int build() {
@@ -499,7 +748,7 @@ public:
             return 1;
         }
 
-        // --- REFACTOR: Auto-detection is now part of the build process ---
+        // Run auto-detection
         run_auto_detection();
 
         const fs::path build_path = config.build_dir;
@@ -511,6 +760,29 @@ public:
         }
 
         out::info("Parsing source file dependencies for build...");
+        
+        // Use smart include scanner if enabled
+        if (config.smart_include_detection) {
+            SmartIncludeScanner scanner;
+            auto analysis = scanner.analyze_includes(source_files, config.include_dirs, config.max_include_depth);
+            
+            out::info("Include analysis complete:");
+            out::info("  - System includes: {}", analysis.system_includes.size());
+            out::info("  - Local includes: {}", analysis.local_includes.size());
+            out::info("  - Missing includes: {}", analysis.missing_includes.size());
+            out::info("  - Max dependency depth: {}", analysis.max_depth);
+            
+            if (!analysis.missing_includes.empty()) {
+                out::warn("Missing includes detected:");
+                for (const auto& missing : analysis.missing_includes) {
+                    out::warn("  - {}", missing);
+                }
+            }
+            
+            // Update include directories based on analysis
+            update_include_dirs_from_analysis(analysis);
+        }
+        
         dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
 
         json build_cache;
@@ -598,6 +870,7 @@ public:
             std::atomic<size_t> file_index = 0;
             const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> workers;
+            
             for (unsigned int i = 0; i < num_threads; ++i) {
                 workers.emplace_back([&]() {
                     while (true) {
@@ -662,6 +935,8 @@ private:
     const fs::path cache_dir = root / CACHE_DIR_NAME;
     const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
     const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
+    const fs::path selected_files_cache = cache_dir / SELECTED_FILES_CACHE;
+    std::vector<fs::path> all_source_files;
     std::vector<fs::path> source_files;
     LibraryDetector lib_detector;
     IncludeParser include_parser;
@@ -674,6 +949,39 @@ private:
         detectLibraries();
     }
 
+    void update_include_dirs_from_analysis(const SmartIncludeScanner::IncludeAnalysis& analysis) {
+        std::unordered_set<std::string> new_includes;
+        
+        // Add existing includes
+        for (const auto& dir : config.include_dirs) {
+            new_includes.insert(dir);
+        }
+        
+        // Add include directories from found header locations
+        for (const auto& [header, locations] : analysis.include_locations) {
+            for (const auto& location : locations) {
+                new_includes.insert(fmt::format("-I{}", location.parent_path().string()));
+            }
+        }
+        
+        config.include_dirs.assign(new_includes.begin(), new_includes.end());
+    }
+
+    void save_selected_files_cache() {
+        try {
+            json cache_data;
+            cache_data["selected_files"] = json::array();
+            for (const auto& file : config.selected_files) {
+                cache_data["selected_files"].push_back(file.string());
+            }
+            
+            std::ofstream cache_file(selected_files_cache);
+            cache_file << cache_data.dump(2);
+        } catch (const std::exception& e) {
+            out::warn("Failed to save selected files cache: {}", e.what());
+        }
+    }
+
     bool readConfigCache() {
         if (!fs::exists(config_file)) return false;
         std::ifstream file(config_file);
@@ -684,6 +992,7 @@ private:
         std::string line;
         config.include_dirs.clear();
         config.external_libs.clear();
+        config.selected_files.clear();
         while (std::getline(file, line)) {
             const auto pos = line.find(':');
             if (pos == std::string::npos) continue;
@@ -698,14 +1007,20 @@ private:
             else if (key == "ldflags") config.ldflags = value;
             else if (key == "build_dir") config.build_dir = value;
             else if (key == "use_pch") config.use_pch = (value == "true");
+            else if (key == "cherry_pick_mode") config.cherry_pick_mode = (value == "true");
+            else if (key == "smart_include_detection") config.smart_include_detection = (value == "true");
+            else if (key == "max_include_depth") config.max_include_depth = std::stoi(std::string(value));
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
+            else if (key == "selected") config.selected_files.emplace_back(value);
         }
         return true;
     }
+    
     std::unordered_set<std::string> getIgnoredDirs() const {
         return {".git", config.build_dir, CACHE_DIR_NAME};
     }
+    
     void scanLocalHeaders() {
         std::set<fs::path> header_dirs;
         for (const auto& entry : fs::recursive_directory_iterator(root)) {
@@ -722,10 +1037,12 @@ private:
         for (const auto& dir : header_dirs) final_includes.insert(fmt::format("-I{}", dir.string()));
         config.include_dirs.assign(final_includes.begin(), final_includes.end());
     }
+    
     void detectLibraries() {
         const auto all_includes = include_parser.getAllUniqueIncludes(source_files, config.include_dirs);
         lib_detector.detect(all_includes, config);
     }
+    
     std::string generatePCH(const fs::path& build_path) {
         out::info("Analyzing for Pre-Compiled Header generation...");
         std::unordered_map<std::string, int> include_counts;
@@ -779,6 +1096,7 @@ private:
         }
         return fmt::format("-include {}", pch_source.string());
     }
+    
     std::string getCompiler(const fs::path& file) const {
         const std::string ext = file.extension().string();
         if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return config.cxx;
@@ -788,12 +1106,139 @@ private:
     }
 };
 
+// Utility functions
+std::vector<fs::path> find_source_files(const fs::path& root, const std::unordered_set<std::string>& ignored_dirs) {
+    std::vector<fs::path> source_files;
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        if (entry.is_regular_file()) {
+            const std::string ext = entry.path().extension().string();
+            if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++" || ext == ".c" || ext == ".s" || ext == ".S" || ext == ".asm") {
+                bool should_ignore = false;
+                for (const auto& ignored : ignored_dirs) {
+                    if (entry.path().string().find(ignored) != std::string::npos) {
+                        should_ignore = true;
+                        break;
+                    }
+                }
+                if (!should_ignore) {
+                    source_files.push_back(entry.path());
+                }
+            }
+        }
+    }
+    return source_files;
+}
+
+struct ExecuteResult {
+    int exit_code;
+    std::string stdout_output;
+    std::string stderr_output;
+};
+
+ExecuteResult execute(const std::string& command) {
+    std::string stdout_result, stderr_result;
+    int exit_code = 0;
+    
+    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+    if (!pipe) {
+        return {-1, "", "Failed to execute command"};
+    }
+    
+    char buffer[128];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        stdout_result += buffer;
+    }
+    
+    exit_code = pclose(pipe);
+    return {exit_code, stdout_result, stderr_result};
+}
+
+// Legacy IncludeParser for backward compatibility
+class IncludeParser {
+    std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
+    static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
+        fs::path potential_path = relative_to / header_name;
+        if (fs::exists(potential_path)) return fs::canonical(potential_path);
+        for (const auto& dir_flag : include_dirs) {
+            if (dir_flag.rfind("-I", 0) == 0) {
+                fs::path base_dir = dir_flag.substr(2);
+                potential_path = base_dir / header_name;
+                if (fs::exists(potential_path)) return fs::canonical(potential_path);
+            }
+        }
+        return {};
+    }
+public:
+    [[nodiscard]] DependencyMap parseSourceDependencies(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
+        DependencyMap dep_map;
+        for (const auto& src_file : sourceFiles) {
+            std::unordered_set<fs::path> dependencies;
+            std::vector<fs::path> files_to_scan = {src_file};
+            std::unordered_set<fs::path> scanned_files;
+            while (!files_to_scan.empty()) {
+                fs::path current_file = files_to_scan.back();
+                files_to_scan.pop_back();
+                if (scanned_files.contains(current_file)) continue;
+                scanned_files.insert(current_file);
+                std::ifstream file_stream(current_file);
+                if (!file_stream.is_open()) {
+                    out::warn("Could not open file for dependency parsing: {}", current_file);
+                    continue;
+                }
+                std::string line;
+                while (std::getline(file_stream, line)) {
+                    if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                        if (matches[2].matched) { // Only track local "..." includes
+                            const auto& header_name = matches[2].str();
+                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                                dependencies.insert(header_path);
+                                files_to_scan.push_back(header_path);
+                            }
+                        }
+                    }
+                }
+            }
+            dep_map[src_file] = dependencies;
+        }
+        return dep_map;
+    }
+    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
+        std::unordered_set<std::string> unique_includes;
+        std::vector<fs::path> files_to_scan = sourceFiles;
+        std::unordered_set<fs::path> scanned_files;
+        while (!files_to_scan.empty()) {
+            fs::path current_file = files_to_scan.back();
+            files_to_scan.pop_back();
+            if (scanned_files.contains(current_file)) continue;
+            scanned_files.insert(current_file);
+            std::ifstream file_stream(current_file);
+            if (!file_stream.is_open()) {
+                out::warn("Could not open file for unique includes parsing: {}", current_file);
+                continue;
+            }
+            std::string line;
+            while (std::getline(file_stream, line)) {
+                if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                    unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
+                    if (matches[2].matched) { // Recurse on local "..." includes
+                        const auto& header_name = matches[2].str();
+                        if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                            files_to_scan.push_back(header_path);
+                        }
+                    }
+                }
+            }
+        }
+        return {unique_includes.begin(), unique_includes.end()};
+    }
+};
+
 
 // --- User Interaction and Main ---
 
 void show_help() {
     using fmt::styled;
-    out::info("AutoCC {} - A smaller C++ build system", VERSION);
+    out::info("AutoCC {} - Enhanced C++ build system with FTXUI", VERSION);
     fmt::print(
         "\n"
         "Usage: autocc [command]\n\n"
@@ -806,7 +1251,10 @@ void show_help() {
         "  {}                Removes all autocc generated files\n"
         "  {}                Download/update the library detection database.\n"
         "  {}                 Show current version and build date.\n"
-        "  {}              Shows this help message.\n",
+        "  {}              Shows this help message.\n"
+        "  {}              Interactive file selection for cherry-picking.\n"
+        "  {}              Enable/disable cherry-pick mode.\n"
+        "  {}              Enable/disable smart include detection.\n",
         styled("<none>", out::color_prompt),
         styled("ac/autoconfig", out::color_prompt),
         styled("setup/sync/sc", out::color_prompt),
@@ -816,7 +1264,10 @@ void show_help() {
         styled("fetch", out::color_prompt),
         styled("wipe", out::color_prompt),
         styled("version", out::color_prompt),
-        styled("help", out::color_prompt)
+        styled("help", out::color_prompt),
+        styled("select", out::color_prompt),
+        styled("cherry-pick", out::color_prompt),
+        styled("smart-includes", out::color_prompt)
     );
 }
 
@@ -848,8 +1299,23 @@ void user_init(Config& config) {
     config.build_dir = get_input("Build Directory", config.build_dir);
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = (pch_choice == "yes" || pch_choice == "y");
-
+    
+    std::string cherry_pick_choice = get_input("Enable Cherry-Pick Mode (yes/no)", config.cherry_pick_mode ? "yes" : "no");
+    config.cherry_pick_mode = (cherry_pick_choice == "yes" || cherry_pick_choice == "y");
+    
+    std::string smart_includes_choice = get_input("Enable Smart Include Detection (yes/no)", config.smart_include_detection ? "yes" : "no");
+    config.smart_include_detection = (smart_includes_choice == "yes" || smart_includes_choice == "y");
+    
+    if (config.smart_include_detection) {
+        std::string depth_input = get_input("Max Include Depth", std::to_string(config.max_include_depth));
+        try {
+            config.max_include_depth = std::stoi(depth_input);
+        } catch (...) {
+            out::warn("Invalid depth value, using default: {}", config.max_include_depth);
+        }
+    }
 }
+
 int main(const int argc, char* argv[]) {
     const fs::path config_toml_path = "autocc.toml";
     const fs::path cache_dir = CACHE_DIR_NAME;
@@ -869,6 +1335,15 @@ int main(const int argc, char* argv[]) {
             out::error("Failed to load project from cache. Try running 'autocc setup' again.");
             return 1;
         }
+        
+        // Check if cherry-pick mode is enabled and no files are selected
+        if (autocc_opt->config.cherry_pick_mode && autocc_opt->config.selected_files.empty()) {
+            out::info("Cherry-pick mode enabled but no files selected. Starting interactive selection...");
+            if (!autocc_opt->select_files_interactively()) {
+                return 1;
+            }
+        }
+        
         return autocc_opt->build();
     }
 
@@ -938,6 +1413,90 @@ int main(const int argc, char* argv[]) {
             return 1;
         }
         return autocc_opt->build();
+    }
+
+    if (command == "select") {
+        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
+            out::error("Project not set up. Run 'autocc setup' first.");
+            return 1;
+        }
+        auto autocc_opt = AutoCC::load_from_cache();
+        if (!autocc_opt) {
+            out::error("Failed to load project from cache. Try 'autocc setup' again.");
+            return 1;
+        }
+        
+        if (autocc_opt->select_files_interactively()) {
+            // Update the configuration and save it
+            autocc_opt->config.cherry_pick_mode = true;
+            autocc_opt->writeConfigCache();
+            write_config_to_toml(autocc_opt->config, config_toml_path);
+            out::success("File selection saved. Run 'autocc' to build with selected files.");
+        }
+        return 0;
+    }
+
+    if (command == "cherry-pick") {
+        if (argc < 3) {
+            out::error("Usage: autocc cherry-pick <on|off>");
+            return 1;
+        }
+        
+        std::string mode = argv[2];
+        if (mode != "on" && mode != "off") {
+            out::error("Invalid mode. Use 'on' or 'off'.");
+            return 1;
+        }
+        
+        if (!fs::exists(config_toml_path)) {
+            out::error("No 'autocc.toml' found. Run 'autocc autoconfig' first.");
+            return 1;
+        }
+        
+        auto config_opt = load_config_from_toml(config_toml_path);
+        if (!config_opt) {
+            out::error("Failed to load configuration.");
+            return 1;
+        }
+        
+        config_opt->cherry_pick_mode = (mode == "on");
+        write_config_to_toml(*config_opt, config_toml_path);
+        
+        out::success("Cherry-pick mode {}ed.", mode);
+        if (mode == "on") {
+            out::info("Run 'autocc select' to choose files interactively, or edit autocc.toml manually.");
+        }
+        return 0;
+    }
+
+    if (command == "smart-includes") {
+        if (argc < 3) {
+            out::error("Usage: autocc smart-includes <on|off>");
+            return 1;
+        }
+        
+        std::string mode = argv[2];
+        if (mode != "on" && mode != "off") {
+            out::error("Invalid mode. Use 'on' or 'off'.");
+            return 1;
+        }
+        
+        if (!fs::exists(config_toml_path)) {
+            out::error("No 'autocc.toml' found. Run 'autocc autoconfig' first.");
+            return 1;
+        }
+        
+        auto config_opt = load_config_from_toml(config_toml_path);
+        if (!config_opt) {
+            out::error("Failed to load configuration.");
+            return 1;
+        }
+        
+        config_opt->smart_include_detection = (mode == "on");
+        write_config_to_toml(*config_opt, config_toml_path);
+        
+        out::success("Smart include detection {}ed.", mode);
+        return 0;
     }
 
     if (command == "clean") {
