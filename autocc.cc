@@ -12,6 +12,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <sstream> // Added for string stream
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
@@ -29,7 +30,7 @@ using json = nlohmann::json;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.1" // Incremented version for changes
+#define VERSION "v0.2.0" // Incremented version for major change
 
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
@@ -63,6 +64,7 @@ struct Config {
     bool use_pch = true;
     std::vector<std::string> include_dirs;
     std::vector<std::string> external_libs;
+    std::vector<std::string> ignored_dirs; // Added ignored directories
     bool manual_mode = false;
 };
 
@@ -102,6 +104,11 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         libs_arr.push_back(lib);
     }
 
+    auto ignored_arr = toml::array{};
+    for (const auto& dir : config.ignored_dirs) {
+        ignored_arr.push_back(dir);
+    }
+
     auto tbl = toml::table{
         {"project", toml::table{
             {"name", config.name},
@@ -122,7 +129,8 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         }},
         {"paths", toml::table{
             {"include_dirs", includes_arr},
-            {"external_libs", libs_arr}
+            {"external_libs", libs_arr},
+            {"ignored_dirs", ignored_arr}
         }}
     };
 
@@ -166,6 +174,9 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         }
         if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
             for (const auto& elem : *libs) { config.external_libs.emplace_back(elem.value_or("")); }
+        }
+        if (auto* ignored = tbl["paths"]["ignored_dirs"].as_array()) {
+            for (const auto& elem : *ignored) { config.ignored_dirs.emplace_back(elem.value_or("")); }
         }
 
         return config;
@@ -350,7 +361,6 @@ private:
         return pkg_cache[package] = stdout_result;
     }
 };
-// --- START OF MODIFIED SECTION ---
 
 class IncludeParser {
     std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
@@ -491,6 +501,7 @@ public:
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
         for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
         for (const auto& lib : config.external_libs) file << "lib:" << lib << "\n";
+        for (const auto& dir : config.ignored_dirs) file << "ignore:" << dir << "\n";
     }
 
     int build() {
@@ -684,6 +695,7 @@ private:
         std::string line;
         config.include_dirs.clear();
         config.external_libs.clear();
+        config.ignored_dirs.clear();
         while (std::getline(file, line)) {
             const auto pos = line.find(':');
             if (pos == std::string::npos) continue;
@@ -700,15 +712,32 @@ private:
             else if (key == "use_pch") config.use_pch = (value == "true");
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
+            else if (key == "ignore") config.ignored_dirs.emplace_back(value);
         }
         return true;
     }
     std::unordered_set<std::string> getIgnoredDirs() const {
-        return {".git", config.build_dir, CACHE_DIR_NAME};
+        std::unordered_set<std::string> ignored = {".git", config.build_dir, CACHE_DIR_NAME};
+        ignored.insert(config.ignored_dirs.begin(), config.ignored_dirs.end());
+        return ignored;
     }
     void scanLocalHeaders() {
         std::set<fs::path> header_dirs;
-        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        const auto ignored_dirs_set = getIgnoredDirs(); // Get ignored dirs for header scan
+        for (const auto& entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied)) {
+            bool is_in_ignored_dir = false;
+            for (const auto& part : entry.path()) {
+                if (ignored_dirs_set.contains(part.string())) {
+                    is_in_ignored_dir = true;
+                    break;
+                }
+            }
+            if (is_in_ignored_dir) {
+                // We just skip the entry. The iterator will continue to the next item.
+                // The problematic 'disable_recursion_pending' is removed.
+                continue;
+            }
+
             if (entry.is_regular_file()) {
                 const std::string ext = entry.path().extension().string();
                 if (ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
@@ -799,11 +828,11 @@ void show_help() {
         "Usage: autocc [command]\n\n"
         "Commands:\n"
         "  {}               Builds the project incrementally using cached settings.\n"
-        "  {}        Auto-generated autocc.toml.\n"
-        "  {}        Convert autocc.toml to autocc build cache.\n"
-        "  {}              Same as no command (argc = 1).\n"
-        "  {}                Remove build directory.\n"
-        "  {}                Removes all autocc generated files\n"
+        "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
+        "  {}        Converts 'autocc.toml' to the internal build cache.\n"
+        "  {}              Same as no command.\n"
+        "  {}                Removes the build directory.\n"
+        "  {}                Removes all autocc generated files (cache, build dir, db).\n"
         "  {}                Download/update the library detection database.\n"
         "  {}                 Show current version and build date.\n"
         "  {}              Shows this help message.\n",
@@ -812,11 +841,18 @@ void show_help() {
         styled("setup/sync/sc", out::color_prompt),
         styled("compile", out::color_prompt),
         styled("clean", out::color_prompt),
-        styled("clean", out::color_prompt),
-        styled("fetch", out::color_prompt),
         styled("wipe", out::color_prompt),
+        styled("fetch", out::color_prompt),
         styled("version", out::color_prompt),
         styled("help", out::color_prompt)
+    );
+     fmt::print(
+        "\nConfiguration ('autocc.toml'):\n"
+        "  The `autoconfig` command helps create this file. You can also edit it manually.\n"
+        "  To ignore directories from the source file scan (e.g., 'vendor', 'tests'), add them to\n"
+        "  the `ignored_dirs` array under the `[paths]` section.\n\n"
+        "  [paths]\n"
+        "  ignored_dirs = [ \"vendor\", \"tests\" ]\n"
     );
 }
 
@@ -849,6 +885,14 @@ void user_init(Config& config) {
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = (pch_choice == "yes" || pch_choice == "y");
 
+    std::string ignored_input = get_input("Ignored directories (space-separated, e.g. 'vendor tests')", "");
+    if (!ignored_input.empty()) {
+        std::stringstream ss(ignored_input);
+        std::string item;
+        while (ss >> item) { // Using operator>> handles whitespace better
+            config.ignored_dirs.push_back(item);
+        }
+    }
 }
 int main(const int argc, char* argv[]) {
     const fs::path config_toml_path = "autocc.toml";
@@ -963,6 +1007,8 @@ int main(const int argc, char* argv[]) {
         Config temp_cfg;
         if (const auto optional = AutoCC::load_from_cache()) {
             temp_cfg = optional->config;
+        } else if (const auto toml_optional = load_config_from_toml(config_toml_path)) {
+            temp_cfg = *toml_optional;
         }
         out::warn("Wiping all autocc files (build dir and cache)...");
         if (fs::exists(temp_cfg.build_dir)) {

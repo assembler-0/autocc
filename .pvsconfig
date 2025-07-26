@@ -1,0 +1,9 @@
+[analysis]
+mode = 4
+check-level = 1
+rules = +*
+suspicious-code = yes
+detect-64-bit-issues = yes
+check-headers = yes
+platform = x64
+exclude-path =
