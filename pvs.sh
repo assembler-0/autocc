@@ -17,7 +17,8 @@ fi
 
 echo "Starting PVS-Studio analysis for build directory: $BUILD_DIR"
 echo "=========================================="
-
+echo "Activating PVS free license"
+pvs-studio-analyzer credentials PVS-Studio Free FREE-FREE-FREE-FREE
 # Clean previous build artifacts
 echo "Cleaning previous build artifacts..."
 cmake --build "$BUILD_DIR" --target clean
