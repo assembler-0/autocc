@@ -1,11 +1,6 @@
 #compdef autocc
 
-# zsh completion script for autocc (Corrected Version)
-#
-# To install:
-# 1. Save this file as '_autocc' in ~/.zsh/completions/
-# 2. Ensure fpath=(~/.zsh/completions $fpath) is in your ~/.zshrc
-# 3. Reload your shell (exec zsh)
+
 
 # This is the function that _arguments will call to get the list of commands.
 _autocc_cmds() {

@@ -32,7 +32,7 @@ using json = nlohmann::json;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.2.0" // Incremented version for major change
+#define VERSION "v0.1.1" // Incremented version for major change
 
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;

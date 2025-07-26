@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 project(autocc LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_FLAGS "-O3 -march=native -mtune=native -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-exit-time-destructors -Wno-global-constructors -Wno-missing-prototypes")
 add_executable(autocc autocc.cc)
 target_link_libraries(autocc fmt stdc++fs xxhash ssl crypto)
