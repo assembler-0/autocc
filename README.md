@@ -145,7 +145,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Issues**: [GitHub Issues](https://github.com/yourusername/projectname/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/projectname/discussions)
 - **Email**: diaviekone13@gmail.com
-- **Discord**: [Join our community](https://discord.gg/your-invite)
 
 ---
 

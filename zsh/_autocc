@@ -1,8 +1,5 @@
 #compdef autocc
 
-
-
-# This is the function that _arguments will call to get the list of commands.
 _autocc_cmds() {
     local -a commands
 
@@ -16,7 +13,6 @@ _autocc_cmds() {
         'help:Shows the help message'
     )
 
-    # _describe is a helper to list completions with their descriptions.
     _describe -t commands "autocc commands" commands
 }
 
