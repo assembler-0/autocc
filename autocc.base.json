@@ -50,7 +50,7 @@
     "QtCore/": { "pkg_configs": ["Qt6Core", "Qt5Core"] },
     "QtGui/": { "pkg_configs": ["Qt6Gui", "Qt5Gui"] },
     "wx/wx.h": { "pkg_configs": ["wxwidgets"] },
-    "wayland-client.h" { "direct_libs": ["-lwayland-client"] },
+    "wayland-client.h": { "direct_libs": ["-lwayland-client"] },
     "FL/Fl.H": { "direct_libs": ["-lfltk"] },
 
     "nlohmann/json.hpp": {},
