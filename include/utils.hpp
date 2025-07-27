@@ -24,35 +24,16 @@ struct CommandResult {
 // Executes a command and captures its exit code, stdout, and stderr.
 [[nodiscard]]
 inline CommandResult execute(const std::string& cmd) {
-    std::string stdout_result;
-    std::string stderr_result;
+    const std::string stdout_result;
+    const std::string stderr_result;
 
     // Create temporary files for stdout and stderr
     fs::path stdout_path = fs::temp_directory_path() / "autocc_stdout.log";
     fs::path stderr_path = fs::temp_directory_path() / "autocc_stderr.log";
 
     // Construct the command to redirect stdout and stderr to files
-    std::string full_cmd = cmd + " > " + stdout_path.string() + " 2> " + stderr_path.string();
 
-    int exit_code = system(full_cmd.c_str());
-
-    // Read stdout from file
-    if (fs::exists(stdout_path)) {
-        std::ifstream stdout_file(stdout_path);
-        std::stringstream ss_stdout;
-        ss_stdout << stdout_file.rdbuf();
-        stdout_result = ss_stdout.str();
-        fs::remove(stdout_path);
-    }
-
-    // Read stderr from file
-    if (fs::exists(stderr_path)) {
-        std::ifstream stderr_file(stderr_path);
-        std::stringstream ss_stderr;
-        ss_stderr << stderr_file.rdbuf();
-        stderr_result = ss_stderr.str();
-        fs::remove(stderr_path);
-    }
+    const int exit_code = system(cmd.c_str());
 
     return {exit_code, stdout_result, stderr_result};
 }
