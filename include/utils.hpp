@@ -3,12 +3,9 @@
 #pragma once
 
 #include <string>
-#include <cstdio>
 #include <filesystem>
 #include <vector>
 #include <unordered_set>
-#include <fstream>
-#include <sstream>
 
 #include "log.hpp"
 

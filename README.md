@@ -3,7 +3,7 @@
 > A fast, minimal low-level build system
  
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-0.1.1-green.svg)](autocc.cc)
+[![Version](https://img.shields.io/badge/version-0.1.2-green.svg)](autocc.cc)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---

@@ -51,6 +51,8 @@
     "QtGui/": { "pkg_configs": ["Qt6Gui", "Qt5Gui"] },
     "wx/wx.h": { "pkg_configs": ["wxwidgets"] },
     "FL/Fl.H": { "direct_libs": ["-lfltk"] },
+    "ncurses.h": { "pkg_configs": ["ncurses"], "direct_libs": ["-lncursesw"] },
+    "curses.h": { "pkg_configs": ["ncurses"], "direct_libs": ["-lncursesw"] },
 
     "nlohmann/json.hpp": {},
     "rapidjson/document.h": {},

@@ -32,7 +32,7 @@ using json = nlohmann::json;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.1" // Incremented version for major change
+#define VERSION "v0.1.2" // Incremented version for major change
 
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
@@ -71,7 +71,7 @@ struct Config {
 };
 
 std::string hash_file(const fs::path& path) {
-    constexpr size_t buffer_size = 65536; // 64KB buffer
+    constexpr size_t buffer_size = 65536;
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         return "";
@@ -79,19 +79,22 @@ std::string hash_file(const fs::path& path) {
 
     std::vector<char> buffer(buffer_size);
     XXH64_state_t* const state = XXH64_createState();
-    XXH64_reset(state, 0); // Use seed 0
+    if (!state) return "";  // Check allocation
+
+    // Use RAII wrapper
+    auto state_deleter = [](XXH64_state_t* s) { XXH64_freeState(s); };
+    std::unique_ptr<XXH64_state_t, decltype(state_deleter)> state_guard(state, state_deleter);
+
+    XXH64_reset(state, 0);
 
     while (file.read(buffer.data(), buffer_size)) {
         XXH64_update(state, buffer.data(), file.gcount());
     }
-    // Handle the last chunk
     if (file.gcount() > 0) {
         XXH64_update(state, buffer.data(), file.gcount());
     }
 
     XXH64_hash_t const hash_val = XXH64_digest(state);
-    XXH64_freeState(state);
-
     return fmt::format("{:016x}", hash_val);
 }
 
@@ -245,8 +248,7 @@ private:
         size_t host_start = url.find(protocol_end);
         if (host_start == std::string::npos) return false;
         host_start += protocol_end.length();
-        size_t path_start = url.find('/', host_start);
-        if (path_start == std::string::npos) {
+        if (const size_t path_start = url.find('/', host_start); path_start == std::string::npos) {
             host = url.substr(host_start);
             path = "/";
         } else {
@@ -266,7 +268,7 @@ class LibraryDetector {
     std::unordered_map<std::string, std::string> pkg_cache;
     void load_rules_from_file(const fs::path& db_path) {
         if (!fs::exists(db_path)) {
-            out::warn(fmt::runtime("Library database '{}' not found. Attempting to download..."));
+            out::warn("Library database '{}' not found. Attempting to download...", db_path);
             if (!Fetcher::download_file(BASE_DB_URL, db_path)) {
                 out::error("Failed to download library database. Library detection will be limited.");
                 return;
@@ -278,10 +280,22 @@ class LibraryDetector {
                 out::error("Failed to open library database '{}'. Library detection will be limited.", db_path);
                 return;
             }
-            for (json data = json::parse(f); auto& [header, rule_json] : data["libraries"].items()) {
+            json data = json::parse(f);
+            if (!data.contains("libraries") || !data["libraries"].is_object()) {
+                out::error("Invalid database format: missing 'libraries' object");
+                return;
+            }
+
+            for (auto& [header, rule_json] : data["libraries"].items()) {
+                if (!rule_json.is_object()) continue; // Skip invalid entries
+
                 DetectionRule rule;
-                if (rule_json.contains("direct_libs")) rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
-                if (rule_json.contains("pkg_configs")) rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                if (rule_json.contains("direct_libs") && rule_json["direct_libs"].is_array()) {
+                    rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                }
+                if (rule_json.contains("pkg_configs") && rule_json["pkg_configs"].is_array()) {
+                    rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                }
                 detectionMap[header] = rule;
             }
             out::info("Loaded {} library detection rules.", detectionMap.size());
@@ -300,10 +314,22 @@ class LibraryDetector {
                         out::error("Failed to open re-downloaded library database '{}'. Library detection will be limited.", db_path);
                         return;
                     }
-                    for (json data = json::parse(f); auto& [header, rule_json] : data["libraries"].items()) {
+                    json data = json::parse(f);
+                    if (!data.contains("libraries") || !data["libraries"].is_object()) {
+                        out::error("Invalid database format: missing 'libraries' object");
+                        return;
+                    }
+
+                    for (auto& [header, rule_json] : data["libraries"].items()) {
+                        if (!rule_json.is_object()) continue; // Skip invalid entries
+
                         DetectionRule rule;
-                        if (rule_json.contains("direct_libs")) rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
-                        if (rule_json.contains("pkg_configs")) rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                        if (rule_json.contains("direct_libs") && rule_json["direct_libs"].is_array()) {
+                            rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                        }
+                        if (rule_json.contains("pkg_configs") && rule_json["pkg_configs"].is_array()) {
+                            rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                        }
                         detectionMap[header] = rule;
                     }
                     out::info("Successfully re-downloaded and loaded {} library detection rules.", detectionMap.size());
@@ -318,17 +344,26 @@ class LibraryDetector {
 public:
     LibraryDetector() { load_rules_from_file(DB_FILE_NAME); }
     void detect(const std::vector<std::string>& includes, Config& config) {
-        std::unordered_set<std::string> found_direct_libs(config.external_libs.begin(), config.external_libs.end());
+        std::unordered_set found_direct_libs(config.external_libs.begin(), config.external_libs.end());
         std::unordered_set<std::string> processed_pkg_configs;
-        std::string additional_ldflags;
+        std::string additional_cflags;    // ✅ Separate compile flags
+        std::string additional_ldflags;   // ✅ Only for actual linker flags
+
         for (const auto& include : includes) {
             for (const auto& [header_signature, rule] : detectionMap) {
                 if (include.find(header_signature) != std::string::npos) {
-                    for (const auto& lib : rule.direct_libs) found_direct_libs.insert(lib);
+                    // Add direct libraries
+                    for (const auto& lib : rule.direct_libs) {
+                        found_direct_libs.insert(lib);
+                    }
+
+                    // Process pkg-config
                     for (const auto& pkg_name : rule.pkg_configs) {
                         if (processed_pkg_configs.contains(pkg_name)) continue;
+
                         if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
-                            additional_ldflags += " " + pkg_result;
+                            // Parse pkg-config output and separate flags properly
+                            parsePkgConfigOutput(pkg_result, found_direct_libs, additional_cflags, additional_ldflags);
                             out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
                         } else {
                             out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
@@ -338,27 +373,57 @@ public:
                 }
             }
         }
+
         config.external_libs.assign(found_direct_libs.begin(), found_direct_libs.end());
-        if (!additional_ldflags.empty()) config.ldflags += additional_ldflags;
+
+        // Add compile flags to cxxflags (not ldflags!)
+        if (!additional_cflags.empty()) {
+            config.cxxflags += " " + additional_cflags;
+            config.cflags += " " + additional_cflags;  // Add to both C and C++ flags
+        }
+
+        // Only add actual linker flags to ldflags
+        if (!additional_ldflags.empty()) {
+            config.ldflags += " " + additional_ldflags;
+        }
     }
+
 private:
+    static void parsePkgConfigOutput(const std::string& pkg_output, std::unordered_set<std::string>& libs, std::string& cflags, std::string& ldflags) {
+        std::istringstream iss(pkg_output);
+        std::string token;
+
+        while (iss >> token) {
+            if (token.starts_with("-l")) {
+                libs.insert(token);
+            } else if (token.starts_with("-L") || token.starts_with("-Wl,") ||
+                token.starts_with("-T") ||
+                token.starts_with("--dynamic-linker") ||
+                token.starts_with("-rpath")) {
+                ldflags += " " + token;
+            } else {
+               // Everything else goes to cflags (includes -I, -D, and other compile flags)
+               cflags += " " + token;
+            }
+        }
+    }
     std::string getPkgConfigFlags(const std::string& package) {
         if (pkg_cache.contains(package)) return pkg_cache[package];
         const std::string cmd = fmt::format("pkg-config --libs --cflags {}", package);
-        CommandResult result = execute(cmd);
+        auto [exit_code, stdout_output, stderr_output] = execute(cmd);
 
-        if (result.exit_code != 0) {
-            if (result.stderr_output.find("not found") != std::string::npos) {
+        if (exit_code != 0) {
+            if (stderr_output.find("not found") != std::string::npos) {
                 out::warn("pkg-config for '{}' failed: Package not found. Is it installed?", package);
-            } else if (!result.stderr_output.empty()) {
-                out::warn("pkg-config for '{}' failed with error: {}", package, result.stderr_output);
+            } else if (!stderr_output.empty()) {
+                out::warn("pkg-config for '{}' failed with error: {}", package, stderr_output);
             } else {
                 out::warn("pkg-config for '{}' failed with unknown error.", package);
             }
             return "";
         }
 
-        std::string stdout_result = result.stdout_output;
+        std::string stdout_result = stdout_output;
         if (!stdout_result.empty() && stdout_result.back() == '\n') stdout_result.pop_back();
         return pkg_cache[package] = stdout_result;
     }
@@ -383,7 +448,7 @@ public:
         DependencyMap dep_map;
         for (const auto& src_file : sourceFiles) {
             std::unordered_set<fs::path> dependencies;
-            std::vector<fs::path> files_to_scan = {src_file};
+            std::vector files_to_scan = {src_file};
             std::unordered_set<fs::path> scanned_files;
             while (!files_to_scan.empty()) {
                 fs::path current_file = files_to_scan.back();
@@ -412,10 +477,37 @@ public:
         }
         return dep_map;
     }
-    [[nodiscard]] std::vector<std::string> getAllUniqueIncludes(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
+    [[nodiscard]] std::vector<std::string> getAllProjectIncludes(const std::vector<fs::path>& sourceFiles,
+                                                                 const std::vector<std::string>& include_dirs,
+                                                                 const std::unordered_set<std::string>& ignored_dirs) const {
         std::unordered_set<std::string> unique_includes;
         std::vector<fs::path> files_to_scan = sourceFiles;
         std::unordered_set<fs::path> scanned_files;
+        for (const auto& entry : fs::recursive_directory_iterator(".", fs::directory_options::skip_permission_denied)) {
+            // Skip ignored directories
+            bool is_in_ignored_dir = false;
+            for (const auto& part : entry.path()) {
+                if (ignored_dirs.contains(part.string())) {
+                    is_in_ignored_dir = true;
+                    break;
+                }
+            }
+            if (is_in_ignored_dir) continue;
+
+            if (entry.is_regular_file()) {
+                if (const std::string ext = entry.path().extension().string(); ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
+                    // Scan this header file for includes
+                    if (std::ifstream file_stream(entry.path()); file_stream.is_open()) {
+                        std::string line;
+                        while (std::getline(file_stream, line)) {
+                            if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                                unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         while (!files_to_scan.empty()) {
             fs::path current_file = files_to_scan.back();
             files_to_scan.pop_back();
@@ -447,6 +539,129 @@ public:
 class AutoCC {
 public:
     Config config;
+    LibraryDetector lib_detector;  // Make this public too
+    IncludeParser include_parser;  // Make this public too
+    std::vector<fs::path> source_files; // Make this public too
+
+    std::unordered_set<std::string> getIgnoredDirs() const {
+        std::unordered_set<std::string> ignored = {".git", config.build_dir, CACHE_DIR_NAME};
+        ignored.insert(config.ignored_dirs.begin(), config.ignored_dirs.end());
+        return ignored;
+    }
+    void scanLocalHeaders() {
+        std::set<fs::path> header_dirs;
+        const auto ignored_dirs_set = getIgnoredDirs();
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied)) {
+                try {
+                    // Check if we can access this entry
+                    if (!entry.exists()) continue;
+
+                    bool is_in_ignored_dir = false;
+                    for (const auto& part : entry.path()) {
+                        if (ignored_dirs_set.contains(part.string())) {
+                            is_in_ignored_dir = true;
+                            break;
+                        }
+                    }
+                    if (is_in_ignored_dir) continue;
+
+                    if (entry.is_regular_file()) {
+                        if (const std::string ext = entry.path().extension().string(); ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
+                            header_dirs.insert(fs::canonical(entry.path().parent_path()));
+                        }
+                    }
+                } catch (const fs::filesystem_error& e) {
+                    out::warn("Skipping file due to filesystem error: {}", e.what());
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to scan for headers: {}", e.what());
+            return;
+        }
+
+        // Use a set to avoid duplicate -I flags from TOML and scan
+        std::unordered_set<std::string> final_includes;
+        for (const auto& dir : config.include_dirs) final_includes.insert(dir);
+        for (const auto& dir : header_dirs) final_includes.insert(fmt::format("-I{}", dir.string()));
+        config.include_dirs.assign(final_includes.begin(), final_includes.end());
+    }
+
+    void detectLibraries() {
+        const auto ignored_dirs = getIgnoredDirs();
+        const auto all_includes = include_parser.getAllProjectIncludes(source_files, config.include_dirs, ignored_dirs);
+        lib_detector.detect(all_includes, config);
+    }
+
+    std::string generatePCH(const fs::path& build_path) {
+        out::info("Analyzing for Pre-Compiled Header generation...");
+        std::unordered_map<std::string, int> include_counts;
+        int cpp_file_count = 0;
+        for (const auto& src : source_files) {
+            if (getCompiler(src) != config.cxx) continue;
+            cpp_file_count++;
+            std::ifstream stream(src);
+        if (!stream.is_open()) {
+            out::warn("Could not open source file for PCH analysis: {}", src);
+            continue;
+        }
+            std::string line;
+            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_" );
+            while(std::getline(stream, line)) {
+                if(std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
+                    include_counts[matches[1].str()]++;
+                }
+            }
+        }
+        if (cpp_file_count < 3) {
+            out::info("PCH skipped: Not enough C++ source files.");
+            return "";
+        }
+        std::vector<std::string> pch_headers;
+        for(const auto& [header, count] : include_counts) {
+            if (count > cpp_file_count / 2) {
+                pch_headers.push_back(header);
+            }
+        }
+        if (pch_headers.empty()) {
+             out::info("PCH skipped: No sufficiently common headers found.");
+             return "";
+        }
+        fs::path pch_source = build_path / PCH_HEADER_NAME;
+        fs::path pch_out = pch_source.string() + ".gch";
+        out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
+        std::ofstream pch_file(pch_source);
+        if (!pch_file.is_open()) {
+            out::error("Failed to create PCH source file: {}", pch_source);
+            return "";
+        }
+        for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
+        pch_file.close();
+        const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
+            config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
+        out::command("{}", pch_compile_cmd);
+        if (auto [exit_code, stdout_output, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
+            out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
+            return "";
+        }
+        if (!fs::exists(pch_out)) {
+            out::warn("PCH compilation appeared successful but output file missing: {}", pch_out);
+            // Clean up partial files
+            try {
+                if (fs::exists(pch_source)) fs::remove(pch_source);
+            } catch (...) {}
+            return "";
+        }
+        return fmt::format("-include {}", pch_source.string());
+    }
+
+    std::string getCompiler(const fs::path& file) const {
+        const std::string ext = file.extension().string();
+        if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return config.cxx;
+        if (ext == ".c") return config.cc;
+        if (ext == ".s" || ext == ".S" || ext == ".asm") return config.as;
+        return config.cxx;
+    }
 
     explicit AutoCC(Config cfg) : config(std::move(cfg)) {
         const auto ignored_dirs = getIgnoredDirs();
@@ -511,9 +726,6 @@ public:
             out::error("No source files found to build.");
             return 1;
         }
-
-        // --- REFACTOR: Auto-detection is now part of the build process ---
-        run_auto_detection();
 
         const fs::path build_path = config.build_dir;
         try {
@@ -584,8 +796,7 @@ public:
                     needs_recompile = true;
                     reason = "not in cache";
                 } else {
-                    const auto& cached_info = build_cache[obj_file.string()];
-                    if (cached_info.value("source_hash", "") != current_source_hash) reason = "source file changed";
+                    if (const auto& cached_info = build_cache[obj_file.string()]; cached_info.value("source_hash", "") != current_source_hash) reason = "source file changed";
                     else if (cached_info.value("flags", "") != current_flags) reason = "compiler flags changed";
                     else if (cached_info.value("dep_hashes", json::object()) != current_dep_hashes) reason = "a header dependency changed";
                     if (!reason.empty()) needs_recompile = true;
@@ -607,16 +818,17 @@ public:
             out::success("All {} files are up to date.", source_files.size());
         } else {
             out::info("Compiling {}/{} source files...", files_to_compile.size(), source_files.size());
-            std::atomic<bool> compilation_failed = false;
+            std::atomic compilation_failed = false;
             std::atomic<size_t> file_index = 0;
             const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> workers;
             for (unsigned int i = 0; i < num_threads; ++i) {
-                workers.emplace_back([&]() {
+                workers.emplace_back([&] {
                     while (true) {
-                        if (compilation_failed) return;
+                        if (compilation_failed.load()) return;
                         const size_t index = file_index.fetch_add(1);
                         if (index >= files_to_compile.size()) return;
+                        if (compilation_failed.load()) return;
                         const auto& src = files_to_compile[index];
                         std::string compiler = getCompiler(src);
                         fs::path obj = build_path / src.filename().replace_extension(".o");
@@ -624,8 +836,8 @@ public:
                         if (compiler == config.as) {
                             cmd = fmt::format("{} {} -felf64 -o {}", compiler, src, obj);
                         } else {
-                            std::string_view flags = (compiler == config.cxx) ? config.cxxflags : config.cflags;
-                            std::string current_pch_flags = (compiler == config.cxx) ? pch_flags : "";
+                            std::string_view flags = compiler == config.cxx ? config.cxxflags : config.cflags;
+                            std::string current_pch_flags = compiler == config.cxx ? pch_flags : "";
                             cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags, fmt::join(config.include_dirs, " "));
                         }
                         out::command("{}", cmd);
@@ -675,9 +887,6 @@ private:
     const fs::path cache_dir = root / CACHE_DIR_NAME;
     const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
     const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
-    std::vector<fs::path> source_files;
-    LibraryDetector lib_detector;
-    IncludeParser include_parser;
     DependencyMap dependency_map;
 
     void run_auto_detection() {
@@ -701,8 +910,14 @@ private:
         while (std::getline(file, line)) {
             const auto pos = line.find(':');
             if (pos == std::string::npos) continue;
+
+            if (pos == 0 || pos == line.length() - 1) {
+                out::warn("Invalid config cache line format, skipping: {}", line);
+                continue;
+            }
             const std::string_view key = std::string_view(line).substr(0, pos);
             std::string_view value = std::string_view(line).substr(pos + 1);
+            if (key.empty()) continue;
             if (key == "cxx") config.cxx = value;
             else if (key == "cc") config.cc = value;
             else if (key == "as") config.as = value;
@@ -711,112 +926,14 @@ private:
             else if (key == "cflags") config.cflags = value;
             else if (key == "ldflags") config.ldflags = value;
             else if (key == "build_dir") config.build_dir = value;
-            else if (key == "use_pch") config.use_pch = (value == "true");
+            else if (key == "use_pch") config.use_pch = value == "true";
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
             else if (key == "ignore") config.ignored_dirs.emplace_back(value);
         }
         return true;
     }
-    std::unordered_set<std::string> getIgnoredDirs() const {
-        std::unordered_set<std::string> ignored = {".git", config.build_dir, CACHE_DIR_NAME};
-        ignored.insert(config.ignored_dirs.begin(), config.ignored_dirs.end());
-        return ignored;
-    }
-    void scanLocalHeaders() {
-        std::set<fs::path> header_dirs;
-        const auto ignored_dirs_set = getIgnoredDirs(); // Get ignored dirs for header scan
-        for (const auto& entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied)) {
-            bool is_in_ignored_dir = false;
-            for (const auto& part : entry.path()) {
-                if (ignored_dirs_set.contains(part.string())) {
-                    is_in_ignored_dir = true;
-                    break;
-                }
-            }
-            if (is_in_ignored_dir) {
-                // We just skip the entry. The iterator will continue to the next item.
-                // The problematic 'disable_recursion_pending' is removed.
-                continue;
-            }
 
-            if (entry.is_regular_file()) {
-                const std::string ext = entry.path().extension().string();
-                if (ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
-                    header_dirs.insert(fs::canonical(entry.path().parent_path()));
-                }
-            }
-        }
-        // Use a set to avoid duplicate -I flags from TOML and scan
-        std::unordered_set<std::string> final_includes;
-        for (const auto& dir : config.include_dirs) final_includes.insert(dir);
-        for (const auto& dir : header_dirs) final_includes.insert(fmt::format("-I{}", dir.string()));
-        config.include_dirs.assign(final_includes.begin(), final_includes.end());
-    }
-    void detectLibraries() {
-        const auto all_includes = include_parser.getAllUniqueIncludes(source_files, config.include_dirs);
-        lib_detector.detect(all_includes, config);
-    }
-    std::string generatePCH(const fs::path& build_path) {
-        out::info("Analyzing for Pre-Compiled Header generation...");
-        std::unordered_map<std::string, int> include_counts;
-        int cpp_file_count = 0;
-        for (const auto& src : source_files) {
-            if (getCompiler(src) != config.cxx) continue;
-            cpp_file_count++;
-            std::ifstream stream(src);
-        if (!stream.is_open()) {
-            out::warn("Could not open source file for PCH analysis: {}", src);
-            continue;
-        }
-            std::string line;
-            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_" );
-            while(std::getline(stream, line)) {
-                if(std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
-                    include_counts[matches[1].str()]++;
-                }
-            }
-        }
-        if (cpp_file_count < 3) {
-            out::info("PCH skipped: Not enough C++ source files.");
-            return "";
-        }
-        std::vector<std::string> pch_headers;
-        for(const auto& [header, count] : include_counts) {
-            if (count > cpp_file_count / 2) {
-                pch_headers.push_back(header);
-            }
-        }
-        if (pch_headers.empty()) {
-             out::info("PCH skipped: No sufficiently common headers found.");
-             return "";
-        }
-        fs::path pch_source = build_path / PCH_HEADER_NAME;
-        fs::path pch_out = pch_source.string() + ".gch";
-        out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
-        std::ofstream pch_file(pch_source);
-        if (!pch_file.is_open()) {
-            out::error("Failed to create PCH source file: {}", pch_source);
-            return "";
-        }
-        for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
-        pch_file.close();
-        const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
-            config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
-        out::command("{}", pch_compile_cmd);
-        if (auto [exit_code, stdout_output, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
-            out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
-            return "";
-        }
-        return fmt::format("-include {}", pch_source.string());
-    }
-    std::string getCompiler(const fs::path& file) const {
-        const std::string ext = file.extension().string();
-        if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".c++") return config.cxx;
-        if (ext == ".c") return config.cc;
-        if (ext == ".s" || ext == ".S" || ext == ".asm") return config.as;
-        return config.cxx;
-    }
 };
 
 
@@ -884,11 +1001,10 @@ void user_init(Config& config) {
     config.cflags = get_input("CC Flags", config.cflags);
     config.ldflags = get_input("Linker Flags", config.ldflags);
     config.build_dir = get_input("Build Directory", config.build_dir);
-    std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
-    config.use_pch = (pch_choice == "yes" || pch_choice == "y");
+    const std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
+    config.use_pch = pch_choice == "yes" || pch_choice == "y";
 
-    std::string ignored_input = get_input("Ignored directories (space-separated, e.g. 'vendor tests')", "");
-    if (!ignored_input.empty()) {
+    if (const std::string ignored_input = get_input("Ignored directories (space-separated, e.g. 'vendor tests')", ""); !ignored_input.empty()) {
         std::stringstream ss(ignored_input);
         std::string item;
         while (ss >> item) { // Using operator>> handles whitespace better
@@ -938,12 +1054,21 @@ int main(const int argc, char* argv[]) {
         Config config;
         user_init(config);
 
-        // This scan is for PRE-POPULATING the TOML file with good suggestions.
+        // Create AutoCC instance for comprehensive scanning
         AutoCC scanner(config);
-        scanner.discover_dependencies_for_config();
+
+        // Do ALL the detection work here
+        out::info("Scanning entire project for headers and libraries...");
+        scanner.scanLocalHeaders();  // Scan for local headers
+
+        // Update library detection to use the new comprehensive method
+        const auto ignored_dirs = scanner.getIgnoredDirs();
+        const auto all_includes = scanner.include_parser.getAllProjectIncludes(
+            scanner.source_files, scanner.config.include_dirs, ignored_dirs);
+        scanner.lib_detector.detect(all_includes, scanner.config);
 
         write_config_to_toml(scanner.config, config_toml_path);
-        out::info("Now run 'autocc setup' to prepare the build environment.");
+        out::info("Configuration complete. Run 'autocc setup' to prepare build environment.");
         return 0;
     }
 
@@ -951,7 +1076,7 @@ int main(const int argc, char* argv[]) {
         out::info("Syncing build environment from '{}'...", config_toml_path);
         const auto config_opt = load_config_from_toml(config_toml_path);
         if (!config_opt) {
-            out::error(fmt::runtime("Could not load '{}'. Run 'autocc autoconfig' to create it."));
+            out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
             return 1;
         }
         if (fs::exists(cache_dir)) {

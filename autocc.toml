@@ -13,9 +13,9 @@ ldflags = '  -lfmt  -lssl  -lcrypto  -lxxhash  -lzstd'
 
 [paths]
 external_libs = [ '-lm', '-lz', '-lpthread' ]
-ignored_dirs = []
-include_dirs = [ '-I/home/Atheria/workspace/pack/include' ]
+ignored_dirs = ["cmake-build-release"]
+include_dirs = [ '-Iinclude' ]
 
 [project]
 build_dir = '.autocc_build'
-name = 'a.out'
+name = 'autocc'
