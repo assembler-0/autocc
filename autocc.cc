@@ -1,5 +1,6 @@
 // This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+#include "include/utils.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -7,7 +8,6 @@
 #include <string>
 #include <string_view>
 #include <regex>
-#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <thread>
@@ -65,6 +65,7 @@ struct Target {
 class TargetDiscovery {
 public:
     struct DiscoveredTarget {
+
         std::string suggested_name;
         fs::path main_file;
         std::vector<fs::path> suggested_sources;
@@ -313,6 +314,20 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     out::success("Configuration saved to '{}'.", toml_path);
 }
 
+void validate_config(Config& config) {
+    std::unordered_set<std::string> names, outputs;
+    for (const auto& t : config.targets) {
+        if (t.name.empty()) out::warn("A target has an empty name.");
+        if (t.main_file.empty()) out::warn("Target '{}' has an empty main_file.", t.name);
+        if (t.sources.empty()) out::warn("Target '{}' has no sources.", t.name);
+        if (!names.insert(t.name).second) out::error("Duplicate target name '{}'.", t.name);
+        if (!outputs.insert(t.output_name).second) out::error("Duplicate output_name '{}'.", t.output_name);
+    }
+    if (!config.default_target.empty() &&
+        std::ranges::none_of(config.targets, [&](const Target& t){ return t.name == config.default_target; }))
+        out::warn("default_target '{}' does not match any target name.", config.default_target);
+}
+
 std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
     if (!fs::exists(toml_path)) {
         return std::nullopt;
@@ -341,7 +356,13 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.use_pch = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
-            for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
+            for (const auto& elem : *includes) {
+                std::string dir = elem.value_or("");
+                if (!dir.empty() && fs::path(dir).is_absolute()) {
+                    out::warn("Include directory '{}' in autocc.toml is absolute. This may break portability. Consider using a relative path.", dir);
+                }
+                config.include_dirs.emplace_back(dir);
+            }
         }
 
         if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
@@ -380,6 +401,7 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
             }
         }
 
+        validate_config(config);
         return config;
 
     } catch (const toml::parse_error& err) {
@@ -810,7 +832,10 @@ public:
         // Use a set to avoid duplicate -I flag from TOML and scan
         std::unordered_set<std::string> final_includes;
         for (const auto& dir : config.include_dirs) final_includes.insert(dir);
-        for (const auto& dir : header_dirs) final_includes.insert(fmt::format("-I{}", dir.string()));
+        for (const auto& dir : header_dirs) {
+            fs::path rel = fs::relative(dir, root);
+            final_includes.insert(rel.empty() ? dir.string() : rel.string());
+        }
         config.include_dirs.assign(final_includes.begin(), final_includes.end());
     }
 
@@ -865,7 +890,8 @@ public:
         for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
         pch_file.close();
         const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {} {}",
-            config.cxx, pch_source, pch_out, config.cxxflags, fmt::join(config.include_dirs, " "));
+            config.cxx, pch_source, pch_out, config.cxxflags, 
+            fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
         out::command("{}", pch_compile_cmd);
         if (auto [exit_code, stdout_output, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
             out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
@@ -1016,17 +1042,27 @@ public:
 private:
 
     int build_target(const Target& target) {
+        target_source_files.clear(); // clear previous target files (extra safety)
         out::info("Building target: {} -> {}", target.name, target.output_name);
 
-        // Use ONLY the explicitly configured sources
         for (const auto& src_path : target.sources) {
-            fs::path file_path(src_path);
 
-            // Handle relative paths consistently with root
-            if (!file_path.is_absolute()) {
-                file_path = fs::path(root) / file_path;  // Use root instead of current_path()
+            bool excluded = false;
+            for (const auto& pat : config.exclude_patterns) {
+                if (matches_pattern(src_path, pat)) { excluded = true; break; }
+            }
+            for (const auto& pat : target.exclude_patterns) {
+                if (matches_pattern(src_path, pat)) { excluded = true; break; }
+            }
+            if (excluded) {
+                out::info("Source '{}' excluded by pattern.", src_path);
+                continue;
             }
 
+            fs::path file_path(src_path);
+            if (!file_path.is_absolute()) {
+                file_path = fs::path(root) / file_path;
+            }
             try {
                 if (fs::exists(file_path)) {
                     try {
@@ -1038,7 +1074,7 @@ private:
                     }
                 } else {
                     out::error("Source file '{}' specified in target '{}' not found at '{}'",
-                              src_path, target.name, file_path.string());
+                            src_path, target.name, file_path.string());
                     return 1;
                 }
             } catch (const fs::filesystem_error& e) {
@@ -1179,7 +1215,8 @@ private:
                         } else {
                             std::string_view flags = compiler == config.cxx ? config.cxxflags : config.cflags;
                             std::string current_pch_flags = compiler == config.cxx ? pch_flags : "";
-                            cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags, fmt::join(config.include_dirs, " "));
+                            cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags, 
+                                  fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
                         }
                         out::command("{}", cmd);
                         if (auto [exit_code, stdout_output, stderr_output] = execute(cmd); exit_code != 0) {

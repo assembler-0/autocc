@@ -41,7 +41,7 @@ cd autocc
 
 # Build with cmake
 mkdir build && cd build
-cmake .. && make
+cmake .. && make # -DWALL=ON for all possible warnings -DARM=ON for no optimization flags (suitable for armv8a+)
 
 # Or if you already have autocc:
 autocc setup && autocc
@@ -105,7 +105,7 @@ ldflags = '-lfmt -lssl -lcrypto -lxxhash'
 
 [paths]
 external_libs = ['-lm', '-lz', '-lpthread']    # System libraries
-include_dirs = ['-I./include', '-I./third_party'] # Include directories
+include_dirs = ['./include', './third_party'] # Include directories
 exclude_patterns = ['test_*.cpp', '*_benchmark.cpp'] # Files to exclude globally
 
 # 🎯 Target Configuration (Multiple Executables)
