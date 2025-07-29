@@ -1,53 +1,155 @@
 // This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
 #pragma once
-
+#include <cstdlib>
 #include <string>
+#include <fstream>
 #include <filesystem>
-#include <vector>
-#include <unordered_set>
-#include <thread>
-
+#include <stdexcept>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h> // getpid
+#include <fcntl.h>
+#include <sys/wait.h>
 #include "log.hpp"
 
 namespace fs = std::filesystem;
 
-// A struct to hold the result of a command execution
 struct CommandResult {
     int exit_code;
     std::string stdout_output;
     std::string stderr_output;
 };
 
-// Executes a command and captures its exit code, stdout, and stderr.
+namespace fs = std::filesystem;
+
+class TempFile {
+public:
+    explicit TempFile(const fs::path& base) {
+        path_ = base.string() + "_" + std::to_string(getpid()) + "_" +
+                std::to_string(rand() % 1000000) + ".tmp";
+    }
+
+    ~TempFile() {
+        std::error_code ec;
+        fs::remove(path_, ec);
+    }
+
+    const fs::path& path() const { return path_; }
+
+    // Prevent copying
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+
+    TempFile(TempFile&& other) noexcept : path_(std::move(other.path_)) {
+        other.path_ = "";
+    }
+
+private:
+    fs::path path_;
+};
+
 [[nodiscard]] inline CommandResult execute(const std::string& cmd) {
-    // Create temporary files for stdout and stderr
-    fs::path stdout_path = fs::temp_directory_path() / ("autocc_stdout_" + std::to_string(getpid()) + ".log");
-    fs::path stderr_path = fs::temp_directory_path() / ("autocc_stderr_" + std::to_string(getpid()) + ".log");
 
-    // Construct the command to redirect stdout and stderr to files
-    std::string full_cmd = fmt::format("{} > {} 2> {}", cmd, stdout_path.string(), stderr_path.string());
+    auto contains_shell_metachar = [](const std::string& s) {
+        const char* unsafe[] = {";", "&", "|", "$(", "`", "<", ">", "<<", ">>", "\\n", "\\r", nullptr};
+        for (const char** p = unsafe; *p; ++p) {
+            if (s.find(*p) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
 
+    if (contains_shell_metachar(cmd)) {
+        return { -1, "", "Error: Command contains potentially dangerous shell metacharacters." };
+    }
+
+    const auto trimmed_cmd = [](const std::string& s) -> std::string {
+        const size_t start = s.find_first_not_of(" \t\n\r");
+        const size_t end = s.find_last_not_of(" \t\n\r");
+        if (start == std::string::npos) return "";
+        return s.substr(start, end - start + 1);
+    }(cmd);
+
+    if (trimmed_cmd.empty()) {
+        return { -1, "", "Error: Empty command." };
+    }
+
+    // 🔒 3. Use RAII temp files
+    static std::once_flag seed_flag;
+    std::call_once(seed_flag, [] { srand(static_cast<unsigned>(time(nullptr))); });
+
+    const TempFile stdout_file(fs::temp_directory_path() / "autocc_stdout");
+    const TempFile stderr_file(fs::temp_directory_path() / "autocc_stderr");
+
+    auto shell_escape = [](const std::string& s) -> std::string {
+        std::string result;
+        result += "'";
+        for (const char c : s) {
+            if (c == '\'') {
+                result += "'\\''";
+            } else {
+                result += c;
+            }
+        }
+        result += "'";
+        return result;
+    };
+
+    const std::string escaped_stdout = shell_escape(stdout_file.path().string());
+    const std::string escaped_stderr = shell_escape(stderr_file.path().string());
+    const std::string escaped_cmd = shell_escape(trimmed_cmd);
+
+    // Build full command: <cmd> > stdout 2> stderr
+    const std::string full_cmd = escaped_cmd + " > " + escaped_stdout + " 2> " + escaped_stderr;
+
+    // 🔒 5. Use system() safely (still not perfect, but better)
     const int exit_code = system(full_cmd.c_str());
 
-    // Read the captured output
-    std::string stdout_result, stderr_result;
-
-    if (std::ifstream stdout_file(stdout_path); stdout_file.is_open()) {
-        stdout_result.assign(std::istreambuf_iterator(stdout_file),
-                           std::istreambuf_iterator<char>());
+    // Handle system() failure
+    if (exit_code == -1) {
+        return { -1, "", std::string("Error: system() failed: ") + strerror(errno) };
     }
 
-    if (std::ifstream stderr_file(stderr_path); stderr_file.is_open()) {
-        stderr_result.assign(std::istreambuf_iterator<char>(stderr_file),
-                           std::istreambuf_iterator<char>());
+    // 🔒 6. Decode actual exit code (from waitpid format)
+    int real_exit_code;
+    if (WIFEXITED(exit_code)) {
+        real_exit_code = WEXITSTATUS(exit_code);
+    } else {
+        real_exit_code = -1; // Signal or abnormal termination
     }
 
-    // Clean up temp files
-    fs::remove(stdout_path);
-    fs::remove(stderr_path);
+    // 🔒 7. Read output files with size limits and error handling
+    auto read_file_safely = [](const fs::path& p, const size_t max_size = 10 * 1024 * 1024) -> std::string {
+        std::error_code ec;
+        if (!fs::exists(p, ec) || fs::is_directory(p, ec)) {
+            return ""; // File doesn't exist or is dir
+        }
 
-    return {exit_code, stdout_result, stderr_result};
+        const uintmax_t file_size = fs::file_size(p, ec);
+        if (ec || file_size > max_size) {
+            return "(output too large or unreadable)";
+        }
+
+        std::ifstream file(p, std::ios::binary);
+        if (!file.is_open()) {
+            return "(failed to open)";
+        }
+
+        std::string content;
+        content.resize(file_size);
+        file.read(&content[0], static_cast<std::streamsize>(file_size));
+        if (!file) {
+            return "(read error)";
+        }
+        return content;
+    };
+
+    const std::string stdout_result = read_file_safely(stdout_file.path());
+    const std::string stderr_result = read_file_safely(stderr_file.path());
+
+    return { real_exit_code, stdout_result, stderr_result };
 }
 
 inline bool matches_pattern(const std::string& filename, const std::string& pattern) {

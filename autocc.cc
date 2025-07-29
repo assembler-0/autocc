@@ -1,8 +1,5 @@
 // This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
-#ifdef __clang__
-#pragma clang diagnostic ignored "-Weverything"
-#endif //__clang__
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -138,12 +135,16 @@ private:
         std::ifstream stream(file);
         if (!stream.is_open()) return false;
 
-        const std::string content((std::istreambuf_iterator(stream)),
-                           std::istreambuf_iterator<char>());
-
-        // Simple regex to find the main function
-        const std::regex main_regex(R"(\bint\s+main\s*\([^)]*\)\s*\{)");
-        return std::regex_search(content, main_regex);
+        // Read line by line to avoid loading entire file
+        std::string line;
+        // More robust pattern that handles different main signatures
+        const std::regex main_regex(R"(^\s*int\s+main\s*\([^)]*\)\s*(?:\{|$))");
+        while (std::getline(stream, line)) {
+            if (std::regex_search(line, main_regex)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static std::string get_target_name_from_file(const fs::path& file) {
@@ -1028,7 +1029,13 @@ private:
 
             try {
                 if (fs::exists(file_path)) {
-                    target_source_files.push_back(fs::canonical(file_path));
+                    try {
+                        target_source_files.push_back(fs::canonical(file_path));
+                    }
+                    catch (const fs::filesystem_error& e) {
+                        out::error("Cannot resolve path '{}': {}", file_path.string(), e.what());
+                        return 1;
+                    }
                 } else {
                     out::error("Source file '{}' specified in target '{}' not found at '{}'",
                               src_path, target.name, file_path.string());
@@ -1481,10 +1488,6 @@ void user_init(Config& config) {
     if (!config.targets.empty()) {
         config.default_target = get_input("Default target", config.targets[0].name);
     }
-}
-
-fs::path get_value1(const fs::path& base_db_path) {
-    return base_db_path;
 }
 
 int main(const int argc, char* argv[]) {
