@@ -9,13 +9,20 @@ use_pch = true
 [flags]
 cflags = '-march=native -std=c11 -O2 -pipe'
 cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = '  -lfmt  -lssl  -lcrypto  -lxxhash  -lzstd'
+ldflags = ''
 
 [paths]
-external_libs = [ '-lm', '-lz', '-lpthread' ]
-ignored_dirs = ["cmake-build-release"]
-include_dirs = [ '-Iinclude' ]
+exclude_patterns = []
+external_libs = [ '-lm', '-lfmt', '-lzstd', '-lz', '-lxxhash', '-lpthread', '-lcrypto', '-lssl' ]
+include_dirs = [ '-I./include' ]
 
 [project]
 build_dir = '.autocc_build'
+default_target = 'autocc'
+
+[[targets]]
+exclude_patterns = []
+main_file = './autocc.cc'
 name = 'autocc'
+output_name = 'autocc'
+sources = [ './autocc.cc']
