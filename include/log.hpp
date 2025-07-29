@@ -6,9 +6,24 @@
 #include <fmt/core.h>
 #include <fmt/color.h>
 #include <mutex>
+#include <chrono>
+#include <ctime>
 
 // A global mutex for ensuring threads do not interleave cout/cerr writes
 extern std::mutex g_output_mutex;
+
+
+// Helper to format timestamp: YYYY-MM-DD HH:MM:SS.mmm
+inline std::string now_str() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+    ss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
 
 namespace out {
 
@@ -23,7 +38,7 @@ namespace out {
     template<typename... T>
     void info(fmt::format_string<T...> fmt, T&&... args) {
         std::lock_guard lock(g_output_mutex);
-        fmt::print( color_info, "[INFO] ");
+        fmt::print( color_info, "[{}] [INFO] ", now_str());
         fmt::print(stdout, fmt, std::forward<T>(args)...);
         fmt::print(stdout, "\n");
     }
@@ -31,7 +46,7 @@ namespace out {
     template<typename... T>
     void warn(fmt::format_string<T...> fmt, T&&... args) {
         std::lock_guard lock(g_output_mutex);
-        fmt::print(color_warn,"[WARN] ");
+        fmt::print(color_warn,"[{}] [WARNING] ", now_str());
         fmt::print(stderr, fmt, std::forward<T>(args)...);
         fmt::print(stderr, "\n");
     }
@@ -39,7 +54,7 @@ namespace out {
     template<typename... T>
     void error(fmt::format_string<T...> fmt, T&&... args) {
         std::lock_guard lock(g_output_mutex);
-        fmt::print(color_error, "[ERROR] ");
+        fmt::print(color_error, "[{}] [ERROR] ", now_str());
         fmt::print(stderr, fmt, std::forward<T>(args)...);
         fmt::print(stderr, "\n");
     }
@@ -47,7 +62,7 @@ namespace out {
     template<typename... T>
     void success(fmt::format_string<T...> fmt, T&&... args) {
         std::lock_guard lock(g_output_mutex);
-        fmt::print(color_success, "[OK] ");
+        fmt::print(color_success, "[{}] [OK] ", now_str());
         fmt::print(stdout, fmt, std::forward<T>(args)...);
         fmt::print(stdout, "\n");
     }
@@ -55,9 +70,9 @@ namespace out {
     template<typename... T>
     void command(fmt::format_string<T...> fmt, T&&... args) {
         std::lock_guard lock(g_output_mutex);
-        fmt::print(color_cmd,"[CMD]  ");
+        fmt::print(color_cmd,"[{}] [CMD] ", now_str());
         fmt::print(stdout, fmt, std::forward<T>(args)...);
         fmt::print(stdout, "\n");
     }
 
-} // namespace log
+} // namespace out
