@@ -1,0 +1,28 @@
+[compilers]
+as = 'nasm'
+cc = 'clang'
+cxx = 'clang++'
+
+[features]
+use_pch = true
+
+[flags]
+cflags = '-march=native -std=c11 -O2 -pipe'
+cxxflags = '-march=native -std=c++23 -O2 -pipe'
+ldflags = ''
+
+[paths]
+exclude_patterns = []
+external_libs = [ '-lm', '-lfmt', '-lzstd', '-lz', '-lxxhash', '-lpthread', '-lcrypto', '-lssl' ]
+include_dirs = [ './include' ]
+
+[project]
+build_dir = '.autocc_build'
+default_target = 'autocc'
+
+[[targets]]
+exclude_patterns = []
+main_file = './autocc.cc'
+name = 'autocc'
+output_name = 'autocc'
+sources = [ './autocc.cc']

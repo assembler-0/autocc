@@ -471,7 +471,7 @@ public:
                 // Try to find CA certs, but don't fail if we can't
                 if (std::string ca_path = find_ca_cert_path(); !ca_path.empty()) {
                     client.set_ca_cert_path(ca_path);
-                    out::info("Using CA certificates from: {}", ca_path);
+                    out::warn("Using CA certificates from: {}", ca_path);
                 } else {
                     out::warn("No CA certificate bundle found. SSL verification may fail.");
                 }
@@ -1523,7 +1523,7 @@ void user_init(Config& config) {
     // Let user configure each discovered target
     for (const auto& discovered_target : discovered) {
         std::string accept = get_input(
-            fmt::format("Configure target '{}' with main file '{}'? (y/n)",
+            fmt::format("Configure target '{}' with main file '? (y/n)",
                        discovered_target.suggested_name, discovered_target.main_file.filename().string()),
             "y");
 
