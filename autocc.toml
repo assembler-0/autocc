@@ -14,7 +14,7 @@ ldflags = ''
 [paths]
 exclude_patterns = []
 external_libs = [ '-lm', '-lfmt', '-lzstd', '-lz', '-lxxhash', '-lpthread', '-lcrypto', '-lssl' ]
-include_dirs = [ '-I./include' ]
+include_dirs = [ './include' ]
 
 [project]
 build_dir = '.autocc_build'

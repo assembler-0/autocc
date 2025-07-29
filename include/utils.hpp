@@ -6,7 +6,11 @@
 #include <filesystem>
 #include <vector>
 #include <unordered_set>
-#include <thread>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+#include <cstring>
+#include <sstream>
 
 #include "log.hpp"
 
@@ -20,34 +24,56 @@ struct CommandResult {
 };
 
 // Executes a command and captures its exit code, stdout, and stderr.
-[[nodiscard]] inline CommandResult execute(const std::string& cmd) {
-    // Create temporary files for stdout and stderr
-    fs::path stdout_path = fs::temp_directory_path() / ("autocc_stdout_" + std::to_string(getpid()) + ".log");
-    fs::path stderr_path = fs::temp_directory_path() / ("autocc_stderr_" + std::to_string(getpid()) + ".log");
+inline CommandResult execute_vec(const std::vector<std::string>& args) {
+    int stdout_pipe[2], stderr_pipe[2];
+    pipe(stdout_pipe);
+    pipe(stderr_pipe);
 
-    // Construct the command to redirect stdout and stderr to files
-    std::string full_cmd = fmt::format("{} > {} 2> {}", cmd, stdout_path.string(), stderr_path.string());
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); close(stderr_pipe[1]);
 
-    const int exit_code = system(full_cmd.c_str());
+        std::vector<char*> argv;
+        for (const auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127); // exec failed
+    }
 
-    // Read the captured output
+    // Parent
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
     std::string stdout_result, stderr_result;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(stdout_pipe[0], buf, sizeof(buf))) > 0)
+        stdout_result.append(buf, n);
+    while ((n = read(stderr_pipe[0], buf, sizeof(buf))) > 0)
+        stderr_result.append(buf, n);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
 
-    if (std::ifstream stdout_file(stdout_path); stdout_file.is_open()) {
-        stdout_result.assign(std::istreambuf_iterator(stdout_file),
-                           std::istreambuf_iterator<char>());
-    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return {WEXITSTATUS(status), stdout_result, stderr_result};
+}
 
-    if (std::ifstream stderr_file(stderr_path); stderr_file.is_open()) {
-        stderr_result.assign(std::istreambuf_iterator<char>(stderr_file),
-                           std::istreambuf_iterator<char>());
-    }
+// Simple whitespace split (does not handle quotes/escapes)
+inline std::vector<std::string> split_command(const std::string& cmd) {
+    std::istringstream iss(cmd);
+    std::vector<std::string> args;
+    std::string arg;
+    while (iss >> arg) args.push_back(arg);
+    return args;
+}
 
-    // Clean up temp files
-    fs::remove(stdout_path);
-    fs::remove(stderr_path);
-
-    return {exit_code, stdout_result, stderr_result};
+// Replacement for old execute()
+[[nodiscard]] inline CommandResult execute(const std::string& cmd) {
+    return execute_vec(split_command(cmd));
 }
 
 inline bool matches_pattern(const std::string& filename, const std::string& pattern) {
@@ -79,6 +105,8 @@ inline bool matches_pattern(const std::string& filename, const std::string& patt
            filename.substr(0, prefix.size()) == prefix &&
            filename.substr(filename.size() - suffix.size()) == suffix;
 }
+
+
 
 inline std::vector<fs::path> find_source_files(const fs::path& dir,
                                               const std::unordered_set<std::string>& ignored_dirs,
