@@ -1,5 +1,8 @@
 // This is a personal academic project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Weverything"
+#endif //__clang__
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -14,7 +17,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
-#include <sstream> // Added for string stream
+#include <sstream>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
@@ -32,7 +35,7 @@ using json = nlohmann::json;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.2" // Incremented version for major change
+#define VERSION "v0.1.3"
 
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
@@ -54,11 +57,148 @@ struct fmt::formatter<fs::path> : formatter<std::string_view> {
     }
 };
 
+struct Target {
+    std::string name;
+    std::string main_file;
+    std::vector<std::string> sources; // RENAMED from additional_sources - now ALL sources
+    std::string output_name;
+    std::vector<std::string> exclude_patterns; // Target-specific excludes
+};
+
+class TargetDiscovery {
+public:
+    struct DiscoveredTarget {
+        std::string suggested_name;
+        fs::path main_file;
+        std::vector<fs::path> suggested_sources;
+        std::string reason; // Why we think this is a target
+    };
+
+    static std::vector<DiscoveredTarget> discover_targets(const std::vector<fs::path>& all_source_files) {
+        std::vector<DiscoveredTarget> discovered;
+
+        // Strategy 1: Look for files with the "main" function
+        for (const auto& file : all_source_files) {
+            if (has_main_function(file)) {
+                DiscoveredTarget target;
+                target.main_file = file;
+                target.suggested_name = get_target_name_from_file(file);
+                target.suggested_sources = suggest_sources_for_target(file, all_source_files);
+                target.reason = "contains main() function";
+                discovered.push_back(target);
+            }
+        }
+
+        // Strategy 2: Look for common patterns
+        if (discovered.empty()) {
+            // Look for main.cpp, test*.cpp, etc.
+            for (const auto& file : all_source_files) {
+                if (std::string filename = file.filename().string(); filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
+                    DiscoveredTarget target;
+                    target.main_file = file;
+                    target.suggested_name = "main";
+                    target.suggested_sources = suggest_sources_for_target(file, all_source_files);
+                    target.reason = "named 'main.*'";
+                    discovered.push_back(target);
+                }
+                else if (filename.starts_with("test") && !discovered_has_test_target(discovered)) {
+                    DiscoveredTarget target;
+                    target.main_file = file;
+                    target.suggested_name = "test";
+                    target.suggested_sources = suggest_sources_for_target(file, all_source_files);
+                    target.reason = "test file pattern";
+                    discovered.push_back(target);
+                }
+            }
+        }
+
+        // Fallback: If nothing found, suggest the first .cpp file as main
+        if (discovered.empty() && !all_source_files.empty()) {
+            auto cpp_file = std::ranges::find_if(all_source_files,
+                                                 [](const fs::path& p) {
+                                                     const std::string ext = p.extension().string();
+                                                     return ext == ".cpp" || ext == ".cc" || ext == ".cxx";
+                                                 });
+
+            if (cpp_file != all_source_files.end()) {
+                DiscoveredTarget target;
+                target.main_file = *cpp_file;
+                target.suggested_name = "main";
+                target.suggested_sources = all_source_files;
+                target.reason = "fallback - first C++ file";
+                discovered.push_back(target);
+            }
+        }
+
+        return discovered;
+    }
+
+private:
+    static bool has_main_function(const fs::path& file) {
+        std::ifstream stream(file);
+        if (!stream.is_open()) return false;
+
+        const std::string content((std::istreambuf_iterator(stream)),
+                           std::istreambuf_iterator<char>());
+
+        // Simple regex to find the main function
+        const std::regex main_regex(R"(\bint\s+main\s*\([^)]*\)\s*\{)");
+        return std::regex_search(content, main_regex);
+    }
+
+    static std::string get_target_name_from_file(const fs::path& file) {
+        std::string filename = file.stem().string(); // filename without extension
+
+        // Clean up common patterns
+        if (filename == "main") return "main";
+        if (filename.starts_with("test")) return "test";
+        if (filename.ends_with("_main")) return filename.substr(0, filename.size() - 5);
+        if (filename.ends_with("_test")) return filename.substr(0, filename.size() - 5) + "_test";
+
+        return filename;
+    }
+
+    static std::vector<fs::path> suggest_sources_for_target(const fs::path& main_file,
+                                                           const std::vector<fs::path>& all_files) {
+        std::vector<fs::path> suggested;
+        suggested.push_back(main_file); // Always include the main file
+
+        // If it's a test target, include other test files
+        if (const std::string main_filename = main_file.filename().string(); main_filename.starts_with("test") || main_filename.find("test") != std::string::npos) {
+            for (const auto& file : all_files) {
+                if (file == main_file) continue;
+                if (std::string filename = file.filename().string(); filename.find("test") != std::string::npos) {
+                    suggested.push_back(file);
+                }
+            }
+        } else {
+            // For main targets, include all non-test files
+            for (const auto& file : all_files) {
+                if (file == main_file) continue;
+                std::string filename = file.filename().string();
+                // Skip obvious test files and other main files
+                if (filename.find("test") != std::string::npos) continue;
+                if (filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
+                    if (file != main_file) continue; // Skip other main files
+                }
+                suggested.push_back(file);
+            }
+        }
+
+        return suggested;
+    }
+
+    static bool discovered_has_test_target(const std::vector<DiscoveredTarget>& discovered) {
+        return std::ranges::any_of(discovered,
+                                   [](const DiscoveredTarget& t) { return t.suggested_name == "test"; });
+    }
+};
+
 struct Config {
     std::string cc = "clang";
     std::string cxx = "clang++";
     std::string as = "nasm";
-    std::string name = "a.out";
+
     std::string cxxflags = "-march=native -std=c++23 -O2 -pipe";
     std::string cflags = "-march=native -std=c11 -O2 -pipe";
     std::string ldflags;
@@ -66,10 +206,11 @@ struct Config {
     bool use_pch = true;
     std::vector<std::string> include_dirs;
     std::vector<std::string> external_libs;
-    std::vector<std::string> ignored_dirs; // Added ignored directories
-    bool manual_mode = false;
+    std::vector<std::string> exclude_patterns;
+    // Target system
+    std::vector<Target> targets;
+    std::string default_target;
 };
-
 std::string hash_file(const fs::path& path) {
     constexpr size_t buffer_size = 65536;
     std::ifstream file(path, std::ios::binary);
@@ -109,15 +250,37 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         libs_arr.push_back(lib);
     }
 
-    auto ignored_arr = toml::array{};
-    for (const auto& dir : config.ignored_dirs) {
-        ignored_arr.push_back(dir);
+    auto exclude_arr = toml::array{};
+    for (const auto& pattern : config.exclude_patterns) {
+        exclude_arr.push_back(pattern);
+    }
+
+    auto targets_arr = toml::array{};
+    for (const auto&[name, main_file, sources, output_name, exclude_patterns] : config.targets) {
+        auto sources_arr = toml::array{}; // RENAMED from additional_sources
+        for (const auto& src : sources) {
+            sources_arr.push_back(src);
+        }
+
+        auto target_exclude_arr = toml::array{};
+        for (const auto& pattern : exclude_patterns) {
+            target_exclude_arr.push_back(pattern);
+        }
+
+        auto target_tbl = toml::table{
+            {"name", name},
+            {"main_file", main_file},
+            {"sources", sources_arr}, // RENAMED
+            {"output_name", output_name},
+            {"exclude_patterns", target_exclude_arr}
+        };
+        targets_arr.push_back(target_tbl);
     }
 
     auto tbl = toml::table{
         {"project", toml::table{
-            {"name", config.name},
-            {"build_dir", config.build_dir}
+            {"build_dir", config.build_dir},
+            {"default_target", config.default_target}
         }},
         {"compilers", toml::table{
             {"cxx", config.cxx},
@@ -135,8 +298,9 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         {"paths", toml::table{
             {"include_dirs", includes_arr},
             {"external_libs", libs_arr},
-            {"ignored_dirs", ignored_arr}
-        }}
+            {"exclude_patterns", exclude_arr}
+        }},
+        {"targets", targets_arr}
     };
 
     std::ofstream file(toml_path);
@@ -164,24 +328,55 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
             return node ? node->value_or(default_val) : default_val;
         };
 
-        config.name      = get_or(tbl["project"]["name"].as_string(), "a.out");
         config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
-        config.cxx       = get_or(tbl["compilers"]["cxx"].as_string(), "clang++");
-        config.cc        = get_or(tbl["compilers"]["cc"].as_string(), "clang");
-        config.as        = get_or(tbl["compilers"]["as"].as_string(), "nasm");
-        config.cxxflags  = get_or(tbl["flags"]["cxxflags"].as_string(), "-march=native -std=c++23 -O2 -pipe");
-        config.cflags    = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
-        config.ldflags   = get_or(tbl["flags"]["ldflags"].as_string(), "");
-        config.use_pch   = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
+        config.default_target = get_or(tbl["project"]["default_target"].as_string(), "main"); // NEW
+
+        config.cxx = get_or(tbl["compilers"]["cxx"].as_string(), "clang++");
+        config.cc = get_or(tbl["compilers"]["cc"].as_string(), "clang");
+        config.as = get_or(tbl["compilers"]["as"].as_string(), "nasm");
+        config.cxxflags = get_or(tbl["flags"]["cxxflags"].as_string(), "-march=native -std=c++23 -O2 -pipe");
+        config.cflags = get_or(tbl["flags"]["cflags"].as_string(), "-march=native -std=c11 -O2 -pipe");
+        config.ldflags = get_or(tbl["flags"]["ldflags"].as_string(), "");
+        config.use_pch = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
             for (const auto& elem : *includes) { config.include_dirs.emplace_back(elem.value_or("")); }
         }
+
         if (auto* libs = tbl["paths"]["external_libs"].as_array()) {
             for (const auto& elem : *libs) { config.external_libs.emplace_back(elem.value_or("")); }
         }
-        if (auto* ignored = tbl["paths"]["ignored_dirs"].as_array()) {
-            for (const auto& elem : *ignored) { config.ignored_dirs.emplace_back(elem.value_or("")); }
+
+        if (auto* excludes = tbl["paths"]["exclude_patterns"].as_array()) {
+            for (const auto& elem : *excludes) { config.exclude_patterns.emplace_back(elem.value_or("")); }
+        }
+
+        // NEW: Load targets
+        if (auto* targets_arr = tbl["targets"].as_array()) {
+            for (const auto& target_node : *targets_arr) {
+                if (auto* target_tbl = target_node.as_table()) {
+                    Target target;
+                    target.name = get_or((*target_tbl)["name"].as_string(), "");
+                    target.main_file = get_or((*target_tbl)["main_file"].as_string(), "");
+                    target.output_name = get_or((*target_tbl)["output_name"].as_string(), target.name);
+
+                    if (auto* sources = (*target_tbl)["sources"].as_array()) { // RENAMED from additional_sources
+                        for (const auto& elem : *sources) {
+                            target.sources.emplace_back(elem.value_or(""));
+                        }
+                    }
+
+                    if (auto* target_excludes = (*target_tbl)["exclude_patterns"].as_array()) {
+                        for (const auto& elem : *target_excludes) {
+                            target.exclude_patterns.emplace_back(elem.value_or(""));
+                        }
+                    }
+
+                    if (!target.name.empty() && !target.main_file.empty()) {
+                        config.targets.push_back(target);
+                    }
+                }
+            }
         }
 
         return config;
@@ -196,6 +391,7 @@ class Fetcher {
 public:
     static bool download_file(const std::string& url, const fs::path& dest_path, int max_retries = 3) {
         out::info("Attempting to download from {}...", url);
+
         for (int retry_count = 0; retry_count < max_retries; ++retry_count) {
             try {
                 std::string host, path;
@@ -203,11 +399,20 @@ public:
                     out::error("Invalid URL format: {}", url);
                     return false;
                 }
+
                 httplib::SSLClient client(host);
-                client.set_ca_cert_path("/etc/ssl/certs/ca-certificates.crt");
+
+                // Try to find CA certs, but don't fail if we can't
+                if (std::string ca_path = find_ca_cert_path(); !ca_path.empty()) {
+                    client.set_ca_cert_path(ca_path);
+                    out::warn("Using CA certificates from: {}", ca_path);
+                } else {
+                    out::warn("No CA certificate bundle found. SSL verification may fail.");
+                }
+
                 client.set_follow_location(true);
-                client.set_connection_timeout(std::chrono::seconds(5)); // 5-second connection timeout
-                client.set_read_timeout(std::chrono::seconds(10));    // 10-second read timeout
+                client.set_connection_timeout(std::chrono::seconds(5));
+                client.set_read_timeout(std::chrono::seconds(10));
 
                 auto res = client.Get(path);
 
@@ -243,6 +448,26 @@ public:
         return false;
     }
 private:
+    static std::string find_ca_cert_path() {
+        // Common CA cert locations across different distros
+        static const std::vector<std::string> ca_paths = {
+            "/etc/ssl/certs/ca-certificates.crt",     // Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",       // RHEL/CentOS/Fedora
+            "/etc/ssl/ca-bundle.pem",                 // OpenSUSE
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // Modern RHEL/CentOS
+            "/etc/ssl/cert.pem",                      // Alpine/some others
+            "/usr/local/share/certs/ca-root-nss.crt", // FreeBSD
+            "/etc/ssl/certs/ca-bundle.crt"            // Some other distros
+        };
+
+        for (const auto& path : ca_paths) {
+            if (fs::exists(path)) {
+                return path;
+            }
+        }
+
+        return ""; // None found
+    }
     static bool parse_url(const std::string& url, std::string& host, std::string& path) {
         const std::string protocol_end = "://";
         size_t host_start = url.find(protocol_end);
@@ -307,7 +532,7 @@ class LibraryDetector {
                 out::error("Failed to remove corrupt database file '{}': {}", db_path, fs_error.what());
             }
             if (Fetcher::download_file(BASE_DB_URL, db_path)) {
-                // Try parsing again after successful download
+                // Try parsing again after a successful download
                 try {
                     std::ifstream f(db_path);
                     if (!f.is_open()) {
@@ -539,15 +764,16 @@ public:
 class AutoCC {
 public:
     Config config;
-    LibraryDetector lib_detector;  // Make this public too
-    IncludeParser include_parser;  // Make this public too
-    std::vector<fs::path> source_files; // Make this public too
+    LibraryDetector lib_detector;
+    IncludeParser include_parser;
+    std::vector<fs::path> source_files;
+    std::vector<fs::path> target_source_files;
+    bool should_auto_detect{};
 
     std::unordered_set<std::string> getIgnoredDirs() const {
-        std::unordered_set<std::string> ignored = {".git", config.build_dir, CACHE_DIR_NAME};
-        ignored.insert(config.ignored_dirs.begin(), config.ignored_dirs.end());
-        return ignored;
+        return {".git", config.build_dir, CACHE_DIR_NAME}; // to avoid conflict i remove ignored dirs
     }
+
     void scanLocalHeaders() {
         std::set<fs::path> header_dirs;
         const auto ignored_dirs_set = getIgnoredDirs();
@@ -580,7 +806,7 @@ public:
             return;
         }
 
-        // Use a set to avoid duplicate -I flags from TOML and scan
+        // Use a set to avoid duplicate -I flag from TOML and scan
         std::unordered_set<std::string> final_includes;
         for (const auto& dir : config.include_dirs) final_includes.insert(dir);
         for (const auto& dir : header_dirs) final_includes.insert(fmt::format("-I{}", dir.string()));
@@ -597,7 +823,7 @@ public:
         out::info("Analyzing for Pre-Compiled Header generation...");
         std::unordered_map<std::string, int> include_counts;
         int cpp_file_count = 0;
-        for (const auto& src : source_files) {
+        for (const auto& src : target_source_files) {
             if (getCompiler(src) != config.cxx) continue;
             cpp_file_count++;
             std::ifstream stream(src);
@@ -663,36 +889,42 @@ public:
         return config.cxx;
     }
 
-    explicit AutoCC(Config cfg) : config(std::move(cfg)) {
+    explicit AutoCC(Config cfg, const bool auto_detect = false)
+        : config(std::move(cfg)), should_auto_detect(auto_detect) {
+
+        // Always scan for source files first
         const auto ignored_dirs = getIgnoredDirs();
-        source_files = find_source_files(root, ignored_dirs);
+        source_files = find_source_files(root, ignored_dirs, config.exclude_patterns);
+
+        // Only run auto-detection if explicitly requested
+        if (should_auto_detect) {
+            out::info("Running auto-detection for headers and libraries...");
+            scanLocalHeaders();
+            detectLibraries();
+        }
     }
 
     static std::optional<AutoCC> load_from_cache() {
-        AutoCC instance;
-        if (!instance.readConfigCache()) {
+        Config config;
+
+        // Try to read cache first
+        if (!read_config_cache_static(config)) {
             return std::nullopt;
         }
-        const auto ignored_dirs = instance.getIgnoredDirs();
-        instance.source_files = find_source_files(instance.root, ignored_dirs);
+
+        // Create instance WITHOUT auto-detection
+        AutoCC instance(std::move(config), false);
+
         if (instance.source_files.empty()) {
             out::error("No source files found.");
             return std::nullopt;
         }
+
         return instance;
     }
 
-    // This function is now only used by 'autoconfig' to discover and pre-populate the TOML.
-    void discover_dependencies_for_config() {
-        if (source_files.empty()) {
-            out::warn("No source files found to scan for dependencies.");
-            return;
-        }
-        if (!config.manual_mode) {
-            out::info("Scanning for local headers and external libraries to suggest in config...");
-            scanLocalHeaders();
-            detectLibraries();
-        }
+    static AutoCC create_with_auto_detection(Config config) {
+        return AutoCC(std::move(config), true);
     }
 
     void writeConfigCache() const {
@@ -707,22 +939,124 @@ public:
             out::error("Failed to open config cache file for writing: {}", config_file);
             return;
         }
+
+        // Basic config
         file << "cxx:" << config.cxx << "\n";
         file << "cc:" << config.cc << "\n";
         file << "as:" << config.as << "\n";
-        file << "name:" << config.name << "\n";
         file << "cxxflags:" << config.cxxflags << "\n";
         file << "cflags:" << config.cflags << "\n";
         file << "ldflags:" << config.ldflags << "\n";
         file << "build_dir:" << config.build_dir << "\n";
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
+        file << "default_target:" << config.default_target << "\n"; // NEW
+
+        // Arrays
         for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
         for (const auto& lib : config.external_libs) file << "lib:" << lib << "\n";
-        for (const auto& dir : config.ignored_dirs) file << "ignore:" << dir << "\n";
+        for (const auto& pattern : config.exclude_patterns) file << "exclude:" << pattern << "\n";
+
+        // NEW: Targets (using a simple format that's straightforward to parse)
+        for (const auto& [name, main_file, sources, output_name, exclude_patterns] : config.targets) {
+            // Escape pipe characters in the values
+            auto escape_pipes = [](const std::string& str) {
+                std::string result = str;
+                size_t pos = 0;
+                while ((pos = result.find('|', pos)) != std::string::npos) {
+                    result.replace(pos, 1, "\\|");
+                    pos += 2;
+                }
+                return result;
+            };
+
+            file << "target:" << escape_pipes(name) << "|"
+                 << escape_pipes(main_file) << "|"
+                 << escape_pipes(output_name) << "\n";
+
+            // Sources for this target
+            for (const auto& src : sources) {
+                file << "target_src:" << name << ":" << src << "\n";
+            }
+
+            // Target-specific excludes
+            for (const auto& pattern : exclude_patterns) {
+                file << "target_exclude:" << name << ":" << pattern << "\n";
+            }
+        }
     }
 
-    int build() {
-        if (source_files.empty()) {
+
+
+    int build(const std::string& target_name = "") {
+        if (config.targets.empty()) {
+            out::error("No targets configured. Run 'autocc autoconfig' to set up targets.");
+            return 1;
+        }
+        std::string actual_target = target_name.empty() ? config.default_target : target_name;
+
+        if (actual_target.empty()) {
+            actual_target = config.targets[0].name;
+            out::info("No default target specified, using '{}'", actual_target);
+        }
+        // Find the target
+        const auto target_it = std::ranges::find_if(config.targets,
+                                              [&](const Target& t) { return t.name == actual_target; });
+
+        if (target_it == config.targets.end()) {
+            out::error("Target '{}' not found. Available targets: {}",
+                      actual_target,
+                      fmt::join(config.targets | std::views::transform([](const Target& t) { return t.name; }), ", "));
+            return 1;
+        }
+
+        return build_target(*target_it);
+    }
+
+private:
+
+    int build_target(const Target& target) {
+        out::info("Building target: {} -> {}", target.name, target.output_name);
+
+        // Use ONLY the explicitly configured sources
+        for (const auto& src_path : target.sources) {
+            fs::path file_path(src_path);
+
+            // Handle relative paths consistently with root
+            if (!file_path.is_absolute()) {
+                file_path = fs::path(root) / file_path;  // Use root instead of current_path()
+            }
+
+            try {
+                if (fs::exists(file_path)) {
+                    target_source_files.push_back(fs::canonical(file_path));
+                } else {
+                    out::error("Source file '{}' specified in target '{}' not found at '{}'",
+                              src_path, target.name, file_path.string());
+                    return 1;
+                }
+            } catch (const fs::filesystem_error& e) {
+                out::error("Error accessing source file '{}': {}", file_path.string(), e.what());
+                return 1;
+            }
+        }
+
+        if (target_source_files.empty()) {
+            out::error("No valid source files found for target '{}'", target.name);
+            return 1;
+        }
+
+        out::info("Target '{}' building {} source files:", target.name, target_source_files.size());
+        for (const auto& file : target_source_files) {
+            out::info("  - {}", file.filename().string());
+        }
+
+        // Build with target-specific files - use target.output_name directly
+        return build_with_files(target_source_files, target.output_name);
+    }
+
+
+    int build_with_files(const std::vector<fs::path>& files_to_build, const std::string& output_name) {
+        if (files_to_build.empty()) {
             out::error("No source files found to build.");
             return 1;
         }
@@ -736,7 +1070,7 @@ public:
         }
 
         out::info("Parsing source file dependencies for build...");
-        dependency_map = include_parser.parseSourceDependencies(source_files, config.include_dirs);
+        dependency_map = include_parser.parseSourceDependencies(files_to_build, config.include_dirs);
 
         json build_cache;
         std::string pch_flags;
@@ -759,7 +1093,7 @@ public:
 
         out::info("Checking dependencies with content hashing...");
 
-        for (const auto& src_file : source_files) {
+        for (const auto& src_file : files_to_build) {
             fs::path obj_file = build_path / src_file.filename().replace_extension(".o");
             object_files.push_back(obj_file);
 
@@ -814,10 +1148,10 @@ public:
             };
         }
 
-        if (files_to_compile.empty() && !source_files.empty()) {
-            out::success("All {} files are up to date.", source_files.size());
+        if (files_to_compile.empty() && !files_to_build.empty()) {
+            out::success("All {} files are up to date.", files_to_build.size());
         } else {
-            out::info("Compiling {}/{} source files...", files_to_compile.size(), source_files.size());
+            out::info("Compiling {}/{} source files...", files_to_compile.size(), files_to_build.size());
             std::atomic compilation_failed = false;
             std::atomic<size_t> file_index = 0;
             const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -857,7 +1191,7 @@ public:
             }
         }
 
-        const fs::path target_path = fs::path(config.build_dir) / config.name;
+        const fs::path target_path = fs::path(config.build_dir) / output_name;
         if (files_to_compile.empty() && fs::exists(target_path)) {
              out::success("Build complete. Executable '{}' is up to date.", target_path.string());
              return 0;
@@ -870,18 +1204,17 @@ public:
         out::command("{}", link_cmd);
 
         if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
-            out::error("Failed to link target: {}", config.name);
+            out::error("Failed to link target: {}", output_name);
             std::lock_guard lock(g_output_mutex);
             fmt::print(stderr, "{}\n", stderr_output);
             return 1;
         }
         std::ofstream out_cache(dep_cache_file);
         out_cache << new_build_cache.dump(2);
-        out::success("Target '{}' built successfully in '{}'.", config.name, config.build_dir);
+        out::success("Target '{}' built successfully in '{}'.", output_name, config.build_dir);
         return 0;
     }
 
-private:
     AutoCC() = default;
     const fs::path root = ".";
     const fs::path cache_dir = root / CACHE_DIR_NAME;
@@ -889,53 +1222,117 @@ private:
     const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
     DependencyMap dependency_map;
 
-    void run_auto_detection() {
-        if (config.manual_mode) return;
-        out::info("Auto-detecting headers and libraries...");
-        scanLocalHeaders();
-        detectLibraries();
-    }
+    static bool read_config_cache_static(Config& config) {
+        const fs::path cache_dir = CACHE_DIR_NAME;
+        const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
 
-    bool readConfigCache() {
         if (!fs::exists(config_file)) return false;
+
         std::ifstream file(config_file);
         if (!file.is_open()) {
             out::error("Failed to open config cache file for reading: {}", config_file);
             return false;
         }
+
         std::string line;
         config.include_dirs.clear();
         config.external_libs.clear();
-        config.ignored_dirs.clear();
+        config.exclude_patterns.clear();
+        config.targets.clear(); // NEW: Clear targets
+
+        // Helper maps to build targets as we parse
+        std::unordered_map<std::string, Target> target_map;
+
         while (std::getline(file, line)) {
             const auto pos = line.find(':');
-            if (pos == std::string::npos) continue;
-
-            if (pos == 0 || pos == line.length() - 1) {
+            if (pos == std::string::npos) {
                 out::warn("Invalid config cache line format, skipping: {}", line);
                 continue;
             }
+
             const std::string_view key = std::string_view(line).substr(0, pos);
-            std::string_view value = std::string_view(line).substr(pos + 1);
-            if (key.empty()) continue;
+            std::string_view value = pos + 1 < line.size() ? std::string_view(line).substr(pos + 1) : "";
+
+            // Basic config
             if (key == "cxx") config.cxx = value;
             else if (key == "cc") config.cc = value;
             else if (key == "as") config.as = value;
-            else if (key == "name") config.name = value;
             else if (key == "cxxflags") config.cxxflags = value;
             else if (key == "cflags") config.cflags = value;
             else if (key == "ldflags") config.ldflags = value;
             else if (key == "build_dir") config.build_dir = value;
             else if (key == "use_pch") config.use_pch = value == "true";
+            else if (key == "default_target") config.default_target = value; // NEW
+
+            // Arrays
             else if (key == "include") config.include_dirs.emplace_back(value);
             else if (key == "lib") config.external_libs.emplace_back(value);
-            else if (key == "ignore") config.ignored_dirs.emplace_back(value);
+            else if (key == "exclude") config.exclude_patterns.emplace_back(value);
+
+            else if (key == "target") {
+                auto unescape_pipes = [](const std::string& str) {
+                    std::string result = str;
+                    size_t position = 0;
+                    while ((position = result.find("\\|", position)) != std::string::npos) {
+                        result.replace(position, 2, "|");
+                        position += 1;
+                    }
+                    return result;
+                };
+
+                // Format: name|main_file|output_name
+                std::string value_str(value);
+                size_t first_pipe = value_str.find('|');
+
+                if (size_t second_pipe = value_str.find('|', first_pipe + 1);
+                    first_pipe != std::string::npos && second_pipe != std::string::npos) {
+                    Target target;
+                    target.name = unescape_pipes(value_str.substr(0, first_pipe));
+                    target.main_file = unescape_pipes(value_str.substr(first_pipe + 1, second_pipe - first_pipe - 1));
+                    target.output_name = unescape_pipes(value_str.substr(second_pipe + 1));
+                    target_map[target.name] = target;
+                    } else {
+                        out::warn("Invalid target format in cache, skipping: {}", line);
+                    }
+            }
+
+            else if (key == "target_src") {
+                // Format: target_name:source_path
+                std::string value_str(value);
+                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
+                    std::string target_name = value_str.substr(0, colon_pos);
+                    std::string source_path = value_str.substr(colon_pos + 1);
+                    if (target_map.contains(target_name)) {
+                        target_map[target_name].sources.push_back(source_path);
+                    }
+                }
+            }
+
+            else if (key == "target_exclude") {
+                // Format: target_name:exclude_pattern
+                std::string value_str(value);
+                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
+                    std::string target_name = value_str.substr(0, colon_pos);
+                    std::string exclude_pattern = value_str.substr(colon_pos + 1);
+                    if (target_map.contains(target_name)) {
+                        target_map[target_name].exclude_patterns.push_back(exclude_pattern);
+                    }
+                }
+            }
+            else {
+                out::warn("Unknown config cache key, skipping: {}", key);
+            }
         }
+
+        // Convert target_map to vector
+        for (auto &target: target_map | std::views::values) {
+            config.targets.push_back(std::move(target));
+        }
+
         return true;
     }
 
 };
-
 
 // --- User Interaction and Main ---
 
@@ -949,7 +1346,6 @@ void show_help() {
         "  {}               Builds the project incrementally using cached settings.\n"
         "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
         "  {}        Converts 'autocc.toml' to the internal build cache.\n"
-        "  {}              Same as no command.\n"
         "  {}                Removes the build directory.\n"
         "  {}                Removes all autocc generated files (cache, build dir, db).\n"
         "  {}                Download/update the library detection database.\n"
@@ -958,20 +1354,11 @@ void show_help() {
         styled("<none>", out::color_prompt),
         styled("ac/autoconfig", out::color_prompt),
         styled("setup/sync/sc", out::color_prompt),
-        styled("compile", out::color_prompt),
         styled("clean", out::color_prompt),
         styled("wipe", out::color_prompt),
         styled("fetch", out::color_prompt),
         styled("version", out::color_prompt),
         styled("help", out::color_prompt)
-    );
-     fmt::print(
-        "\nConfiguration ('autocc.toml'):\n"
-        "  The `autoconfig` command helps create this file. You can also edit it manually.\n"
-        "  To ignore directories from the source file scan (e.g., 'vendor', 'tests'), add them to\n"
-        "  the `ignored_dirs` array under the `[paths]` section.\n\n"
-        "  [paths]\n"
-        "  ignored_dirs = [ \"vendor\", \"tests\" ]\n"
     );
 }
 
@@ -996,22 +1383,110 @@ void user_init(Config& config) {
     config.cc = get_input("C Compiler", config.cc);
     config.cxx = get_input("C++ Compiler", config.cxx);
     config.as = get_input("Assembler", config.as);
-    config.name = get_input("Executable Name", config.name);
+
+    // Don't ask for an executable name anymore - it comes from targets
+
     config.cxxflags = get_input("CXX Flags", config.cxxflags);
     config.cflags = get_input("CC Flags", config.cflags);
     config.ldflags = get_input("Linker Flags", config.ldflags);
     config.build_dir = get_input("Build Directory", config.build_dir);
-    const std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
+    std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = pch_choice == "yes" || pch_choice == "y";
 
-    if (const std::string ignored_input = get_input("Ignored directories (space-separated, e.g. 'vendor tests')", ""); !ignored_input.empty()) {
-        std::stringstream ss(ignored_input);
+    if (std::string exclude_input = get_input("Global exclude patterns (space-separated, e.g. 'test_*.cpp *_test.cpp')", ""); !exclude_input.empty()) {
+        std::stringstream ss(exclude_input);
         std::string item;
-        while (ss >> item) { // Using operator>> handles whitespace better
-            config.ignored_dirs.push_back(item);
+        while (ss >> item) {
+            config.exclude_patterns.push_back(item);
         }
     }
+
+    // NEW: Smart target discovery and configuration
+    out::info("Discovering potential build targets...");
+
+    // Get all source files for discovery
+    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+    auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+
+    auto discovered = TargetDiscovery::discover_targets(all_sources);
+
+    if (discovered.empty()) {
+        out::warn("No targets discovered. You'll need to configure them manually in autocc.toml");
+        return;
+    }
+
+    out::info("Discovered {} potential target(s):", discovered.size());
+    for (size_t i = 0; i < discovered.size(); ++i) {
+        const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
+        out::info("  {}: {} ({}) - {} source files",
+                 i + 1, suggested_name, main_file.filename().string(),
+                 suggested_sources.size());
+        out::info("     Reason: {}", reason);
+    }
+
+    fmt::print("\n");
+
+    // Let user configure each discovered target
+    for (const auto& discovered_target : discovered) {
+        std::string accept = get_input(
+            fmt::format("Configure target '{}' with main file '{}'? (y/n)",
+                       discovered_target.suggested_name, discovered_target.main_file.filename().string()),
+            "y");
+
+        if (accept == "y" || accept == "yes" || accept == "Y") {
+            Target target;
+            target.name = get_input("Target name", discovered_target.suggested_name);
+            target.main_file = discovered_target.main_file.string();
+            target.output_name = get_input("Output executable name", target.name);
+
+            // Show suggested sources
+            out::info("Suggested source files for target '{}':", target.name);
+            for (size_t i = 0; i < discovered_target.suggested_sources.size(); ++i) {
+                out::info("  {}: {}", i + 1, discovered_target.suggested_sources[i].filename().string());
+            }
+
+            if (std::string use_suggested = get_input("Use these suggested sources? (y/n)", "y"); use_suggested == "y" || use_suggested == "yes" || use_suggested == "Y") {
+                for (const auto& src : discovered_target.suggested_sources) {
+                    target.sources.push_back(src.string());
+                }
+            } else {
+                // Manual source specification, should not get here btw
+                out::info("Enter source files manually (space-separated, relative paths):");
+                std::string sources_input;
+                std::getline(std::cin, sources_input);
+                if (!sources_input.empty()) {
+                    std::stringstream ss(sources_input);
+                    std::string src;
+                    while (ss >> src) {
+                        target.sources.push_back(src);
+                    }
+                }
+            }
+
+            // Target-specific excludes
+            std::string target_excludes = get_input(
+                fmt::format("Target-specific exclude patterns for '{}' (optional)", target.name), "");
+            if (!target_excludes.empty()) {
+                std::stringstream ss(target_excludes);
+                std::string pattern;
+                while (ss >> pattern) {
+                    target.exclude_patterns.push_back(pattern);
+                }
+            }
+
+            config.targets.push_back(target);
+        }
+    }
+
+    if (!config.targets.empty()) {
+        config.default_target = get_input("Default target", config.targets[0].name);
+    }
 }
+
+fs::path get_value1(const fs::path& base_db_path) {
+    return base_db_path;
+}
+
 int main(const int argc, char* argv[]) {
     const fs::path config_toml_path = "autocc.toml";
     const fs::path cache_dir = CACHE_DIR_NAME;
@@ -1023,9 +1498,34 @@ int main(const int argc, char* argv[]) {
             out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
             return 1;
         }
-        if (fs::exists(config_toml_path) && fs::exists(cache_dir / CONFIG_FILE_NAME) && fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
-             out::warn("'autocc.toml' has been modified. Run 'autocc setup' to sync changes.");
+        if (fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
+            const auto config_opt = load_config_from_toml(config_toml_path);
+            if (!config_opt) {
+                out::error("Could not load '{}'. Please fix the configuration file.", config_toml_path);
+                return 1;
+            }
+
+            // Remove old cache
+            if (fs::exists(cache_dir)) {
+                try {
+                    fs::remove_all(cache_dir);
+                } catch (const fs::filesystem_error& e) {
+                    out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
+                    return 1;
+                }
+            }
+
+            AutoCC autocc(*config_opt, false);
+            autocc.writeConfigCache();
+
+            // Create an empty dependency cache
+            std::ofstream out_cache(cache_dir / DEP_CACHE_FILE_NAME);
+            out_cache << "{}";
+            out_cache.close();
+
+            out::success("Configuration synced automatically.");
         }
+
         auto autocc_opt = AutoCC::load_from_cache();
         if (!autocc_opt) {
             out::error("Failed to load project from cache. Try running 'autocc setup' again.");
@@ -1035,59 +1535,59 @@ int main(const int argc, char* argv[]) {
     }
 
     std::string command = argv[1];
+    if (command != "fetch" && command != "help" && command != "version" &&
+        command != "autoconfig" && command != "ac" && command != "setup" &&
+        command != "sync" && command != "sc" && command != "compile" &&
+        command != "clean" && command != "wipe") {
+        std::string target_name;
+
+        // It's a target name
+        target_name = command;
+
+        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
+            out::error("Project not set up. Run 'autocc setup' first.");
+            return 1;
+        }
+
+        auto autocc_opt = AutoCC::load_from_cache();
+        if (!autocc_opt) {
+            out::error("Failed to load project from cache.");
+            return 1;
+        }
+        return autocc_opt->build(target_name);
+    }
 
     if (command == "fetch") { Fetcher::download_file(BASE_DB_URL, base_db_path); return 0; }
     if (command == "help") { show_help(); return 0; }
     if (command == "version") { show_version(); return 0; }
 
     if (command == "autoconfig" || command == "ac") {
-        if (!fs::exists(DB_FILE_NAME)) {
-            out::info("Fetching latest library database for initial configuration...");
-            if (!Fetcher::download_file(BASE_DB_URL, base_db_path)) {
-                out::warn("Failed to download library database. Library detection might be limited.");
-            }
+        if (!exists(base_db_path)) {
+            Fetcher::download_file(BASE_DB_URL, base_db_path);
         }
-        if (fs::exists(config_toml_path)) {
-            out::warn("'autocc.toml' already exists. Overwriting.");
-        }
-        out::info("Starting interactive configuration...");
         Config config;
         user_init(config);
 
-        // Create AutoCC instance for comprehensive scanning
-        AutoCC scanner(config);
-
-        // Do ALL the detection work here
-        out::info("Scanning entire project for headers and libraries...");
-        scanner.scanLocalHeaders();  // Scan for local headers
-
-        // Update library detection to use the new comprehensive method
-        const auto ignored_dirs = scanner.getIgnoredDirs();
-        const auto all_includes = scanner.include_parser.getAllProjectIncludes(
-            scanner.source_files, scanner.config.include_dirs, ignored_dirs);
-        scanner.lib_detector.detect(all_includes, scanner.config);
+        // Use factory method WITH auto-detection
+        AutoCC scanner = AutoCC::create_with_auto_detection(std::move(config));
 
         write_config_to_toml(scanner.config, config_toml_path);
-        out::info("Configuration complete. Run 'autocc setup' to prepare build environment.");
         return 0;
     }
 
     if (command == "setup" || command == "sync" || command == "sc") {
-        out::info("Syncing build environment from '{}'...", config_toml_path);
+        if (!exists(base_db_path)) {
+            out::warn("{} not found!", DB_FILE_NAME);
+        }
         const auto config_opt = load_config_from_toml(config_toml_path);
         if (!config_opt) {
             out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
             return 1;
         }
-        if (fs::exists(cache_dir)) {
-            try {
-                fs::remove_all(cache_dir);
-            } catch (const fs::filesystem_error& e) {
-                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
-            }
-        }
-        AutoCC autocc(*config_opt);
-        autocc.writeConfigCache(); // Core of "setup": create the internal cache from TOML.
+
+        // Create WITHOUT auto-detection (preserve TOML settings)
+        AutoCC autocc(*config_opt, false);
+        autocc.writeConfigCache();
 
         // Create an empty dependency cache to start with.
         std::ofstream out_cache(cache_dir / DEP_CACHE_FILE_NAME);
@@ -1096,19 +1596,6 @@ int main(const int argc, char* argv[]) {
 
         out::success("Setup complete. You can now run 'autocc' to build.");
         return 0;
-    }
-
-    if (command == "compile") {
-        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
-            out::error("Project not set up. Run 'autocc setup' first.");
-            return 1;
-        }
-        auto autocc_opt = AutoCC::load_from_cache();
-        if (!autocc_opt) {
-            out::error("Failed to load project from cache. Try 'autocc setup' again.");
-            return 1;
-        }
-        return autocc_opt->build();
     }
 
     if (command == "clean") {
