@@ -1,3 +1,4 @@
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 14:45:03 Jul 31 2025, EDIT WITH CAUTION.
 [compilers]
 as = 'nasm'
 cc = 'clang'
@@ -7,8 +8,8 @@ cxx = 'clang++'
 use_pch = true
 
 [flags]
-cflags = '-march=native -std=c11 -O2 -pipe -DUSE_TUI'
-cxxflags = '-march=native -std=c++23 -O2 -pipe -DUSE_TUI'
+cflags = '-march=native -std=c11 -O2 -pipe'
+cxxflags = '-march=native -std=c++23 -O2 -pipe'
 ldflags = ''
 
 [paths]
@@ -23,6 +24,9 @@ external_libs = [
     '-lssl',
     '-lbrotlidec',
     '-lfmt',
+    '-lftxui-screen',
+    '-lftxui-dom',
+    '-lftxui-component'
 ]
 include_dirs = [ 'include' ]
 
