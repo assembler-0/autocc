@@ -50,6 +50,8 @@ static constexpr auto CONFIG_FILE_NAME = "config.cache";
 static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 static constexpr auto DB_FILE_NAME = "autocc.base.json";
+static constexpr auto AUTOINSTALL_SCRIPT_PATH = "scripts/autoinstall";
+static constexpr auto DEFAULT_INSTALL_PATH = "/usr/local/bin";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
 
 template <>
@@ -495,6 +497,7 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         out::error("Failed to open '{}' for writing configuration.", toml_path);
         return;
     }
+    file << fmt::format("# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON {} {}, EDIT WITH CAUTION.\n", TIME, DATE);
     file << tbl;
     out::success("Configuration saved to '{}'.", toml_path);
 }
@@ -1101,6 +1104,8 @@ public:
         return config.cxx;
     }
 
+    explicit AutoCC() = default;
+
     explicit AutoCC(Config cfg, const bool auto_detect = false)
         : config(std::move(cfg)), should_auto_detect(auto_detect) {
 
@@ -1224,6 +1229,115 @@ public:
         return build_target(*target_it);
     }
 
+    static bool read_config_cache_static(Config& config) {
+        const fs::path cache_dir = CACHE_DIR_NAME;
+        const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
+
+        if (!fs::exists(config_file)) return false;
+
+        std::ifstream file(config_file);
+        if (!file.is_open()) {
+            out::error("Failed to open config cache file for reading: {}", config_file);
+            return false;
+        }
+
+        std::string line;
+        config.include_dirs.clear();
+        config.external_libs.clear();
+        config.exclude_patterns.clear();
+        config.targets.clear(); // NEW: Clear targets
+
+        // Helper maps to build targets as we parse
+        std::unordered_map<std::string, Target> target_map;
+
+        while (std::getline(file, line)) {
+            const auto pos = line.find(':');
+            if (pos == std::string::npos) {
+                out::warn("Invalid config cache line format, skipping: {}", line);
+                continue;
+            }
+
+            const std::string_view key = std::string_view(line).substr(0, pos);
+            std::string_view value = pos + 1 < line.size() ? std::string_view(line).substr(pos + 1) : "";
+
+            // Basic config
+            if (key == "cxx") config.cxx = value;
+            else if (key == "cc") config.cc = value;
+            else if (key == "as") config.as = value;
+            else if (key == "cxxflags") config.cxxflags = value;
+            else if (key == "cflags") config.cflags = value;
+            else if (key == "ldflags") config.ldflags = value;
+            else if (key == "build_dir") config.build_dir = value;
+            else if (key == "use_pch") config.use_pch = value == "true";
+            else if (key == "default_target") config.default_target = value; // NEW
+
+            // Arrays
+            else if (key == "include") config.include_dirs.emplace_back(value);
+            else if (key == "lib") config.external_libs.emplace_back(value);
+            else if (key == "exclude") config.exclude_patterns.emplace_back(value);
+
+            else if (key == "target") {
+                auto unescape_pipes = [](const std::string& str) {
+                    std::string result = str;
+                    size_t position = 0;
+                    while ((position = result.find("\\|", position)) != std::string::npos) {
+                        result.replace(position, 2, "|");
+                        position += 1;
+                    }
+                    return result;
+                };
+
+                // Format: name|main_file|output_name
+                std::string value_str(value);
+                size_t first_pipe = value_str.find('|');
+
+                if (size_t second_pipe = value_str.find('|', first_pipe + 1);
+                    first_pipe != std::string::npos && second_pipe != std::string::npos) {
+                    Target target;
+                    target.name = unescape_pipes(value_str.substr(0, first_pipe));
+                    target.main_file = unescape_pipes(value_str.substr(first_pipe + 1, second_pipe - first_pipe - 1));
+                    target.output_name = unescape_pipes(value_str.substr(second_pipe + 1));
+                    target_map[target.name] = target;
+                    } else {
+                        out::warn("Invalid target format in cache, skipping: {}", line);
+                    }
+            }
+
+            else if (key == "target_src") {
+                // Format: target_name:source_path
+                std::string value_str(value);
+                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
+                    std::string target_name = value_str.substr(0, colon_pos);
+                    std::string source_path = value_str.substr(colon_pos + 1);
+                    if (target_map.contains(target_name)) {
+                        target_map[target_name].sources.push_back(source_path);
+                    }
+                }
+            }
+
+            else if (key == "target_exclude") {
+                // Format: target_name:exclude_pattern
+                std::string value_str(value);
+                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
+                    std::string target_name = value_str.substr(0, colon_pos);
+                    std::string exclude_pattern = value_str.substr(colon_pos + 1);
+                    if (target_map.contains(target_name)) {
+                        target_map[target_name].exclude_patterns.push_back(exclude_pattern);
+                    }
+                }
+            }
+            else {
+                out::warn("Unknown config cache key, skipping: {}", key);
+            }
+        }
+
+        // Convert target_map to vector
+        for (auto &target: target_map | std::views::values) {
+            config.targets.push_back(std::move(target));
+        }
+
+        return true;
+    }
 private:
 
     int build_target(const Target& target) {
@@ -1451,122 +1565,13 @@ private:
         return 0;
     }
 
-    AutoCC() = default;
     const fs::path root = ".";
     const fs::path cache_dir = root / CACHE_DIR_NAME;
     const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
     const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
     DependencyMap dependency_map;
 
-    static bool read_config_cache_static(Config& config) {
-        const fs::path cache_dir = CACHE_DIR_NAME;
-        const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
 
-        if (!fs::exists(config_file)) return false;
-
-        std::ifstream file(config_file);
-        if (!file.is_open()) {
-            out::error("Failed to open config cache file for reading: {}", config_file);
-            return false;
-        }
-
-        std::string line;
-        config.include_dirs.clear();
-        config.external_libs.clear();
-        config.exclude_patterns.clear();
-        config.targets.clear(); // NEW: Clear targets
-
-        // Helper maps to build targets as we parse
-        std::unordered_map<std::string, Target> target_map;
-
-        while (std::getline(file, line)) {
-            const auto pos = line.find(':');
-            if (pos == std::string::npos) {
-                out::warn("Invalid config cache line format, skipping: {}", line);
-                continue;
-            }
-
-            const std::string_view key = std::string_view(line).substr(0, pos);
-            std::string_view value = pos + 1 < line.size() ? std::string_view(line).substr(pos + 1) : "";
-
-            // Basic config
-            if (key == "cxx") config.cxx = value;
-            else if (key == "cc") config.cc = value;
-            else if (key == "as") config.as = value;
-            else if (key == "cxxflags") config.cxxflags = value;
-            else if (key == "cflags") config.cflags = value;
-            else if (key == "ldflags") config.ldflags = value;
-            else if (key == "build_dir") config.build_dir = value;
-            else if (key == "use_pch") config.use_pch = value == "true";
-            else if (key == "default_target") config.default_target = value; // NEW
-
-            // Arrays
-            else if (key == "include") config.include_dirs.emplace_back(value);
-            else if (key == "lib") config.external_libs.emplace_back(value);
-            else if (key == "exclude") config.exclude_patterns.emplace_back(value);
-
-            else if (key == "target") {
-                auto unescape_pipes = [](const std::string& str) {
-                    std::string result = str;
-                    size_t position = 0;
-                    while ((position = result.find("\\|", position)) != std::string::npos) {
-                        result.replace(position, 2, "|");
-                        position += 1;
-                    }
-                    return result;
-                };
-
-                // Format: name|main_file|output_name
-                std::string value_str(value);
-                size_t first_pipe = value_str.find('|');
-
-                if (size_t second_pipe = value_str.find('|', first_pipe + 1);
-                    first_pipe != std::string::npos && second_pipe != std::string::npos) {
-                    Target target;
-                    target.name = unescape_pipes(value_str.substr(0, first_pipe));
-                    target.main_file = unescape_pipes(value_str.substr(first_pipe + 1, second_pipe - first_pipe - 1));
-                    target.output_name = unescape_pipes(value_str.substr(second_pipe + 1));
-                    target_map[target.name] = target;
-                    } else {
-                        out::warn("Invalid target format in cache, skipping: {}", line);
-                    }
-            }
-
-            else if (key == "target_src") {
-                // Format: target_name:source_path
-                std::string value_str(value);
-                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
-                    std::string target_name = value_str.substr(0, colon_pos);
-                    std::string source_path = value_str.substr(colon_pos + 1);
-                    if (target_map.contains(target_name)) {
-                        target_map[target_name].sources.push_back(source_path);
-                    }
-                }
-            }
-
-            else if (key == "target_exclude") {
-                // Format: target_name:exclude_pattern
-                std::string value_str(value);
-                if (size_t colon_pos = value_str.find(':'); colon_pos != std::string::npos) {
-                    std::string target_name = value_str.substr(0, colon_pos);
-                    std::string exclude_pattern = value_str.substr(colon_pos + 1);
-                    if (target_map.contains(target_name)) {
-                        target_map[target_name].exclude_patterns.push_back(exclude_pattern);
-                    }
-                }
-            }
-            else {
-                out::warn("Unknown config cache key, skipping: {}", key);
-            }
-        }
-
-        // Convert target_map to vector
-        for (auto &target: target_map | std::views::values) {
-            config.targets.push_back(std::move(target));
-        }
-
-        return true;
-    }
 
 };
 
@@ -1596,6 +1601,7 @@ void show_help() {
         "  {}                Download/update the library detection database.\n"
         "  {}              Show current version and build date.\n"
         "  {}                 Shows this help message.\n"
+        "  {}              Install default target.\n"
         "Flags:\n"
         "  {}            For 'autocc autoconfig', use default settings.\n",
         styled("<none>", COLOR_PROMPT),
@@ -1607,6 +1613,7 @@ void show_help() {
         styled("fetch", COLOR_PROMPT),
         styled("version", COLOR_PROMPT),
         styled("help", COLOR_PROMPT),
+        styled("install", COLOR_PROMPT),
         styled("--default", COLOR_PROMPT)
     );
 }
@@ -1822,6 +1829,9 @@ private:
     static int handle_clean(const std::vector<std::string>& args);
     int handle_wipe(const std::vector<std::string>& args) const;
 
+    static int handle_default_install(const std::vector<std::string> &args) ;
+    // int handle_default_install(const std::vector<std::string>& args) const; TODO: implement target installation
+
     // Helper methods
     bool is_project_setup() const;
     bool sync_config_if_needed() const;
@@ -1859,6 +1869,9 @@ void CLIHandler::register_commands() {
 
     commands_["wipe"] = {"Remove all autocc files (build dir and cache)",
         [this](const auto& args) { return handle_wipe(args); }, {}};
+
+    commands_["install"] = {"Install default targets",
+        [this](const auto& args) { return handle_default_install(args); }, {}};
 
     // Register aliases
     for (const auto &info: commands_ | std::views::values) {
@@ -2134,6 +2147,39 @@ int CLIHandler::handle_wipe(const std::vector<std::string>& args) const {
 
     out::success("Wipe complete. 'autocc.toml' was not removed.");
     return 0;
+}
+
+int CLIHandler::handle_default_install(const std::vector<std::string>& args) {
+    static_cast<void>(args);
+    Config autocc{};
+    if (!AutoCC::read_config_cache_static(autocc)) {
+        out::error("Failed to read cache.");
+        return 1;
+    }
+    const std::string autoinstall = AUTOINSTALL_SCRIPT_PATH;
+    const std::string path = DEFAULT_INSTALL_PATH;
+    const std::string full_path = fmt::format("./{}/{}", autocc.build_dir, autocc.default_target);
+    std::string cmd;
+    if (!fs::exists(autocc.build_dir)) {
+        out::error("Project not setup. Cannot install");
+        return 1;
+    }
+    if (fs::exists(autoinstall)) {
+        out::info("Using autoinstall script at {}", autoinstall);
+        cmd = fmt::format("./{} {} --auto", autoinstall, full_path);
+    } else if (isCommandExecutable("/usr/local/bin/autoinstall") || isCommandExecutable("autoinstall")) {
+        out::info("Using autoinstall script in system PATH");
+        cmd = fmt::format("autoinstall {} --auto", full_path);
+    } else {
+        cmd = fmt::format("cp {} {}", full_path, path);
+    }
+    const ::CommandResult res = execute(cmd);
+    if (res.exit_code != 0) {
+        out::error("Failed to install target {}", autocc.default_target);
+        return 1;
+    }
+    out::success("Installed target {}", autocc.default_target);
+    return res.exit_code;
 }
 
 int main(const int argc, char* argv[]) {
