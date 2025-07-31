@@ -15,7 +15,15 @@ if(ARM)
     set(CMAKE_CXX_FLAGS "")
 endif()
 
+find_package(ftxui 6.1 REQUIRED)
 add_executable(autocc autocc.cc)
-target_link_libraries(autocc fmt xxhash ssl crypto)
+target_link_libraries(autocc fmt xxhash ssl crypto ftxui::component ftxui::dom)
 target_include_directories(autocc PUBLIC "include")
+target_compile_definitions(autocc PUBLIC
+        # -DLOG_DISABLE
+        # -DLOG_DISABLE_INFO
+        # -DLOG_DISABLE_COLORS
+        -DLOG_ENABLE_FILE
+        # -DLOG_DISABLE_TIMESTAMP
+)
 install(TARGETS autocc DESTINATION ${CMAKE_INSTALL_BINDIR})

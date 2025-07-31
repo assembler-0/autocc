@@ -1,33 +1,56 @@
 #compdef autocc
 
-_autocc_cmds() {
-    local -a commands
+# Zsh completion for autocc
+# Generated based on autocc v0.1.4
 
-    # Define all available subcommands with their descriptions.
-    commands=(
-        'init:Prompts for configuration and creates a new build environment'
-        'rescan:Clears the cache and performs a full dependency scan'
-        'manual:Prompts for configuration but does NOT scan for dependencies'
-        'clean:Removes the build directory and cache'
-        'version:Show current version, build time and date'
-        'help:Shows the help message'
-    )
-
-    _describe -t commands "autocc commands" commands
-}
-
-# This is the main completion entry point.
 _autocc() {
-    # _arguments is the main Zsh completion helper function.
-    # '1:: :->cmds' means:
-    #   '1:'     - This rule applies to the first argument.
-    #   ':'      - An optional argument name (we leave it empty).
-    #   '->cmds' - If a completion is inserted, jump to the 'cmds' state.
-    # The action part is now directly calling our function.
-    _arguments \
-        '1: :_call_function 1 _autocc_cmds' \
-        '*:: :->args'
+    local context cmd ctx
+    local -A opt_args
+
+    # Get the current command context
+    _arguments -C \
+        '1: :->commands' \
+        '*: :->args' && return 0
+
+    case $state in
+        commands)
+            # Main command suggestions
+            local -a commands
+            commands=(
+                "ac:autoconfig:Creates 'autocc.toml' via an interactive prompt"
+                "autoconfig:Creates 'autocc.toml' via an interactive prompt"
+                "setup:Converts 'autocc.toml' to the internal build cache"
+                "sync:Converts 'autocc.toml' to the internal build cache"
+                "sc:Converts 'autocc.toml' to the internal build cache"
+                "edit:Open a TUI to visually select source files for targets"
+                "select:Open a TUI to visually select source files for targets"
+                "clean:Removes the build directory"
+                "wipe:Removes all autocc generated files (cache, build dir, db)"
+                "fetch:Download/update the library detection database"
+                "version:Show current version and build date"
+                "help:Shows help message"
+                "::Builds the project incrementally using cached settings"
+            )
+            _describe -t commands 'autocc commands' commands
+            ;;
+        args)
+            case $words[1] in
+                ac|autoconfig)
+                    _arguments \
+                        '--default[Use default settings (no prompts)]'
+                    ;;
+                setup|sync|sc|edit|select|clean|wipe|fetch|version|help)
+                    # These take no arguments
+                    _message 'no further arguments'
+                    ;;
+                *)
+                    # Default command: no subcommand, just flags
+                    _arguments \
+                        '--default[For autoconfig, use default settings]'
+                    ;;
+            esac
+            ;;
+    esac
 }
 
-# It's good practice to call the main function at the end.
 _autocc "$@"
