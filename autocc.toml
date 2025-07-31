@@ -21,11 +21,8 @@ external_libs = [
     '-lpthread',
     '-lcrypto',
     '-lssl',
-    '-lftxui-component',
-    '-lftxui-dom',
     '-lbrotlidec',
     '-lfmt',
-    '-lftxui-screen'
 ]
 include_dirs = [ 'include' ]
 
