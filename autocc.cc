@@ -27,9 +27,12 @@
 #include "json.hpp"
 #include "httplib.h"
 
+#ifdef USE_TUI
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+using namespace ftxui;
+#endif
 
 #define DATE __DATE__
 #define TIME __TIME__
@@ -37,7 +40,6 @@
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
-using namespace ftxui;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
 
 // log.hpp
