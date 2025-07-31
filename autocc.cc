@@ -261,7 +261,7 @@ private:
                                    [](const DiscoveredTarget& t) { return t.suggested_name == "test"; });
     }
 };
-
+#ifdef USE_TUI
 class SourceEditor {
 public:
     // The main entry point. Launches the TUI for a given target.
@@ -399,6 +399,7 @@ public:
         return final_selection;
     }
 };
+#endif
 
 std::string hash_file(const fs::path& path) {
     constexpr size_t buffer_size = 65536;
@@ -1588,6 +1589,7 @@ void show_version() {
 void show_help() {
     using fmt::styled;
     show_version();
+#ifdef USE_TUI
     fmt::print(
         "\n"
         "Usage: autocc [command]\n\n"
@@ -1616,6 +1618,37 @@ void show_help() {
         styled("install", COLOR_PROMPT),
         styled("--default", COLOR_PROMPT)
     );
+#endif
+#ifndef USE_TUI
+    fmt::print(
+        "\n"
+        "Usage: autocc [command]\n\n"
+        "Commands:\n"
+        "  {}               Builds the project incrementally using cached settings.\n"
+        "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
+        "  {}        Converts 'autocc.toml' to the internal build cache.\n"
+        "  {}          Open a TUI to visually select source files for targets. <DISABLED>\n"
+        "  {}                Removes the build directory.\n"
+        "  {}                 Removes all autocc generated files (cache, build dir, db).\n"
+        "  {}                Download/update the library detection database.\n"
+        "  {}              Show current version and build date.\n"
+        "  {}                 Shows this help message.\n"
+        "  {}              Install default target.\n"
+        "Flags:\n"
+        "  {}            For 'autocc autoconfig', use default settings.\n",
+        styled("<none>", COLOR_PROMPT),
+        styled("ac/autoconfig", COLOR_PROMPT),
+        styled("setup/sync/sc", COLOR_PROMPT),
+        styled("edit/select", COLOR_PROMPT),
+        styled("clean", COLOR_PROMPT),
+        styled("wipe", COLOR_PROMPT),
+        styled("fetch", COLOR_PROMPT),
+        styled("version", COLOR_PROMPT),
+        styled("help", COLOR_PROMPT),
+        styled("install", COLOR_PROMPT),
+        styled("--default", COLOR_PROMPT)
+    );
+#endif
 }
 
 void user_init(Config& config) {
@@ -1823,7 +1856,9 @@ private:
 
     static int handle_version(const std::vector<std::string>& args);
     int handle_autoconfig(const std::vector<std::string>& args) const;
+#ifdef USE_TUI
     int handle_edit(const std::vector<std::string>& args) const;
+#endif
     int handle_setup(const std::vector<std::string>& args) const;
 
     static int handle_clean(const std::vector<std::string>& args);
@@ -1857,10 +1892,10 @@ void CLIHandler::register_commands() {
 
     commands_["autoconfig"] = {"Auto-configure the project",
         [this](const auto& args) { return handle_autoconfig(args); }, {"ac"}};
-
+#ifdef USE_TUI
     commands_["edit"] = {"Edit target source files interactively",
         [this](const auto& args) { return handle_edit(args); }, {"select"}};
-
+#endif
     commands_["setup"] = {"Set up the project from configuration",
         [this](const auto& args) { return handle_setup(args); }, {"sync", "sc"}};
 
@@ -2017,7 +2052,7 @@ int CLIHandler::handle_autoconfig(const std::vector<std::string>& args) const {
     write_config_to_toml(scanner.config, config_toml_path_);
     return 0;
 }
-
+#ifdef USE_TUI
 int CLIHandler::handle_edit(const std::vector<std::string>& args) const {
     out::info("Loading configuration for editing...");
 
@@ -2074,6 +2109,7 @@ int CLIHandler::handle_edit(const std::vector<std::string>& args) const {
     }
     return 0;
 }
+#endif
 
 int CLIHandler::handle_setup(const std::vector<std::string>& args) const {
     if (!exists(base_db_path_)) {
