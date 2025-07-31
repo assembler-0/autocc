@@ -7,8 +7,8 @@ cxx = 'clang++'
 use_pch = true
 
 [flags]
-cflags = '-march=native -std=c11 -O2 -pipe'
-cxxflags = '-march=native -std=c++23 -O2 -pipe'
+cflags = '-march=native -std=c11 -O2 -pipe -DUSE_TUI'
+cxxflags = '-march=native -std=c++23 -O2 -pipe -DUSE_TUI'
 ldflags = ''
 
 [paths]
