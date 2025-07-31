@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sstream>
+#include <sys/stat.h>
 
 #include "log.hpp"
 
@@ -27,7 +28,7 @@ inline CommandResult execute_vec(const std::vector<std::string>& args) {
     pipe(stdout_pipe);
     pipe(stderr_pipe);
 
-    pid_t pid = fork();
+    const pid_t pid = fork();
     if (pid == 0) {
         // Child
         dup2(stdout_pipe[1], STDOUT_FILENO);
@@ -157,3 +158,91 @@ inline std::vector<fs::path> find_source_files(const fs::path& dir,
     return files;
 }
 
+inline bool isCommandExecutable(const std::string& command) {
+    // 1. Input validation: reject empty or dangerous patterns
+    if (command.empty()) {
+        return false;
+    }
+
+    // Reject commands with null bytes or control characters
+    if (command.find('\0') != std::string::npos ||
+        std::ranges::any_of(command, [](const char c) { return c < 32 || c > 126; })) {
+        return false;
+    }
+
+    // Prevent obvious traversal in direct paths (not foolproof, but adds safety)
+    if (std::regex traversal_pattern(R"(\.\./|\.\.$|^/[^/]*\.\./)"); std::regex_search(command, traversal_pattern)) {
+        // Allow if it's a relative executable like "./script", but not "../"
+        if (command.find("../") != std::string::npos) {
+            return false;
+        }
+        if (command == ".." || command == "../") {
+            return false;
+        }
+    }
+
+    std::vector<std::string> search_paths;
+
+    // 2. If command contains '/' -> treat as path (absolute or relative)
+    if (command.find('/') != std::string::npos) {
+        search_paths.emplace_back(""); // Will test the command directly
+    } else {
+        // Else, search in PATH
+        const char* path_env = std::getenv("PATH");
+        if (!path_env) return false;
+
+        std::string path_str(path_env);
+        std::regex token_regex("[^:]+");
+        auto begin = std::sregex_iterator(path_str.begin(), path_str.end(), token_regex);
+        auto end = std::sregex_iterator();
+
+        for (std::sregex_iterator i = begin; i != end; ++i) {
+            std::string dir = i->str();
+
+            // Sanitize PATH entry (prevent weird stuff)
+            if (dir.empty() || dir.length() >= PATH_MAX) {
+                continue;
+            }
+
+            // Prevent traversal in PATH entries
+            if (dir.find("..") != std::string::npos) {
+                continue;
+            }
+
+            search_paths.push_back(dir);
+        }
+    }
+
+    // 3. Try each possible path
+    for (const auto& dir : search_paths) {
+        std::string full_path = dir.empty() ? command : dir + "/" += command;
+
+        // Skip if path is too long
+        if (full_path.length() >= PATH_MAX) {
+            continue;
+        }
+
+        // 4. Resolve symbolic links and get canonical path (avoid loops)
+        char resolved_path[PATH_MAX];
+        if (realpath(full_path.c_str(), resolved_path) == nullptr) {
+            continue; // Doesn't exist, broken symlink, or access denied
+        }
+
+        // 5. Stat the file to ensure it's a regular file or symlink to one
+        struct stat sb{};
+        if (stat(resolved_path, &sb) != 0) {
+            continue;
+        }
+
+        if (!S_ISREG(sb.st_mode)) {
+            continue; // Not a regular file (e.g., directory, device)
+        }
+
+        // 6. Check execute permission for user
+        if (access(resolved_path, X_OK) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}

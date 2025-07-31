@@ -3,7 +3,7 @@
 > A fast, minimal low-level build system with intelligent target management
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.3-green.svg)](autocc.cc)
+[![Version](https://img.shields.io/badge/version-0.1.4-green.svg)](autocc.cc)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
@@ -92,12 +92,19 @@ autocc my_target
 autocc test_suite
 ```
 
+### 4. Install your project
+```bash
+# install default target (may need root privileges)
+autocc install
+```
+
 ---
 
 ## ⚙️ Configuration (autocc.toml)
 
 ### Basic Configuration
 ```toml
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 12:56:30 Jul 31 2025, EDIT WITH CAUTION
 [project]
 build_dir = '.autocc_build'
 default_target = 'main'      # Which target to build by default
@@ -163,6 +170,7 @@ Commands:
   fetch                Download/update the library detection database.
   version              Show current version and build date.
   help                 Shows this help message.
+  install              Install default target.
 Flags:
   --default            For 'autocc autoconfig', use default settings.
 ```

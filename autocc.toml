@@ -13,8 +13,21 @@ ldflags = ''
 
 [paths]
 exclude_patterns = []
-external_libs = [ '-lm', '-lfmt', '-lzstd', '-lz', '-lxxhash', '-lpthread', '-lcrypto', '-lssl' ]
-include_dirs = [ './include' ]
+external_libs = [
+    '-lm',
+    '-lzstd',
+    '-lz',
+    '-lxxhash',
+    '-lpthread',
+    '-lcrypto',
+    '-lssl',
+    '-lftxui-component',
+    '-lftxui-dom',
+    '-lbrotlidec',
+    '-lfmt',
+    '-lftxui-screen'
+]
+include_dirs = [ 'include' ]
 
 [project]
 build_dir = '.autocc_build'
@@ -25,4 +38,4 @@ exclude_patterns = []
 main_file = './autocc.cc'
 name = 'autocc'
 output_name = 'autocc'
-sources = [ './autocc.cc']
+sources = [ './autocc.cc' ]

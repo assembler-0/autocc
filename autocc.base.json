@@ -82,7 +82,7 @@
     "ncurses.h": { "pkg_configs": ["ncurses"], "direct_libs": ["-lncursesw", "-ltinfo"] },
     "curses.h": { "pkg_configs": ["ncurses"], "direct_libs": ["-lncursesw", "-ltinfo"] },
     "notcurses/notcurses.h": { "pkg_configs": ["notcurses"], "direct_libs": ["-lnotcurses"] },
-    "ftxui/screen/screen.hpp": {},
+    "ftxui/": { "pkg_configs": ["ftxui"] },
     "readline/readline.h": { "direct_libs": ["-lreadline"] },
     "editline/readline.h": { "direct_libs": ["-ledit"] },
 
