@@ -27,16 +27,22 @@
 #include "json.hpp"
 #include "httplib.h"
 
-using json = nlohmann::json;
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/elements.hpp>
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.3"
+#define VERSION "v0.1.4"
 
+using json = nlohmann::json;
 namespace fs = std::filesystem;
+using namespace ftxui;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
 
-std::mutex g_output_mutex; // Definition for the extern in out.hpp
+// log.hpp
+std::ofstream g_log_file;
+std::mutex g_output_mutex;
 
 // --- Constants ---
 static constexpr auto CACHE_DIR_NAME = ".autocc_cache";
@@ -55,10 +61,28 @@ struct fmt::formatter<fs::path> : formatter<std::string_view> {
 
 struct Target {
     std::string name;
-    std::string main_file;
-    std::vector<std::string> sources; // RENAMED from additional_sources - now ALL sources
+    std::string main_file; // not compiled, just for misc. uses
+    std::vector<std::string> sources;
     std::string output_name;
-    std::vector<std::string> exclude_patterns; // Target-specific excludes
+    std::vector<std::string> exclude_patterns;
+};
+
+struct Config {
+    std::string cc = "clang";
+    std::string cxx = "clang++";
+    std::string as = "nasm";
+
+    std::string cxxflags = "-march=native -std=c++23 -O2 -pipe";
+    std::string cflags = "-march=native -std=c11 -O2 -pipe";
+    std::string ldflags;
+    std::string build_dir = ".autocc_build";
+    bool use_pch = true;
+    std::vector<std::string> include_dirs;
+    std::vector<std::string> external_libs;
+    std::vector<std::string> exclude_patterns;
+    // Target system
+    std::vector<Target> targets;
+    std::string default_target;
 };
 
 class TargetDiscovery {
@@ -78,7 +102,7 @@ public:
 
         // Helper: prefer src/ and root, deprioritize include/examples/test dirs
         auto is_preferred_dir = [](const fs::path& p) {
-            auto dir = p.parent_path().string();
+            const auto dir = p.parent_path().string();
             if (dir == "." || dir == "./" || dir == "src" || dir.ends_with("/src")) return true;
             if (dir.find("include") != std::string::npos) return false;
             if (dir.find("example") != std::string::npos) return false;
@@ -89,8 +113,7 @@ public:
         // Collect all main candidates
         std::vector<fs::path> preferred_mains, fallback_mains;
         for (const auto& file : all_source_files) {
-            std::string filename = file.filename().string();
-            if (filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
+            if (std::string filename = file.filename().string(); filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
                 if (is_preferred_dir(file)) {
                     preferred_mains.push_back(file);
                 } else {
@@ -129,8 +152,7 @@ public:
         if (discovered.empty()) {
             for (const auto& file : all_source_files) {
                 std::string filename = file.filename().string();
-                std::string dir = file.parent_path().string();
-                if (dirs_with_main.contains(dir)) continue;
+                if (std::string dir = file.parent_path().string(); dirs_with_main.contains(dir)) continue;
                 if (filename.starts_with("test") && !discovered_has_test_target(discovered)) {
                     DiscoveredTarget target;
                     target.main_file = file;
@@ -164,8 +186,7 @@ public:
         std::unordered_set<std::string> seen_main_files;
         std::vector<DiscoveredTarget> unique_discovered;
         for (const auto& t : discovered) {
-            std::string main_file_str = t.main_file.string();
-            if (!seen_main_files.contains(main_file_str)) {
+            if (std::string main_file_str = t.main_file.string(); !seen_main_files.contains(main_file_str)) {
                 unique_discovered.push_back(t);
                 seen_main_files.insert(main_file_str);
             }
@@ -239,23 +260,144 @@ private:
     }
 };
 
-struct Config {
-    std::string cc = "clang";
-    std::string cxx = "clang++";
-    std::string as = "nasm";
+class SourceEditor {
+public:
+    // The main entry point. Launches the TUI for a given target.
+    // Returns the new list of selected source files.
+    static std::vector<std::string> run(
+        const Target& target,
+        const std::vector<fs::path>& all_project_sources)
+    {
+        // 1. Prepare the data for the TUI
+        std::vector<std::string> base_entries;
+        for (const auto& p : all_project_sources) {
+            std::string relative_path = fs::relative(p).string();
+            // Ensure path starts with ./
+            if (!relative_path.starts_with("./")) {
+                relative_path += "./";
+            }
+            base_entries.push_back(relative_path);
+        }
+        std::ranges::sort(base_entries); // Keep the list sorted for usability.
 
-    std::string cxxflags = "-march=native -std=c++23 -O2 -pipe";
-    std::string cflags = "-march=native -std=c11 -O2 -pipe";
-    std::string ldflags;
-    std::string build_dir = ".autocc_build";
-    bool use_pch = true;
-    std::vector<std::string> include_dirs;
-    std::vector<std::string> external_libs;
-    std::vector<std::string> exclude_patterns;
-    // Target system
-    std::vector<Target> targets;
-    std::string default_target;
+        // Remove main_file from the selector if it exists (it will be added automatically)
+        std::string main_file_normalized = target.main_file;
+        if (!main_file_normalized.starts_with("./")) {
+            main_file_normalized = "./" + main_file_normalized;
+        }
+
+        if (const auto main_file_it = std::ranges::find(base_entries, main_file_normalized); main_file_it != base_entries.end()) {
+            base_entries.erase(main_file_it);
+        }
+
+        std::vector<int> states;
+        states.resize(base_entries.size(), 0);
+
+        // Pre-select files that are already in the target's source list (excluding main_file)
+        std::unordered_set<std::string> initial_selection;
+        for (const auto& source : target.sources) {
+            std::string normalized_source = source;
+            if (!normalized_source.starts_with("./")) {
+                normalized_source += "./";
+            }
+            if (normalized_source != main_file_normalized) {
+                initial_selection.insert(normalized_source);
+            }
+        }
+
+        for (size_t i = 0; i < base_entries.size(); ++i) {
+            if (initial_selection.contains(base_entries[i])) {
+                states[i] = 1; // 1 means checked
+            }
+        }
+
+        // Create display entries with checkbox indicators
+        std::vector<std::string> entries;
+        auto update_entries = [&] {
+            entries.clear();
+            for (size_t i = 0; i < base_entries.size(); ++i) {
+                std::string prefix = states[i] ? "[x] " : "[ ] ";
+                entries.push_back(prefix + base_entries[i]);
+            }
+        };
+        update_entries();
+
+        // --- 2. Define the TUI components ---
+        auto screen = ScreenInteractive::Fullscreen();
+
+        int selected = 0;
+        Component menu = Menu(&entries, &selected);
+
+        // Add event handling for selection toggle and exit
+        menu = CatchEvent(menu, [&](const Event &event) {
+            if (event == Event::Character(' ') || event == Event::Return) {
+                states[selected] = 1 - states[selected]; // Toggle
+                update_entries(); // Update display entries
+                return true;
+            }
+            if (event == Event::Character('q') || event == Event::Escape) {
+                screen.Exit();
+                return true;
+            }
+            return false;
+        });
+
+        // Add a title and instructions
+        auto title_renderer = Renderer([] {
+            return text(" Source File Selector ") | bold | center;
+        });
+
+        auto instructions_renderer = Renderer([&] {
+            return vbox({
+                text("Target: " + target.name) | bold,
+                text("Main file: " + main_file_normalized + " (auto-included)") | dim,
+                separator(),
+                text("Use [↑/↓] to navigate."),
+                text("Use [space] or [enter] to toggle selection."),
+                text("Press [q] or [escape] to confirm and exit."),
+                separator(),
+                text("Selected: " + std::to_string(std::ranges::count(states, 1))) | dim,
+            }) | border;
+        });
+
+        // Layout the components
+        const auto layout = Container::Vertical({
+            title_renderer,
+            instructions_renderer,
+            menu
+        });
+
+        // --- 3. Run the TUI event loop ---
+        const auto main_renderer = Renderer(layout, [&] {
+            return vbox({
+                title_renderer->Render(),
+                instructions_renderer->Render(),
+                menu->Render() | vscroll_indicator | frame | flex,
+            }) | border;
+        });
+
+        // The TUI takes control of the terminal here.
+        // It will exit when the user presses 'q' or 'escape'.
+        screen.Loop(main_renderer);
+
+        // --- 4. Process the results ---
+        std::vector<std::string> final_selection;
+        for (size_t i = 0; i < base_entries.size(); ++i) {
+            if (states[i] == 1) { // If the checkbox is checked
+                final_selection.push_back(base_entries[i]);
+            }
+        }
+
+        // Always include the main file, even if the user unchecks it by mistake.
+        if (std::ranges::find(final_selection, main_file_normalized) == final_selection.end()) {
+             final_selection.push_back(main_file_normalized);
+             out::warn("The target's main_file ('{}') was unselected, but has been re-added automatically.", main_file_normalized);
+        }
+
+        return final_selection;
+    }
 };
+
 std::string hash_file(const fs::path& path) {
     constexpr size_t buffer_size = 65536;
     std::ifstream file(path, std::ios::binary);
@@ -1428,11 +1570,19 @@ private:
 
 };
 
-// --- User Interaction and Main ---
+// info and help
+
+void show_version() {
+    fmt::print("AutoCC {} compiled on {} at {}\n",
+        fmt::styled(VERSION, COLOR_SUCCESS),
+        fmt::styled(DATE, COLOR_INFO),
+        fmt::styled(TIME, COLOR_INFO)
+    );
+}
 
 void show_help() {
     using fmt::styled;
-    out::info("AutoCC {} - A smaller C++ build system", VERSION);
+    show_version();
     fmt::print(
         "\n"
         "Usage: autocc [command]\n\n"
@@ -1440,35 +1590,32 @@ void show_help() {
         "  {}               Builds the project incrementally using cached settings.\n"
         "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
         "  {}        Converts 'autocc.toml' to the internal build cache.\n"
+        "  {}          Open a TUI to visually select source files for targets.\n"
         "  {}                Removes the build directory.\n"
-        "  {}                Removes all autocc generated files (cache, build dir, db).\n"
+        "  {}                 Removes all autocc generated files (cache, build dir, db).\n"
         "  {}                Download/update the library detection database.\n"
-        "  {}                 Show current version and build date.\n"
-        "  {}              Shows this help message.\n",
-        styled("<none>", out::color_prompt),
-        styled("ac/autoconfig", out::color_prompt),
-        styled("setup/sync/sc", out::color_prompt),
-        styled("clean", out::color_prompt),
-        styled("wipe", out::color_prompt),
-        styled("fetch", out::color_prompt),
-        styled("version", out::color_prompt),
-        styled("help", out::color_prompt)
-    );
-}
-
-void show_version() {
-    fmt::print("AutoCC {} compiled on {} at {}\n",
-        fmt::styled(VERSION, out::color_success),
-        fmt::styled(DATE, out::color_info),
-        fmt::styled(TIME, out::color_info)
+        "  {}              Show current version and build date.\n"
+        "  {}                 Shows this help message.\n"
+        "Flags:\n"
+        "  {}            For 'autocc autoconfig', use default settings.\n",
+        styled("<none>", COLOR_PROMPT),
+        styled("ac/autoconfig", COLOR_PROMPT),
+        styled("setup/sync/sc", COLOR_PROMPT),
+        styled("edit/select", COLOR_PROMPT), // <-- MODIFIED LINE
+        styled("clean", COLOR_PROMPT),
+        styled("wipe", COLOR_PROMPT),
+        styled("fetch", COLOR_PROMPT),
+        styled("version", COLOR_PROMPT),
+        styled("help", COLOR_PROMPT),
+        styled("--default", COLOR_PROMPT)
     );
 }
 
 void user_init(Config& config) {
     auto get_input = [](const std::string_view prompt, const std::string_view default_val) -> std::string {
         fmt::print(stdout, "{} ({})? ",
-            fmt::styled(prompt, out::color_prompt),
-            fmt::styled(default_val, out::color_default));
+            fmt::styled(prompt, COLOR_PROMPT),
+            fmt::styled(default_val, COLOR_DEFAULT));
         std::string input;
         std::getline(std::cin, input);
         return input.empty() ? std::string(default_val) : input;
@@ -1577,169 +1724,426 @@ void user_init(Config& config) {
     }
 }
 
-int main(const int argc, char* argv[]) {
-    const fs::path config_toml_path = "autocc.toml";
-    const fs::path cache_dir = CACHE_DIR_NAME;
-    const fs::path base_db_path = DB_FILE_NAME;
+void default_init(Config& config) {
 
+    out::info("Discovering potential build targets to create a default configuration...");
+
+    // Get all source files for discovery
+    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+    const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+
+    auto discovered = TargetDiscovery::discover_targets(all_sources);
+
+    if (discovered.empty()) {
+        out::warn("No targets discovered. A default autocc.toml will be created without targets.");
+        return;
+    }
+
+    out::info("Discovered {} potential target(s). Auto-configuring with defaults.", discovered.size());
+    for (size_t i = 0; i < discovered.size(); ++i) {
+        const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
+        out::info("  {}: Found {} ({}) - {} source files. Reason: {}",
+                 i + 1, suggested_name, main_file.filename().string(),
+                 suggested_sources.size(), reason);
+    }
+     fmt::print("\n");
+
+    // Let's automatically configure each discovered target.
+    for (const auto& discovered_target : discovered) {
+        // The prompt to configure a target defaults to "y". We will act on that.
+        out::info("Automatically configuring target '{}'", discovered_target.suggested_name);
+
+        Target target;
+
+        // The prompt for "Target name" defaults to the suggested name.
+        target.name = discovered_target.suggested_name;
+
+        target.main_file = discovered_target.main_file.string();
+
+        // The prompt for "Output executable name" defaults to the target name.
+        target.output_name = target.name;
+
+        // The prompt "Use these suggested sources?" defaults to "y".
+        out::info("  -> Using all {} suggested source files.", discovered_target.suggested_sources.size());
+        for (const auto& src : discovered_target.suggested_sources) {
+            target.sources.push_back(src.string());
+        }
+
+        // The prompt for "Target-specific exclude patterns" defaults to "".
+        // So, no target-specific patterns are added by default.
+
+        config.targets.push_back(target);
+    }
+
+    // If we created any targets, set the default build target.
+    if (!config.targets.empty()) {
+        // The prompt for "Default target" defaults to the first target's name.
+        config.default_target = config.targets[0].name;
+        out::info("Setting default target to '{}'", config.default_target);
+    }
+}
+
+class CLIHandler {
+public:
+    struct CommandResult {
+        int exit_code;
+        bool handled;
+    };
+
+    CLIHandler();
+    CommandResult handle_command(int argc, char* argv[]);
+
+private:
+    struct Command {
+        std::string description;
+        std::function<int(const std::vector<std::string>&)> handler;
+        std::vector<std::string> aliases;
+    };
+
+    std::unordered_map<std::string, Command> commands_;
+
+    // Path constants
+    const fs::path config_toml_path_ = "autocc.toml";
+    const fs::path cache_dir_ = CACHE_DIR_NAME;
+    const fs::path base_db_path_ = DB_FILE_NAME;
+
+    // Command handlers
+    int handle_default_build() const;
+    int handle_target_build(const std::string& target_name) const;
+    int handle_fetch(const std::vector<std::string>& args) const;
+
+    static int handle_help(const std::vector<std::string>& args);
+
+    static int handle_version(const std::vector<std::string>& args);
+    int handle_autoconfig(const std::vector<std::string>& args) const;
+    int handle_edit(const std::vector<std::string>& args) const;
+    int handle_setup(const std::vector<std::string>& args) const;
+
+    static int handle_clean(const std::vector<std::string>& args);
+    int handle_wipe(const std::vector<std::string>& args) const;
+
+    // Helper methods
+    bool is_project_setup() const;
+    bool sync_config_if_needed() const;
+
+    static std::optional<AutoCC> load_autocc_from_cache();
+    void register_commands();
+};
+
+// cli_handler.cpp
+CLIHandler::CLIHandler() {
+    register_commands();
+}
+
+void CLIHandler::register_commands() {
+    commands_["fetch"] = {"Download the base database",
+        [this](const auto& args) { return handle_fetch(args); }, {}};
+
+    commands_["help"] = {"Show help information",
+        [this](const auto& args) { return handle_help(args); }, {}};
+
+    commands_["version"] = {"Show version information",
+        [this](const auto& args) { return handle_version(args); }, {}};
+
+    commands_["autoconfig"] = {"Auto-configure the project",
+        [this](const auto& args) { return handle_autoconfig(args); }, {"ac"}};
+
+    commands_["edit"] = {"Edit target source files interactively",
+        [this](const auto& args) { return handle_edit(args); }, {"select"}};
+
+    commands_["setup"] = {"Set up the project from configuration",
+        [this](const auto& args) { return handle_setup(args); }, {"sync", "sc"}};
+
+    commands_["clean"] = {"Clean build directory",
+        [this](const auto& args) { return handle_clean(args); }, {}};
+
+    commands_["wipe"] = {"Remove all autocc files (build dir and cache)",
+        [this](const auto& args) { return handle_wipe(args); }, {}};
+
+    // Register aliases
+    for (const auto &info: commands_ | std::views::values) {
+        for (const auto& alias : info.aliases) {
+            commands_[alias] = info;
+        }
+    }
+}
+
+CLIHandler::CommandResult CLIHandler::handle_command(const int argc, char* argv[]) {
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; ++i) {
+        args.emplace_back(argv[i]);
+    }
+
+    // No arguments - default build
     if (argc < 2) {
-        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
-            out::error("Project not set up. Run 'autocc setup' first.");
-            out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
-            return 1;
-        }
-        if (fs::last_write_time(config_toml_path) > fs::last_write_time(cache_dir / CONFIG_FILE_NAME)) {
-            const auto config_opt = load_config_from_toml(config_toml_path);
-            if (!config_opt) {
-                out::error("Could not load '{}'. Please fix the configuration file.", config_toml_path);
-                return 1;
-            }
-
-            // Remove old cache
-            if (fs::exists(cache_dir)) {
-                try {
-                    fs::remove_all(cache_dir);
-                } catch (const fs::filesystem_error& e) {
-                    out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
-                    return 1;
-                }
-            }
-
-            AutoCC autocc(*config_opt, false);
-            autocc.writeConfigCache();
-
-            // Create an empty dependency cache
-            std::ofstream out_cache(cache_dir / DEP_CACHE_FILE_NAME);
-            out_cache << "{}";
-            out_cache.close();
-
-            out::success("Configuration synced automatically.");
-        }
-
-        auto autocc_opt = AutoCC::load_from_cache();
-        if (!autocc_opt) {
-            out::error("Failed to load project from cache. Try running 'autocc setup' again.");
-            return 1;
-        }
-        return autocc_opt->build();
+        return {handle_default_build(), true};
     }
 
-    std::string command = argv[1];
-    if (command != "fetch" && command != "help" && command != "version" &&
-        command != "autoconfig" && command != "ac" && command != "setup" &&
-        command != "sync" && command != "sc" && command != "compile" &&
-        command != "clean" && command != "wipe") {
-        std::string target_name;
+    const std::string command = args[1];
 
-        // It's a target name
-        target_name = command;
-
-        if (!fs::exists(cache_dir / CONFIG_FILE_NAME)) {
-            out::error("Project not set up. Run 'autocc setup' first.");
-            return 1;
-        }
-
-        auto autocc_opt = AutoCC::load_from_cache();
-        if (!autocc_opt) {
-            out::error("Failed to load project from cache.");
-            return 1;
-        }
-        return autocc_opt->build(target_name);
+    // Check if it's a registered command
+    if (const auto it = commands_.find(command); it != commands_.end()) {
+        return {it->second.handler(args), true};
     }
 
-    if (command == "fetch") { Fetcher::download_file(BASE_DB_URL, base_db_path); return 0; }
-    if (command == "help") { show_help(); return 0; }
-    if (command == "version") { show_version(); return 0; }
+    // Otherwise, treat as target name
+    return {handle_target_build(command), true};
+}
 
-    if (command == "autoconfig" || command == "ac") {
-        if (!exists(base_db_path)) {
-            Fetcher::download_file(BASE_DB_URL, base_db_path);
+bool CLIHandler::is_project_setup() const {
+    return fs::exists(cache_dir_ / CONFIG_FILE_NAME);
+}
+
+bool CLIHandler::sync_config_if_needed() const {
+    if (!fs::exists(config_toml_path_)) return true;
+    if (!is_project_setup()) return false;
+
+    // Check if config is newer than cache
+    if (fs::last_write_time(config_toml_path_) <= fs::last_write_time(cache_dir_ / CONFIG_FILE_NAME)) {
+        return true; // No sync needed
+    }
+
+    const auto config_opt = load_config_from_toml(config_toml_path_);
+    if (!config_opt) {
+        out::error("Could not load '{}'. Please fix the configuration file.", config_toml_path_);
+        return false;
+    }
+
+    // Remove old cache
+    if (fs::exists(cache_dir_)) {
+        try {
+            fs::remove_all(cache_dir_);
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to remove cache directory '{}': {}", cache_dir_, e.what());
+            return false;
         }
-        Config config;
+    }
+
+    const AutoCC autocc(*config_opt, false);
+    autocc.writeConfigCache();
+
+    // Create empty dependency cache
+    std::ofstream out_cache(cache_dir_ / DEP_CACHE_FILE_NAME);
+    out_cache << "{}";
+    out_cache.close();
+
+    out::success("Configuration synced automatically.");
+    return true;
+}
+
+std::optional<AutoCC> CLIHandler::load_autocc_from_cache() {
+    auto autocc_opt = AutoCC::load_from_cache();
+    if (!autocc_opt) {
+        out::error("Failed to load project from cache. Try running 'autocc setup' again.");
+    }
+    return autocc_opt;
+}
+
+int CLIHandler::handle_default_build() const {
+    if (!is_project_setup()) {
+        out::error("Project not set up. Run 'autocc setup' first.");
+        out::info("If you have no 'autocc.toml', run 'autocc autoconfig' to create one.");
+        return 1;
+    }
+
+    if (!sync_config_if_needed()) {
+        return 1;
+    }
+
+    auto autocc_opt = load_autocc_from_cache();
+    if (!autocc_opt) {
+        return 1;
+    }
+
+    return autocc_opt->build();
+}
+
+int CLIHandler::handle_target_build(const std::string& target_name) const {
+    if (!is_project_setup()) {
+        out::error("Project not set up. Run 'autocc setup' first.");
+        return 1;
+    }
+
+    auto autocc_opt = load_autocc_from_cache();
+    if (!autocc_opt) {
+        return 1;
+    }
+
+    return autocc_opt->build(target_name);
+}
+
+int CLIHandler::handle_fetch(const std::vector<std::string>& args) const {
+    Fetcher::download_file(BASE_DB_URL, base_db_path_);
+    return 0;
+}
+
+int CLIHandler::handle_help(const std::vector<std::string>& args) {
+    show_help();
+    return 0;
+}
+
+int CLIHandler::handle_version(const std::vector<std::string>& args) {
+    show_version();
+    return 0;
+}
+
+int CLIHandler::handle_autoconfig(const std::vector<std::string>& args) const {
+    if (!exists(base_db_path_)) {
+        Fetcher::download_file(BASE_DB_URL, base_db_path_);
+    }
+
+    Config config;
+
+    if (args[2] == "--default") {
+        default_init(config);
+    } else {
         user_init(config);
+    }
 
-        // Use factory method WITH auto-detection
-        AutoCC scanner = AutoCC::create_with_auto_detection(std::move(config));
+    const AutoCC scanner = AutoCC::create_with_auto_detection(std::move(config));
+    write_config_to_toml(scanner.config, config_toml_path_);
+    return 0;
+}
 
-        write_config_to_toml(scanner.config, config_toml_path);
+int CLIHandler::handle_edit(const std::vector<std::string>& args) const {
+    out::info("Loading configuration for editing...");
+
+    const auto config_opt = load_config_from_toml(config_toml_path_);
+    if (!config_opt) {
+        out::error("Could not load '{}'. Run 'autocc autoconfig' first.", config_toml_path_);
+        return 1;
+    }
+
+    Config config = *config_opt;
+    if (config.targets.empty()) {
+        out::error("No targets found in '{}'. Nothing to edit.", config_toml_path_);
+        return 1;
+    }
+
+    // Find all source files
+    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+    const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+
+    if (all_sources.empty()) {
+        out::error("No source files found in the project. Cannot open editor.");
+        return 1;
+    }
+
+    // Edit each target
+    for (auto& target : config.targets) {
+        out::info("Opening TUI editor for target: {}", target.name);
+
+        if (auto new_sources = SourceEditor::run(target, all_sources);
+            new_sources.size() != target.sources.size() ||
+            !std::is_permutation(target.sources.begin(), target.sources.end(), new_sources.begin())) {
+
+            out::info("Updating sources for target '{}'. Old count: {}, New count: {}.",
+                      target.name, target.sources.size(), new_sources.size());
+            target.sources = new_sources;
+            std::ranges::sort(target.sources);
+        } else {
+            out::info("No changes made for target '{}'.", target.name);
+        }
+    }
+
+    out::info("\nAll targets processed.");
+    out::warn("This will overwrite your 'autocc.toml' with the new selections.");
+
+    fmt::print(stdout, "{} (y/n)? ", fmt::styled("Do you want to save your changes?", COLOR_PROMPT));
+    std::string confirmation;
+    std::getline(std::cin, confirmation);
+
+    if (confirmation == "y" || confirmation == "yes") {
+        write_config_to_toml(config, config_toml_path_);
+        out::info("To apply changes, run 'autocc setup' to sync the new config to the cache.");
+    } else {
+        out::info("Operation cancelled. 'autocc.toml' was not modified.");
+    }
+    return 0;
+}
+
+int CLIHandler::handle_setup(const std::vector<std::string>& args) const {
+    if (!exists(base_db_path_)) {
+        out::warn("{} not found!", DB_FILE_NAME);
+    }
+
+    const auto config_opt = load_config_from_toml(config_toml_path_);
+    if (!config_opt) {
+        out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path_);
+        return 1;
+    }
+
+    const AutoCC autocc(*config_opt, false);
+    autocc.writeConfigCache();
+
+    // Create empty dependency cache
+    std::ofstream out_cache(cache_dir_ / DEP_CACHE_FILE_NAME);
+    out_cache << "{}";
+    out_cache.close();
+
+    out::success("Setup complete. You can now run 'autocc' to build.");
+    return 0;
+}
+
+int CLIHandler::handle_clean(const std::vector<std::string>& args) {
+    const auto autocc_opt = AutoCC::load_from_cache();
+    if (!autocc_opt) {
+        out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
         return 0;
     }
 
-    if (command == "setup" || command == "sync" || command == "sc") {
-        if (!exists(base_db_path)) {
-            out::warn("{} not found!", DB_FILE_NAME);
-        }
-        const auto config_opt = load_config_from_toml(config_toml_path);
-        if (!config_opt) {
-            out::error("Could not load '{}'. Run 'autocc autoconfig' to create it.", config_toml_path);
+    const auto& build_dir = autocc_opt->config.build_dir;
+    out::info("Cleaning build directory '{}'...", build_dir);
+
+    if (fs::exists(build_dir)) {
+        try {
+            fs::remove_all(build_dir);
+            out::success("Clean complete. Targets and objects removed.");
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to remove build directory '{}': {}", build_dir, e.what());
             return 1;
         }
+    }
+    return 0;
+}
 
-        // Create WITHOUT auto-detection (preserve TOML settings)
-        AutoCC autocc(*config_opt, false);
-        autocc.writeConfigCache();
-
-        // Create an empty dependency cache to start with.
-        std::ofstream out_cache(cache_dir / DEP_CACHE_FILE_NAME);
-        out_cache << "{}";
-        out_cache.close();
-
-        out::success("Setup complete. You can now run 'autocc' to build.");
-        return 0;
+int CLIHandler::handle_wipe(const std::vector<std::string>& args) const {
+    Config temp_cfg;
+    if (const auto optional = AutoCC::load_from_cache()) {
+        temp_cfg = optional->config;
+    } else if (const auto toml_optional = load_config_from_toml(config_toml_path_)) {
+        temp_cfg = *toml_optional;
     }
 
-    if (command == "clean") {
-        if (const auto optional = AutoCC::load_from_cache()) {
-            Config temp_cfg = optional->config;
-            out::info("Cleaning build directory '{}'...", temp_cfg.build_dir);
-            if (fs::exists(temp_cfg.build_dir)) {
-                try {
-                    fs::remove_all(temp_cfg.build_dir);
-                } catch (const fs::filesystem_error& e) {
-                    out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
-                }
+    out::warn("Wiping all autocc files (build dir and cache)...");
+
+    for (std::vector<fs::path> const paths_to_remove = {temp_cfg.build_dir, cache_dir_, base_db_path_};
+        const auto& path : paths_to_remove) {
+        if (!fs::exists(path)) continue;
+
+        try {
+            if (fs::is_directory(path)) {
+                fs::remove_all(path);
+            } else {
+                fs::remove(path);
             }
-            out::success("Clean complete. Targets and objects removed.");
+        } catch (const fs::filesystem_error& e) {
+            out::error("Failed to remove '{}': {}", path, e.what());
         }
-        else {
-            out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
-        }
-        return 0;
     }
 
-    if (command == "wipe") {
-        Config temp_cfg;
-        if (const auto optional = AutoCC::load_from_cache()) {
-            temp_cfg = optional->config;
-        } else if (const auto toml_optional = load_config_from_toml(config_toml_path)) {
-            temp_cfg = *toml_optional;
-        }
-        out::warn("Wiping all autocc files (build dir and cache)...");
-        if (fs::exists(temp_cfg.build_dir)) {
-            try {
-                fs::remove_all(temp_cfg.build_dir);
-            } catch (const fs::filesystem_error& e) {
-                out::error("Failed to remove build directory '{}': {}", temp_cfg.build_dir, e.what());
-            }
-        }
-        if (fs::exists(cache_dir)) {
-            try {
-                fs::remove_all(cache_dir);
-            } catch (const fs::filesystem_error& e) {
-                out::error("Failed to remove cache directory '{}': {}", cache_dir, e.what());
-            }
-        }
-        if (fs::exists(base_db_path)) {
-            try {
-                fs::remove(base_db_path);
-            } catch (const fs::filesystem_error& e) {
-                out::error("Failed to remove database file '{}': {}", base_db_path, e.what());
-            }
-        }
-        out::success("Wipe complete. 'autocc.toml' was not removed.");
-        return 0;
+    out::success("Wipe complete. 'autocc.toml' was not removed.");
+    return 0;
+}
+
+int main(const int argc, char* argv[]) {
+    CLIHandler cli;
+    auto [exit_code, handled] = cli.handle_command(argc, argv);
+
+    if (!handled) {
+        out::error("Unknown command. Use 'autocc help' for usage.");
+        return 1;
     }
 
-    out::error("Unknown command: '{}'. Use 'autocc help' for usage.", command);
-    return 1;
+    return exit_code;
 }

@@ -18,6 +18,7 @@
 - **🧠 Pre-Compiled Headers** - Automatically generates PCH for common headers to speed up compilation
 - **🎯 Target Discovery** - Intelligently discovers main() functions and suggests build targets
 - **🤖 Automated setup** - with `autoconfig` setting up a project becomes easy
+- **✅ TUI-Based editor** - using `edit` to edit configuration files without any external edtior
 
 ---
 
@@ -26,7 +27,7 @@
 ### Prerequisites
 ```bash
 cmake >= 3.30
-C++20 standard support 
+C++23 standard support 
 fmt library
 xxhash library
 OpenSSL library
@@ -46,7 +47,16 @@ cmake .. && make # -DWALL=ON for all possible warnings -DARM=ON for no optimizat
 # Or if you already have autocc:
 autocc setup && autocc
 ```
-
+### target_compile_definitions() 
+```cmake
+target_compile_definitions(autocc PUBLIC
+        # -DLOG_DISABLE -- disable logging
+        # -DLOG_DISABLE_INFO -- disable info
+        # -DLOG_DISABLE_COLORS -- disable colors
+        -DLOG_ENABLE_FILE # -- enable file logging
+        # -DLOG_DISABLE_TIMESTAMP -- disable timestamps
+)
+```
 ---
 
 ## 📋 Sample Workflow
@@ -54,12 +64,14 @@ autocc setup && autocc
 ### 1. Initial Setup & Target Discovery
 ```bash
 # Generate config with intelligent target discovery
-autocc autoconfig   # or 'autocc ac'
+autocc autoconfig   # or 'autocc ac', use --default to skip all and use builtin configuration
 # This will:
 # - Scan your project for main() functions
 # - Suggest build targets automatically
 # - Detect headers and libraries
 # - Create autocc.toml with smart defaults
+autocc edit # or 'autocc select'
+# this edits sources to build
 ```
 
 ### 2. Sync Configuration
@@ -137,21 +149,22 @@ exclude_patterns = []
 
 ```bash
 ➜  ~ autocc help
-[INFO] AutoCC v0.1.3 - A smarter C++ build system
+AutoCC v0.1.4 compiled on Jul 31 2025 at 12:07:36
 
-Usage: autocc [command|target_name]
+Usage: autocc [command]
 
 Commands:
-  <none>               Builds the default target using cached settings
-  <target_name>        Builds the specified target (e.g., 'autocc test')
-  ac/autoconfig        Creates 'autocc.toml' with intelligent target discovery
-  setup/sync/sc        Converts 'autocc.toml' to internal build cache
-  clean                Removes the build directory
-  wipe                 Removes all autocc generated files (cache, build dir, db)
-  fetch                Download/update the library detection database
-  version              Show current version and build date
-  help                 Shows this help message
-
+  <none>               Builds the project incrementally using cached settings.
+  ac/autoconfig        Creates 'autocc.toml' via an interactive prompt.
+  setup/sync/sc        Converts 'autocc.toml' to the internal build cache.
+  edit/select          Open a TUI to visually select source files for targets.
+  clean                Removes the build directory.
+  wipe                 Removes all autocc generated files (cache, build dir, db).
+  fetch                Download/update the library detection database.
+  version              Show current version and build date.
+  help                 Shows this help message.
+Flags:
+  --default            For 'autocc autoconfig', use default settings.
 ```
 
 ---
@@ -188,8 +201,9 @@ AutoCC's target system allows you to build multiple executables from a single pr
 ### Project Structure
 ```
 autocc/
-├── zsh/       
-│   └── _autocc              # auto suggestions for zsh (not working)
+├── zsh/    
+│   ├── install.sh           # Install script for _autocc
+│   └── _autocc              # auto suggestions for zsh
 ├── include/       
 │   ├── httplib.h            # http for downloading
 │   ├── json.hpp             # json for caching and db
@@ -208,7 +222,7 @@ autocc/
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ---
 
