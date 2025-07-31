@@ -42,7 +42,7 @@ cd autocc
 
 # Build with cmake
 mkdir build && cd build
-cmake .. && make # -DWALL=ON for all possible warnings -DARM=ON for no optimization -DNUSE_TUI for disabling ftxui
+cmake .. && make # -DWALL=ON for all possible warnings -DARM=ON for no optimization -DNUSE_TUI=ON for disabling ftxui
 
 # Or if you already have autocc:
 autocc setup && autocc
