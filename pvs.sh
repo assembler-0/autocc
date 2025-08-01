@@ -28,6 +28,7 @@ echo "Step 1: Tracing compilation process..."
 pvs-studio-analyzer trace -o strace_out -- cmake --build "$BUILD_DIR"
 
 # Check if tracing was successful
+# shellcheck disable=SC2181
 if [ $? -ne 0 ]; then
     echo "Error: PVS-Studio tracing failed!"
     exit 1
@@ -44,9 +45,11 @@ echo "✓ Build successful, proceeding with static analysis..."
 
 # Step 2: Run the actual static analysis
 echo "Step 2: Running PVS-Studio static analysis..."
+# shellcheck disable=SC2046
 pvs-studio-analyzer analyze -o PVS-Studio.log -j$(nproc)
 
 # Check if analysis was successful
+# shellcheck disable=SC2181
 if [ $? -ne 0 ]; then
     echo "Error: PVS-Studio analysis failed!"
     echo "This might be due to license issues or configuration problems"
@@ -80,6 +83,7 @@ echo "Step 3: Converting to HTML report..."
 plog-converter -t fullhtml -a "GA:1,2,3;OP:1,2,3;64:1,2,3;CS:1,2,3" -o report.html PVS-Studio.log
 
 # Check if conversion was successful
+# shellcheck disable=SC2181
 if [ $? -eq 0 ]; then
     echo "=========================================="
     echo "SUCCESS! Files generated:"
