@@ -8,7 +8,7 @@
 
 ---
 ## 🎊 What's new? (v0.1.5)
-- **Code base refector** - optimizations and better efficientcy
+- **Codebase refector** - optimizations and better efficiency
 - **TUI-Based autoconfig** - easier project configuration.
 ## ✨ Features
 

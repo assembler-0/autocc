@@ -276,7 +276,7 @@ public:
             std::string relative_path = fs::relative(p).string();
             // Ensure path starts with ./ for consistency
             if (!relative_path.starts_with("./") && !relative_path.starts_with("../")) {
-                relative_path += "./";
+                relative_path = "./" + relative_path;
             }
             base_entries.push_back(relative_path);
         }
@@ -299,7 +299,7 @@ public:
         for (const auto& source : target.sources) {
             std::string normalized_source = source;
             if (!normalized_source.starts_with("./") && !normalized_source.starts_with("../")) {
-                normalized_source += "./";
+                normalized_source = "./" + normalized_source;
             }
             if (normalized_source != main_file_normalized) {
                 initial_selection.insert(normalized_source);
