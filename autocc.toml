@@ -1,4 +1,4 @@
-# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 14:45:03 Jul 31 2025, EDIT WITH CAUTION.
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 18:46:12 Jul 31 2025, EDIT WITH CAUTION.
 [compilers]
 as = 'nasm'
 cc = 'clang'
@@ -7,27 +7,8 @@ cxx = 'clang++'
 [features]
 use_pch = true
 
-[flags]
-cflags = '-march=native -std=c11 -O2 -pipe'
-cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = ''
-
 [paths]
 exclude_patterns = []
-external_libs = [
-    '-lm',
-    '-lzstd',
-    '-lz',
-    '-lxxhash',
-    '-lpthread',
-    '-lcrypto',
-    '-lssl',
-    '-lbrotlidec',
-    '-lfmt',
-    '-lftxui-screen',
-    '-lftxui-dom',
-    '-lftxui-component'
-]
 include_dirs = [ 'include' ]
 
 [project]
@@ -35,8 +16,27 @@ build_dir = '.autocc_build'
 default_target = 'autocc'
 
 [[targets]]
+cflags = '-DUSE_TUI -O3 -march=native -std=c++23'
+cxxflags = '-DUSE_TUI -O3 -march=native -std=c++23'
 exclude_patterns = []
+external_libs = [
+    '-lz',
+    '-lpthread',
+    '-lssl',
+    '-lcrypto',
+    '-lftxui-component',
+    '-lftxui-dom',
+    '-lftxui-screen',
+    '-lfmt',
+    '-lxxhash',
+    '-lzstd',
+    '-lm',
+    '-lbrotlidec'
+]
+ldflags = ''
 main_file = './autocc.cc'
 name = 'autocc'
 output_name = 'autocc'
-sources = [ './autocc.cc' ]
+sources = [
+    './autocc.cc',
+]

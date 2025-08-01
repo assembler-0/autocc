@@ -3,11 +3,13 @@
 > A fast, minimal low-level build system with intelligent target management
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.4-green.svg)](autocc.cc)
+[![Version](https://img.shields.io/badge/version-0.1.5-green.svg)](autocc.cc)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
-
+## 🎊 What's new? (v0.1.5)
+- **Codebase refector** - optimizations and better efficiency
+- **TUI-Based autoconfig** - easier project configuration.
 ## ✨ Features
 
 - **🎯 Incremental Builds** - For lightning fast rebuilds

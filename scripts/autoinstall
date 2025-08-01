@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # GNU install clone script
 # Usage: install <file> [--link|--auto]
 # Default: copies file to /usr/local/bin
@@ -30,8 +29,10 @@ auto_detect_path() {
     local test_commands=("ls" "cat" "echo" "sh" "which")
 
     for cmd in "${test_commands[@]}"; do
+        # shellcheck disable=SC2155
         local cmd_path=$(which "$cmd" 2>/dev/null || true)
         if [[ -n "$cmd_path" && -x "$cmd_path" ]]; then
+            # shellcheck disable=SC2155
             local bin_dir=$(dirname "$cmd_path")
             if [[ -w "$bin_dir" ]] || [[ $(id -u) -eq 0 ]]; then
                 echo "$bin_dir"
@@ -72,6 +73,7 @@ if [[ $# -eq 2 ]]; then
         --auto)
             MODE="auto"
             TARGET_DIR=$(auto_detect_path)
+            # shellcheck disable=SC2181
             if [[ $? -ne 0 ]]; then
                 exit 1
             fi
