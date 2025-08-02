@@ -106,50 +106,56 @@ autocc install
 
 ### Basic Configuration
 ```toml
-# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 12:56:30 Jul 31 2025, EDIT WITH CAUTION
-[project]
-build_dir = '.autocc_build'
-default_target = 'main'      # Which target to build by default
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 11:22:23 Aug  1 2025, EDIT WITH CAUTION.
+# PATCH 0.1.5 template
 
 [compilers]
-as = 'nasm'                  # Your assembler
-cc = 'clang'                 # Your C compiler
-cxx = 'clang++'              # Your C++ compiler
+as = 'nasm'
+cc = 'clang'
+cxx = 'clang++'
 
 [features]
-use_pch = true               # Use Pre-Compiled Headers for faster builds
-
-[flags]
-cflags = '-march=native -std=c11 -O2 -pipe'
-cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = '-lfmt -lssl -lcrypto -lxxhash'
+use_pch = true
 
 [paths]
-external_libs = ['-lm', '-lz', '-lpthread']    # System libraries
-include_dirs = ['./include', './third_party'] # Include directories
-exclude_patterns = ['test_*.cpp', '*_benchmark.cpp'] # Files to exclude globally
-
-# 🎯 Target Configuration (Multiple Executables)
-[[targets]]
-name = 'main'
-main_file = 'src/main.cpp'
-sources = ['src/main.cpp', 'src/utils.cpp', 'src/core.cpp']
-output_name = 'my_app'
-exclude_patterns = []        # Target-specific excludes
-
-[[targets]]
-name = 'test'
-main_file = 'tests/test_main.cpp'
-sources = ['tests/test_main.cpp', 'tests/unit_tests.cpp', 'src/utils.cpp']
-output_name = 'test_runner'
-exclude_patterns = ['*_integration.cpp']
-
-[[targets]]
-name = 'benchmark'
-main_file = 'benchmark/bench_main.cpp'
-sources = ['benchmark/bench_main.cpp', 'src/core.cpp']
-output_name = 'benchmarks'
 exclude_patterns = []
+include_dirs = [ 'include/imgui/backends', 'include/imgui', 'include', '.' ]
+
+[project]
+build_dir = '.autocc_build'
+default_target = 'sift'
+
+[[targets]]
+cflags = ''
+cxxflags = '-O3 -std=c++23 -march=native'
+exclude_patterns = []
+external_libs = [ '-ldl', '-lglfw', '-lm', '-lglut', '-lGL', '-lpthread', '-lz', '-llzma' ]
+ldflags = ''
+main_file = './src/main.cpp'
+name = 'sift'
+output_name = 'sift'
+sources = [
+    './src/main.cpp',
+    './asm/3np1.asm',
+    './asm/aesDEC.asm',
+    './asm/aesENC.asm',
+    './asm/avx.asm',
+    './asm/branch.asm',
+    './asm/cache.asm',
+    './asm/diskWrite.asm',
+    './asm/flood.asm',
+    './asm/primes.asm',
+    './asm/render.asm',
+    './asm/sha256.asm',
+    './include/imgui/backends/imgui_impl_glfw.cpp',
+    './include/imgui/backends/imgui_impl_opengl3.cpp',
+    './include/imgui/imgui.cpp',
+    './include/imgui/imgui_draw.cpp',
+    './include/imgui/imgui_tables.cpp',
+    './include/imgui/imgui_widgets.cpp',
+    './src/lzma.module.cpp',
+    './src/systemMonitor.manage.cpp',
+]
 ```
 
 ---
