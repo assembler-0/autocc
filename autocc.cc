@@ -487,7 +487,8 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         out::error("Failed to open '{}' for writing configuration.", toml_path);
         return;
     }
-    file << fmt::format("# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON {} {}, EDIT WITH CAUTION.\n", TIME, DATE);
+    file << fmt::format("# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC {}, MAKE SURE YOU HAVE AN APPROPRIATE AUTOCC BUILD.\n", VERSION);
+    file << fmt::format("# COPYRIGHT (C) assembler-0 2025\n", VERSION);
     file << tbl;
     out::success("Configuration saved to '{}'.", toml_path);
 }
