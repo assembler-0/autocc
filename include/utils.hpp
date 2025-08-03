@@ -246,3 +246,99 @@ inline bool isCommandExecutable(const std::string& command) {
 
     return false;
 }
+
+// Helper function to avoid code duplication
+namespace search {
+    inline void validateFileAndPatterns(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
+        // Validate patterns
+        if (patterns.empty()) {
+            throw std::invalid_argument("Patterns vector cannot be empty");
+        }
+
+        for (const auto& pattern : patterns) {
+            if (pattern.empty()) {
+                throw std::invalid_argument("Pattern cannot be empty");
+            }
+        }
+
+        if (filePath.empty()) {
+            throw std::invalid_argument("File path cannot be empty");
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(filePath, ec)) {
+            throw std::runtime_error("File does not exist: " + filePath.string());
+        }
+
+        if (ec) {
+            throw std::system_error(ec, "Error checking file existence");
+        }
+
+        if (!std::filesystem::is_regular_file(filePath, ec)) {
+            throw std::runtime_error("Path is not a regular file: " + filePath.string());
+        }
+
+        if (ec) {
+            throw std::system_error(ec, "Error checking file type");
+        }
+    }
+}
+
+// Original function (updated to use helper)
+inline bool searchPatternInFile(const std::filesystem::path& filePath, const std::string& pattern) {
+    const std::vector patterns = {pattern};
+    search::validateFileAndPatterns(filePath, patterns);
+
+    std::ifstream file(filePath, std::ios::in | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + filePath.string());
+    }
+
+    try {
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.find(pattern) != std::string::npos) {
+                return true;
+            }
+        }
+
+        if (file.bad()) {
+            throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+        }
+    }
+    catch (const std::ios_base::failure& e) {
+        throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
+    }
+
+    return false;
+}
+
+// New overloaded function
+inline bool searchPatternInFile(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
+    search::validateFileAndPatterns(filePath, patterns);
+
+    std::ifstream file(filePath, std::ios::in | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + filePath.string());
+    }
+
+    try {
+        std::string line;
+        while (std::getline(file, line)) {
+            for (const auto& pattern : patterns) {
+                if (line.find(pattern) != std::string::npos) {
+                    return true;  // Return true if ANY pattern is found
+                }
+            }
+        }
+
+        if (file.bad()) {
+            throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+        }
+    }
+    catch (const std::ios_base::failure& e) {
+        throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
+    }
+
+    return false;
+}

@@ -36,7 +36,7 @@ using namespace ftxui;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "v0.1.5"
+#define VERSION "0.1.5" // REMEMBER TO UPDATE VALIDATION_PATTERN!
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -48,13 +48,32 @@ std::mutex g_output_mutex;
 
 // --- Constants ---
 static constexpr auto CACHE_DIR_NAME = ".autocc_cache";
-static constexpr auto CONFIG_FILE_NAME = "config.cache";
+static constexpr auto CONFIG_CACHE_FILE_NAME = "config.cache"; // THIS SUPPOSED TO 
+static constexpr auto CONFIG_FILE_NAME = "autocc.toml";
 static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 static constexpr auto DB_FILE_NAME = "autocc.base.json";
 static constexpr auto AUTOINSTALL_SCRIPT_PATH = "scripts/autoinstall";
 static constexpr auto DEFAULT_INSTALL_PATH = "/usr/local/bin";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
+static constexpr auto PROJECT_ROOT = ".";
+
+static std::vector<std::string> getAllValidationPattern() {
+    static const std::vector<std::string> patterns = {
+        "# AUTOCC 0.1.5",
+        "# AUTOCC 0.1.4",
+        "# AUTOCC 0.1.3"
+    };
+    return patterns;
+}
+
+static const std::vector<std::string> getCurrentValidationPattern() {
+    static const std::vector<std::string> patterns = {
+        "# AUTOCC 0.1.5",
+        fmt::format("# AUTOCC {}", "0.1.5")  // Redundant example, but shows fmt usage
+    };
+    return patterns;
+}
 
 template <>
 struct fmt::formatter<fs::path> : formatter<std::string_view> {
@@ -87,10 +106,16 @@ struct Config {
     std::string default_target;
 };
 
+bool validateVersion() {
+    if (searchPatternInFile(CONFIG_FILE_NAME, getAllValidationPattern())) {
+        return true;
+    }
+    return false;
+}
+
 class TargetDiscovery {
 public:
     struct DiscoveredTarget {
-
         std::string suggested_name;
         fs::path main_file;
         std::vector<fs::path> suggested_sources;
@@ -487,6 +512,8 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         out::error("Failed to open '{}' for writing configuration.", toml_path);
         return;
     }
+
+    file << fmt::format("# AUTOCC {}\n", VERSION);
     file << fmt::format("# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC {}, MAKE SURE YOU HAVE AN APPROPRIATE AUTOCC BUILD.\n", VERSION);
     file << fmt::format("# COPYRIGHT (C) assembler-0 2025\n", VERSION);
     file << tbl;
@@ -500,7 +527,7 @@ void validate_config(Config& config) {
         if (t.main_file.empty()) out::warn("Target '{}' has an empty main_file.", t.name);
         if (t.sources.empty()) out::warn("Target '{}' has no sources.", t.name);
         if (!names.insert(t.name).second) out::error("Duplicate target name '{}'.", t.name);
-        if (!outputs.insert(t.output_name).second) out::error("Duplicate output_name '{}'.", t.output_name);
+        if (!outputs.insert(t.output_name).second) out::warn("Duplicate output_name '{}'.", t.output_name);
     }
     if (!config.default_target.empty() &&
         std::ranges::none_of(config.targets, [&](const Target& t){ return t.name == config.default_target; }))
@@ -1205,7 +1232,7 @@ public:
 
     static bool read_config_cache_static(Config& config) {
         const fs::path cache_dir = CACHE_DIR_NAME;
-        const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
+        const fs::path config_file = cache_dir / CONFIG_CACHE_FILE_NAME;
 
         if (!fs::exists(config_file)) return false;
 
@@ -1535,9 +1562,9 @@ private:
         return 0;
     }
 
-    const fs::path root = ".";
+    const fs::path root = PROJECT_ROOT;
     const fs::path cache_dir = root / CACHE_DIR_NAME;
-    const fs::path config_file = cache_dir / CONFIG_FILE_NAME;
+    const fs::path config_file = cache_dir / CONFIG_CACHE_FILE_NAME;
     const fs::path dep_cache_file = cache_dir / DEP_CACHE_FILE_NAME;
     DependencyMap dependency_map;
 
@@ -1588,8 +1615,7 @@ void show_help() {
 }
 
 #ifdef USE_TUI
-// everything is already there
-// everything is already there
+
 void user_init(Config& config) {
     using namespace ftxui;
     int current_step = 0;
@@ -2083,7 +2109,7 @@ void user_init(Config& config) {
 #endif
 
 void default_init(Config& config) {
-
+    out::warn("The '--default' option is no longer maintained and is only supported by autocc version 0.1.4 or lower, use with caution.");
     out::info("Discovering potential build targets to create a default configuration...");
     const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
     const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
@@ -2143,7 +2169,7 @@ private:
 
     std::unordered_map<std::string, Command> commands_;
 
-    const fs::path config_toml_path_ = "autocc.toml";
+    const fs::path config_toml_path_ = CONFIG_FILE_NAME;
     const fs::path cache_dir_ = CACHE_DIR_NAME;
     const fs::path base_db_path_ = DB_FILE_NAME;
 
@@ -2215,10 +2241,15 @@ CLIHandler::CommandResult CLIHandler::handle_command(const int argc, char* argv[
 }
 
 bool CLIHandler::is_project_setup() const {
-    return fs::exists(cache_dir_ / CONFIG_FILE_NAME);
+    return fs::exists(cache_dir_ / CONFIG_CACHE_FILE_NAME);
 }
 
 int CLIHandler::do_setup() const {
+    if (!validateVersion()) {
+        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", getCurrentValidationPattern(), CONFIG_FILE_NAME);
+        return 1;
+    }
+
     if (!fs::exists(config_toml_path_)) {
         out::error("'{}' not found. Run 'autocc autoconfig' to create it.", config_toml_path_);
         return 1;
@@ -2244,6 +2275,7 @@ int CLIHandler::do_setup() const {
 }
 
 bool CLIHandler::sync_config_if_needed() const {
+
     if (!fs::exists(config_toml_path_)) {
         return true; // No toml, nothing to sync from.
     }
@@ -2253,7 +2285,7 @@ bool CLIHandler::sync_config_if_needed() const {
     }
 
     try {
-        if (fs::last_write_time(config_toml_path_) <= fs::last_write_time(cache_dir_ / CONFIG_FILE_NAME)) {
+        if (fs::last_write_time(config_toml_path_) <= fs::last_write_time(cache_dir_ / CONFIG_CACHE_FILE_NAME)) {
             return true; // Cache is up-to-date.
         }
     } catch(const fs::filesystem_error& e) {
@@ -2320,6 +2352,10 @@ int CLIHandler::handle_autoconfig(const std::vector<std::string>& args) const {
 #ifdef USE_TUI
 int CLIHandler::handle_edit(const std::vector<std::string>&) const {
     out::info("Loading configuration for editing...");
+    if (!validateVersion()) {
+        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", getCurrentValidationPattern(), CONFIG_FILE_NAME);
+        return 1;
+    }
 
     const auto config_opt = load_config_from_toml(config_toml_path_);
     if (!config_opt) {
@@ -2437,6 +2473,9 @@ int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
 
 int CLIHandler::handle_install(const std::vector<std::string>&) {
     Config config;
+    if (!validateVersion()) {
+        out::warn("Your config file might not be up-to-date with current autocc version.");
+    }
     if (!AutoCC::read_config_cache_static(config)) {
         out::error("Project cache not found. Please run 'autocc setup' first.");
         return 1;

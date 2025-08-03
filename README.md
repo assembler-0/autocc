@@ -106,50 +106,50 @@ autocc install
 
 ### Basic Configuration
 ```toml
-# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC ON 12:56:30 Jul 31 2025, EDIT WITH CAUTION
-[project]
-build_dir = '.autocc_build'
-default_target = 'main'      # Which target to build by default
-
+# AUTOCC 0.1.5 -- Validation pattern, remember to add!
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC v0.1.5, MAKE SURE YOU HAVE THE APPROPRIATE AUTOCC BUILD.
+# COPYRIGHT (C) assembler-0 2025
 [compilers]
-as = 'nasm'                  # Your assembler
-cc = 'clang'                 # Your C compiler
-cxx = 'clang++'              # Your C++ compiler
+as = 'nasm'
+cc = 'clang'
+cxx = 'clang++'
 
 [features]
-use_pch = true               # Use Pre-Compiled Headers for faster builds
-
-[flags]
-cflags = '-march=native -std=c11 -O2 -pipe'
-cxxflags = '-march=native -std=c++23 -O2 -pipe'
-ldflags = '-lfmt -lssl -lcrypto -lxxhash'
+use_pch = true
 
 [paths]
-external_libs = ['-lm', '-lz', '-lpthread']    # System libraries
-include_dirs = ['./include', './third_party'] # Include directories
-exclude_patterns = ['test_*.cpp', '*_benchmark.cpp'] # Files to exclude globally
-
-# 🎯 Target Configuration (Multiple Executables)
-[[targets]]
-name = 'main'
-main_file = 'src/main.cpp'
-sources = ['src/main.cpp', 'src/utils.cpp', 'src/core.cpp']
-output_name = 'my_app'
-exclude_patterns = []        # Target-specific excludes
-
-[[targets]]
-name = 'test'
-main_file = 'tests/test_main.cpp'
-sources = ['tests/test_main.cpp', 'tests/unit_tests.cpp', 'src/utils.cpp']
-output_name = 'test_runner'
-exclude_patterns = ['*_integration.cpp']
-
-[[targets]]
-name = 'benchmark'
-main_file = 'benchmark/bench_main.cpp'
-sources = ['benchmark/bench_main.cpp', 'src/core.cpp']
-output_name = 'benchmarks'
 exclude_patterns = []
+include_dirs = [ 'include' ]
+
+[project]
+build_dir = '.autocc_build'
+default_target = 'autocc'
+
+[[targets]]
+cflags = '-DUSE_TUI -O3 -march=native -std=c++23'
+cxxflags = '-DUSE_TUI -O3 -march=native -std=c++23'
+exclude_patterns = []
+external_libs = [
+    '-lz',
+    '-lpthread',
+    '-lssl',
+    '-lcrypto',
+    '-lftxui-component',
+    '-lftxui-dom',
+    '-lftxui-screen',
+    '-lfmt',
+    '-lxxhash',
+    '-lzstd',
+    '-lm',
+    '-lbrotlidec'
+]
+ldflags = ''
+main_file = './autocc.cc'
+name = 'autocc'
+output_name = 'autocc'
+sources = [
+    './autocc.cc',
+]
 ```
 
 ---
@@ -158,7 +158,7 @@ exclude_patterns = []
 
 ```bash
 ➜  ~ autocc help
-AutoCC v0.1.4 compiled on Jul 31 2025 at 12:07:36
+AutoCC v0.1.5 compiled on Jul 31 2025 at 12:07:36
 
 Usage: autocc [command]
 
