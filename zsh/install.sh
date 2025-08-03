@@ -1,7 +1,7 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 # Better zsh completion installation script
-set -e  # Exit on any error
+set -euo pipefail  # Exit on any error
 
 # Colors for output
 RED='\033[0;31m'

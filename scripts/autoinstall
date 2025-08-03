@@ -5,7 +5,7 @@
 # --link: creates symbolic link instead of copying
 # --auto: auto-detects bin path using 'which' command
 
-set -e
+set -euo pipefail
 
 # Function to show usage
 show_usage() {
