@@ -17,19 +17,14 @@ _autocc() {
             # Main command suggestions
             local -a commands
             commands=(
-                "ac:autoconfig:Creates 'autocc.toml' via an interactive prompt"
                 "autoconfig:Creates 'autocc.toml' via an interactive prompt"
                 "setup:Converts 'autocc.toml' to the internal build cache"
-                "sync:Converts 'autocc.toml' to the internal build cache"
-                "sc:Converts 'autocc.toml' to the internal build cache"
                 "edit:Open a TUI to visually select source files for targets"
-                "select:Open a TUI to visually select source files for targets"
                 "clean:Removes the build directory"
                 "wipe:Removes all autocc generated files (cache, build dir, db)"
                 "fetch:Download/update the library detection database"
                 "version:Show current version and build date"
                 "help:Shows help message"
-                "::Builds the project incrementally using cached settings"
             )
             _describe -t commands 'autocc commands' commands
             ;;

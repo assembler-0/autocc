@@ -213,6 +213,7 @@ AutoCC's target system allows you to build multiple executables from a single pr
 autocc/
 ├── zsh/    
 │   ├── install.sh           # Install script for _autocc
+│   ├── uninstall.sh         # Uninstall script for _autocc
 │   └── _autocc              # auto suggestions for zsh
 ├── include/       
 │   ├── httplib.h            # http for downloading
