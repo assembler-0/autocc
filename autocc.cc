@@ -67,7 +67,7 @@ static std::vector<std::string> getAllValidationPattern() {
     return patterns;
 }
 
-static const std::vector<std::string> getCurrentValidationPattern() {
+static std::vector<std::string> getCurrentValidationPattern() {
     static const std::vector<std::string> patterns = {
         "# AUTOCC 0.1.5",
         fmt::format("# AUTOCC {}", "0.1.5")  // Redundant example, but shows fmt usage
@@ -1586,18 +1586,18 @@ void show_help() {
 
     fmt::print(
         "\n"
-        "Usage: autocc [command] [target_name]\n\n"
+        "Usage: autocc [command] (target_name)\n\n"
         "Commands:\n"
-        "  {}               Builds the default target, or a specified target.\n"
+        "  {}   Builds the default target, or a specified target.\n"
         "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
         "  {}        Converts 'autocc.toml' to the internal build cache.\n"
-        "  {}        Open a TUI to visually select source files for targets (could be disabled).\n"
+        "  {}          Open a TUI to visually select source files for targets (could be disabled).\n"
         "  {}                Removes the build directory.\n"
         "  {}                 Removes all autocc generated files (cache, build dir, db).\n"
         "  {}                Download/update the library detection database.\n"
         "  {}              Show current version and build date.\n"
         "  {}                 Shows this help message.\n"
-        "  {}              Install default target to system path.\n"
+        "  {}     Install specified target to system binary dir.\n"
         "Flags:\n"
         "  {}            For 'autocc autoconfig', use default settings.\n",
         styled("<none> or <target>", COLOR_PROMPT),
@@ -1609,7 +1609,7 @@ void show_help() {
         styled("fetch", COLOR_PROMPT),
         styled("version", COLOR_PROMPT),
         styled("help", COLOR_PROMPT),
-        styled("install", COLOR_PROMPT),
+        styled("install <target>", COLOR_PROMPT),
         styled("--default", COLOR_PROMPT)
     );
 }
@@ -2214,7 +2214,7 @@ void CLIHandler::register_commands() {
     commands_["wipe"] = {"Remove all autocc files (build dir, cache, db)",
         [this](const auto& args) { return handle_wipe(args); }, {}};
     commands_["install"] = {"Install the default target to the system",
-        &CLIHandler::handle_install, {}};
+        [this](const auto& args) { return handle_install(args); }, {}};
     #ifdef USE_TUI
     commands_["edit"] = {"Edit target source files interactively",
         [this](const auto& args) { return handle_edit(args); }, {"select"}};
@@ -2471,7 +2471,7 @@ int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
     return 0;
 }
 
-int CLIHandler::handle_install(const std::vector<std::string>&) {
+int CLIHandler::handle_install(const std::vector<std::string>& args) {
     Config config;
     if (!validateVersion()) {
         out::warn("Your config file might not be up-to-date with current autocc version.");
@@ -2480,41 +2480,68 @@ int CLIHandler::handle_install(const std::vector<std::string>&) {
         out::error("Project cache not found. Please run 'autocc setup' first.");
         return 1;
     }
-    if (config.default_target.empty()) {
-        out::error("No default target is set. Cannot run install.");
-        return 1;
+
+    // Determine which target to install
+    std::string target_name;
+    if (args.size() > 2) {
+        target_name = args[2];
+    } else {
+        target_name = config.default_target;
+        out::info("Using default target {}", target_name);
+        if (target_name.empty()) {
+            out::error("No default target is set. Cannot run install.");
+            return 1;
+        }
     }
 
+    // Validate target exists
+    if (!target_name.empty() && !config.targets.empty()) {
+        auto target_it = std::ranges::find_if(config.targets,
+                                            [&](const Target& t) { return t.name == target_name; });
+        if (target_it == config.targets.end()) {
+            out::error("Target '{}' not found. Available targets: {}",
+                      target_name,
+                      fmt::join(config.targets | std::views::transform([](const Target& t) { return t.name; }), ", "));
+            return 1;
+        }
+    }
+
+    // Build path to executable
     const std::string build_path_str = config.build_dir;
     if (build_path_str.empty()) {
         out::error("Build directory is not configured.");
         return 1;
     }
 
-    const fs::path target_executable = fs::path(build_path_str) / config.default_target;
+    const fs::path target_executable = fs::path(build_path_str) / target_name;
     if (!fs::exists(target_executable)) {
-        out::error("Default target '{}' not found. Please build it first by running 'autocc'.", target_executable);
+        out::error("Target executable '{}' not found. Please build it first by running 'autocc {}'.", target_executable, target_name);
         return 1;
     }
 
+    // Execute installation
     std::string cmd;
     if (fs::exists(AUTOINSTALL_SCRIPT_PATH)) {
         out::info("Using local autoinstall script.");
-        cmd = fmt::format("./{} {} --auto", AUTOINSTALL_SCRIPT_PATH, target_executable.string());
+        cmd = fmt::format("./{} {}", AUTOINSTALL_SCRIPT_PATH, target_executable.string());
+    } else if (isCommandExecutable("dvk")) {
+        out::info("Using 'dvk' from system PATH");
+        cmd = fmt::format("dvk install {}", target_executable.string());
     } else if (isCommandExecutable("autoinstall")) {
         out::info("Using 'autoinstall' from system PATH.");
         cmd = fmt::format("autoinstall {} --auto", target_executable.string());
     } else {
-        out::info("No 'autoinstall' script found, falling back to 'sudo cp'.");
-        cmd = fmt::format("sudo cp -f {} {}", target_executable.string(), DEFAULT_INSTALL_PATH);
+        out::info("No 'autoinstall' script found, falling back to 'cp'.");
+        cmd = fmt::format("cp -f {} {}", target_executable.string(), DEFAULT_INSTALL_PATH);
     }
 
     if (const ::CommandResult res = execute(cmd); res.exit_code != 0) {
-        out::error("Failed to install target '{}'. Exit code: {}.", config.default_target, res.exit_code);
+        out::error("Failed to install target '{}'. Exit code: {}.", target_name, res.exit_code);
         if(!res.stderr_output.empty()) out::error("Stderr: {}", res.stderr_output);
         return 1;
     }
-    out::success("Installed target '{}' successfully.", config.default_target);
+
+    out::success("Installed target '{}' successfully.", target_name);
     return 0;
 }
 

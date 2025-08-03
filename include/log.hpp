@@ -143,35 +143,35 @@ namespace out {
 #ifndef LOG_DISABLE_INFO
     template<typename... T>
     void info(fmt::format_string<T...> fmt, T&&... args) {
-        log_impl(COLOR_INFO, LOG_DEFAULT_STREAM, "[INFO]", fmt, std::forward<T>(args)...);
+        log_impl(COLOR_INFO, LOG_DEFAULT_STREAM, "INFO", fmt, std::forward<T>(args)...);
     }
 #endif
 
     template<typename... T>
     void warn(fmt::format_string<T...> fmt, T&&... args) {
 #ifndef LOG_DISABLE_WARN
-        log_impl(COLOR_WARN, LOG_ERROR_STREAM, "[WARNING]", fmt, std::forward<T>(args)...);
+        log_impl(COLOR_WARN, LOG_ERROR_STREAM, "WARNING", fmt, std::forward<T>(args)...);
 #endif
     }
 
     template<typename... T>
     void error(fmt::format_string<T...> fmt, T&&... args) {
 #ifndef LOG_DISABLE_ERROR
-        log_impl(COLOR_ERROR, LOG_ERROR_STREAM, "[ERROR]", fmt, std::forward<T>(args)...);
+        log_impl(COLOR_ERROR, LOG_ERROR_STREAM, "ERROR", fmt, std::forward<T>(args)...);
 #endif
     }
 
     template<typename... T>
     void success(fmt::format_string<T...> fmt, T&&... args) {
 #ifndef LOG_DISABLE_INFO
-        log_impl(COLOR_SUCCESS, LOG_DEFAULT_STREAM, "[OK]", fmt, std::forward<T>(args)...);
+        log_impl(COLOR_SUCCESS, LOG_DEFAULT_STREAM, "OK", fmt, std::forward<T>(args)...);
 #endif
     }
 
     template<typename... T>
     void command(fmt::format_string<T...> fmt, T&&... args) {
 #ifndef LOG_DISABLE_INFO
-        log_impl(COLOR_CMD, LOG_DEFAULT_STREAM, "[CMD]", fmt, std::forward<T>(args)...);
+        log_impl(COLOR_CMD, LOG_DEFAULT_STREAM, "CMD", fmt, std::forward<T>(args)...);
 #endif
     }
 
@@ -182,7 +182,7 @@ namespace out {
 #ifdef LOG_DISABLE_COLORS
         fmt::print(stdout, "[PROMPT] ");
 #else
-        fmt::print(COLOR_PROMPT, "[PROMPT] ");
+        fmt::print(COLOR_PROMPT, "PROMPT ");
 #endif
         fmt::print(stdout, fmt, std::forward<T>(args)...);
         fmt::print(stdout, " ");

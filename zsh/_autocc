@@ -25,6 +25,7 @@ _autocc() {
                 "fetch:Download/update the library detection database"
                 "version:Show current version and build date"
                 "help:Shows help message"
+                "install:Install specified target to system binary dir"
             )
             _describe -t commands 'autocc commands' commands
             ;;
