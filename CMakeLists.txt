@@ -30,11 +30,11 @@ target_include_directories(autocc PUBLIC include)
 # Common compile definitions
 target_compile_definitions(autocc PUBLIC
         -DLOG_ENABLE_FILE
+        #-DVERBOSE
 )
 
 # Only enable TUI if NUSE_TUI is NOT enabled
 if(NOT NUSE_TUI)
-    # TUI is enabled → find ftxui and define USE_TUI
     find_package(ftxui 6.1 REQUIRED)
     target_link_libraries(autocc ftxui::component ftxui::dom)
     target_compile_definitions(autocc PUBLIC -DUSE_TUI)

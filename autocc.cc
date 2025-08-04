@@ -1,5 +1,4 @@
-// This is a personal academic project. Dear PVS-Studio, please check it.
-// PVS-Studio Static Code Analyzer for C, C++, C#, and Java: https://pvs-studio.com
+// AUTOCC - a simple, fast and intelligent target-based build system written in modern C++
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +17,8 @@
 #include <fmt/ranges.h>
 #include <fmt/chrono.h>
 #include <xxhash.h>
+#include <future>
+#include <shared_mutex>
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 
@@ -36,15 +37,11 @@ using namespace ftxui;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "0.1.5" // REMEMBER TO UPDATE VALIDATION_PATTERN!
+#define VERSION "0.1.6" // REMEMBER TO UPDATE VALIDATION_PATTERN!
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 using DependencyMap = std::unordered_map<fs::path, std::unordered_set<fs::path>>;
-
-// log.hpp
-std::ofstream g_log_file;
-std::mutex g_output_mutex;
 
 // --- Constants ---
 static constexpr auto CACHE_DIR_NAME = ".autocc_cache";
@@ -57,22 +54,24 @@ static constexpr auto AUTOINSTALL_SCRIPT_PATH = "scripts/autoinstall";
 static constexpr auto DEFAULT_INSTALL_PATH = "/usr/local/bin";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
 static constexpr auto PROJECT_ROOT = ".";
+static constexpr auto AUTOCC_LOG_FILE_NAME = "autocc.log";
+
+// log.hpp
+#ifdef LOG_ENABLE_FILE
+std::ofstream g_log_file(AUTOCC_LOG_FILE_NAME); // I forgot, sorry
+#endif
+std::mutex g_output_mutex;
 
 static std::vector<std::string> getAllValidationPattern() {
     static const std::vector<std::string> patterns = {
         "# AUTOCC 0.1.5",
-        "# AUTOCC 0.1.4",
-        "# AUTOCC 0.1.3"
+        "# AUTOCC 0.1.6"
     };
     return patterns;
 }
 
-static std::vector<std::string> getCurrentValidationPattern() {
-    static const std::vector<std::string> patterns = {
-        "# AUTOCC 0.1.5",
-        fmt::format("# AUTOCC {}", "0.1.5")  // Redundant example, but shows fmt usage
-    };
-    return patterns;
+static std::string getCurrentValidationPattern() {
+    return fmt::format("# AUTOCC {}", VERSION);
 }
 
 template <>
@@ -123,11 +122,17 @@ public:
     };
 
     static std::vector<DiscoveredTarget> discover_targets(const std::vector<fs::path>& all_source_files) {
-        std::vector<DiscoveredTarget> discovered;
-        std::unordered_set<std::string> main_files_seen;
-        std::unordered_set<std::string> dirs_with_main;
+        if (all_source_files.empty()) {
+            return {};
+        }
 
-        // Helper: prefer src/ and root, deprioritize include/examples/test dirs
+        // --- Phase 1: Categorize all files in a single pass ---
+        std::vector<fs::path> preferred_mains_candidates;
+        std::vector<fs::path> fallback_mains_candidates;
+        std::vector<fs::path> test_files;
+        std::vector<fs::path> library_files;
+        fs::path first_cpp_file;
+
         auto is_preferred_dir = [](const fs::path& p) {
             const auto dir = p.parent_path().string();
             if (dir == "." || dir == "./" || dir == "src" || dir.ends_with("/src")) return true;
@@ -137,108 +142,109 @@ public:
             return true;
         };
 
-        // Collect all main candidates
-        std::vector<fs::path> preferred_mains, fallback_mains;
         for (const auto& file : all_source_files) {
-            if (std::string filename = file.filename().string(); filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
+            if (const std::string filename = file.filename().string(); filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
                 if (is_preferred_dir(file)) {
-                    preferred_mains.push_back(file);
+                    preferred_mains_candidates.push_back(file);
                 } else {
-                    fallback_mains.push_back(file);
+                    fallback_mains_candidates.push_back(file);
+                }
+            } else if (filename.find("test") != std::string::npos) {
+                test_files.push_back(file);
+            } else {
+                library_files.push_back(file);
+            }
+
+            if (first_cpp_file.empty()) {
+                if (const std::string ext = file.extension().string(); ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
+                    first_cpp_file = file;
                 }
             }
         }
 
-        // Strategy 1: Look for files with the "main" function, prefer preferred_mains
-        auto try_main_candidates = [&](const std::vector<fs::path>& candidates) {
-            for (const auto& file : candidates) {
-                std::string dir = file.parent_path().string();
-                if (dirs_with_main.contains(dir)) continue;
-                if (has_main_function(file)) {
-                    std::string target_name = get_target_name_from_file(file);
-                    if (main_files_seen.contains(target_name)) continue;
+        std::vector<DiscoveredTarget> discovered;
+
+        // Helper lambda to find a main file from a list of candidates in parallel
+        auto find_main_in_list =
+            [&](const std::vector<fs::path>& candidates) -> std::optional<DiscoveredTarget> {
+
+            if (candidates.empty()) return std::nullopt;
+
+            std::vector<std::future<bool>> futures;
+            futures.reserve(candidates.size());
+            for (const auto& candidate : candidates) {
+                futures.push_back(std::async(std::launch::async, &TargetDiscovery::has_main_function, candidate));
+            }
+
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                if (futures[i].get()) { // Blocks until this future is ready
+                    const auto& main_file = candidates[i];
                     DiscoveredTarget target;
-                    target.main_file = file;
-                    target.suggested_name = target_name;
-                    target.suggested_sources = suggest_sources_for_target(file, all_source_files);
+                    target.main_file = main_file;
+                    target.suggested_name = get_target_name_from_file(main_file);
                     target.reason = "contains main() function";
-                    discovered.push_back(target);
-                    main_files_seen.insert(target_name);
-                    dirs_with_main.insert(dir);
-                    // Only add the first preferred main
-                    break;
+                    target.suggested_sources.push_back(main_file);
+                    target.suggested_sources.insert(target.suggested_sources.end(), library_files.begin(), library_files.end());
+                    return target;
                 }
             }
+            return std::nullopt;
         };
 
-        // Try preferred mains first, then fallback
-        try_main_candidates(preferred_mains);
-        if (discovered.empty()) try_main_candidates(fallback_mains);
+        // --- Phase 2: Look for a main() function in preferred directories (in parallel) ---
+        if (auto target = find_main_in_list(preferred_mains_candidates)) {
+            discovered.push_back(*target);
+        }
 
-        // Strategy 2: Look for test files if no main found
+        // --- Phase 3: If nothing found, check fallback directories (in parallel) ---
         if (discovered.empty()) {
-            for (const auto& file : all_source_files) {
-                std::string filename = file.filename().string();
-                if (std::string dir = file.parent_path().string(); dirs_with_main.contains(dir)) continue;
-                if (filename.starts_with("test") && !discovered_has_test_target(discovered)) {
-                    DiscoveredTarget target;
-                    target.main_file = file;
-                    target.suggested_name = "test";
-                    target.suggested_sources = suggest_sources_for_target(file, all_source_files);
-                    target.reason = "test file pattern";
-                    discovered.push_back(target);
-                }
+            if (auto target = find_main_in_list(fallback_mains_candidates)) {
+                discovered.push_back(*target);
             }
         }
 
-        // Fallback: If nothing found, suggest the first .cpp file as main
-        if (discovered.empty() && !all_source_files.empty()) {
-            auto cpp_file = std::ranges::find_if(all_source_files,
-                                                 [](const fs::path& p) {
-                                                     const std::string ext = p.extension().string();
-                                                     return ext == ".cpp" || ext == ".cc" || ext == ".cxx";
-                                                 });
-
-            if (cpp_file != all_source_files.end()) {
-                DiscoveredTarget target;
-                target.main_file = *cpp_file;
-                target.suggested_name = "main";
-                target.suggested_sources = all_source_files;
-                target.reason = "fallback - first C++ file";
-                discovered.push_back(target);
-            }
+        // --- Phase 4: If no main executable found, look for a test target ---
+        if (discovered.empty() && !test_files.empty()) {
+            DiscoveredTarget target;
+            // The first test file found becomes the 'main' for the test suite
+            target.main_file = test_files[0];
+            target.suggested_name = "test";
+            // Per original logic, test targets only link against other test files
+            target.suggested_sources = test_files;
+            target.reason = "test file pattern";
+            discovered.push_back(target);
         }
 
-        // Remove duplicate targets (by main_file)
-        std::unordered_set<std::string> seen_main_files;
-        std::vector<DiscoveredTarget> unique_discovered;
-        for (const auto& t : discovered) {
-            if (std::string main_file_str = t.main_file.string(); !seen_main_files.contains(main_file_str)) {
-                unique_discovered.push_back(t);
-                seen_main_files.insert(main_file_str);
-            }
+        // --- Phase 5: Fallback - if nothing found, suggest the first C++ file ---
+        if (discovered.empty() && !first_cpp_file.empty()) {
+            DiscoveredTarget target;
+            target.main_file = first_cpp_file;
+            target.suggested_name = "main";
+            // Fallback includes all sources as it's a best-guess effort
+            target.suggested_sources = all_source_files;
+            target.reason = "fallback - first C++ file";
+            discovered.push_back(target);
         }
 
-        return unique_discovered;
+        // The simplified logic ensures only one target is discovered, so no de-duplication is needed.
+        return discovered;
     }
 
 private:
+    // This I/O-bound function is now called in parallel.
     static bool has_main_function(const fs::path& file) {
         std::ifstream stream(file);
         if (!stream.is_open()) return false;
 
-        // Read line by line to avoid loading entire file
-        std::string line;
-        // More robust pattern that handles different main signatures
-        const std::regex main_regex(R"(^\s*int\s+main\s*\([^)]*\)\s*(?:\{|$))");
-        while (std::getline(stream, line)) {
-            if (std::regex_search(line, main_regex)) {
-                return true;
-            }
-        }
-        return false;
+        const std::string content((std::istreambuf_iterator(stream)),
+                           std::istreambuf_iterator<char>());
+
+        // Simple regex to find "int main(" with flexible spacing.
+        const std::regex main_pattern(R"(\bint\s+main\s*\()");
+        return std::regex_search(content, main_pattern);
     }
 
+    // This helper function is unchanged.
     static std::string get_target_name_from_file(const fs::path& file) {
         std::string filename = file.stem().string(); // filename without extension
 
@@ -251,41 +257,8 @@ private:
         return filename;
     }
 
-    static std::vector<fs::path> suggest_sources_for_target(const fs::path& main_file,
-                                                           const std::vector<fs::path>& all_files) {
-        std::vector<fs::path> suggested;
-        suggested.push_back(main_file); // Always include the main file
-
-        // If it's a test target, include other test files
-        if (const std::string main_filename = main_file.filename().string(); main_filename.starts_with("test") || main_filename.find("test") != std::string::npos) {
-            for (const auto& file : all_files) {
-                if (file == main_file) continue;
-                if (std::string filename = file.filename().string(); filename.find("test") != std::string::npos) {
-                    suggested.push_back(file);
-                }
-            }
-        } else {
-            // For main targets, include all non-test files
-            for (const auto& file : all_files) {
-                if (file == main_file) continue;
-                std::string filename = file.filename().string();
-                // Skip obvious test files and other main files
-                if (filename.find("test") != std::string::npos) continue;
-                if (filename == "main.cpp" || filename == "main.c" || filename == "main.cc") {
-                    if (file != main_file) continue; // Skip other main files
-                }
-                suggested.push_back(file);
-            }
-        }
-
-        return suggested;
-    }
-
-    static bool discovered_has_test_target(const std::vector<DiscoveredTarget>& discovered) {
-        return std::ranges::any_of(discovered,
-                                   [](const DiscoveredTarget& t) { return t.suggested_name == "test"; });
-    }
 };
+
 #ifdef USE_TUI
 class SourceEditor {
 public:
@@ -299,9 +272,11 @@ public:
         std::vector<std::string> base_entries;
         for (const auto& p : all_project_sources) {
             std::string relative_path = fs::relative(p).string();
-            // Ensure path starts with ./ for consistency
+            // Ensure a path starts with ./ for consistency
             if (!relative_path.starts_with("./") && !relative_path.starts_with("../")) {
-                relative_path = "./" + relative_path;
+                std::filesystem::path root{"./"};
+                root /= relative_path;
+                relative_path = root.string();
             }
             base_entries.push_back(relative_path);
         }
@@ -324,7 +299,9 @@ public:
         for (const auto& source : target.sources) {
             std::string normalized_source = source;
             if (!normalized_source.starts_with("./") && !normalized_source.starts_with("../")) {
-                normalized_source = "./" + normalized_source;
+                std::filesystem::path root{"./"};
+                root /= normalized_source;
+                normalized_source = root.string();
             }
             if (normalized_source != main_file_normalized) {
                 initial_selection.insert(normalized_source);
@@ -333,7 +310,7 @@ public:
 
         for (size_t i = 0; i < base_entries.size(); ++i) {
             if (initial_selection.contains(base_entries[i])) {
-                states[i] = 1; // 1 means checked
+                states[i] = 1; // 1 mean checked
             }
         }
 
@@ -388,7 +365,7 @@ public:
             }) | border;
         });
 
-        // Layout the components
+        // Lay out the components
         const auto layout = Container::Vertical({
             title_renderer,
             instructions_renderer,
@@ -422,30 +399,31 @@ public:
 #endif
 
 std::string hash_file(const fs::path& path) {
-    constexpr size_t buffer_size = 65536;
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) return "";
+
+    struct stat sb{};
+    if (fstat(fd, &sb) == -1) {
+        close(fd);
         return "";
     }
 
-    std::vector<char> buffer(buffer_size);
-    XXH64_state_t* const state = XXH64_createState();
-    if (!state) return "";  // Check allocation
-
-    // Use RAII wrapper
-    auto state_deleter = [](XXH64_state_t* s) { XXH64_freeState(s); };
-    std::unique_ptr<XXH64_state_t, decltype(state_deleter)> state_guard(state, state_deleter);
-
-    XXH64_reset(state, 0);
-
-    while (file.read(buffer.data(), buffer_size)) {
-        XXH64_update(state, buffer.data(), file.gcount());
-    }
-    if (file.gcount() > 0) {
-        XXH64_update(state, buffer.data(), file.gcount());
+    if (sb.st_size == 0) {
+        close(fd);
+        return "ef46db3751d8e999"; // XXH64 of empty data
     }
 
-    XXH64_hash_t const hash_val = XXH64_digest(state);
+    void* mapped = mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        close(fd);
+        return "";
+    }
+
+    XXH64_hash_t hash_val = XXH64(mapped, sb.st_size, 0);
+
+    munmap(mapped, sb.st_size);
+    close(fd);
+
     return fmt::format("{:016x}", hash_val);
 }
 
@@ -711,163 +689,322 @@ class LibraryDetector {
         std::vector<std::string> direct_libs;
         std::vector<std::string> pkg_configs;
     };
+
+    // Optimized data structures
     std::unordered_map<std::string, DetectionRule> detectionMap;
     std::unordered_map<std::string, std::string> pkg_cache;
+    mutable std::shared_mutex cache_mutex;
+
+    // Pre-computed optimization structures
+    std::vector<std::pair<std::string, const DetectionRule*>> sorted_rules;
+    bool rules_sorted = false;
+
     void load_rules_from_file(const fs::path& db_path) {
         if (!fs::exists(db_path)) {
             out::warn("Library database '{}' not found. Attempting to download...", db_path);
-            if (!Fetcher::download_file(BASE_DB_URL, db_path)) {
+            if (!download_and_parse(db_path)) {
                 out::error("Failed to download library database. Library detection will be limited.");
                 return;
             }
+        } else {
+            if (!parse_database(db_path)) {
+                // Try re-downloading if parsing fails
+                out::warn("Failed to parse existing database. Attempting to re-download...");
+                try {
+                    fs::remove(db_path);
+                } catch (const fs::filesystem_error&) {}
+
+                if (!download_and_parse(db_path)) {
+                    out::error("Failed to re-download library database. Library detection will be limited.");
+                }
+            }
         }
+
+        // Pre-sort rules by header length (longest first) for better matching
+        optimize_rules();
+    }
+
+    bool download_and_parse(const fs::path& db_path) {
+        if (!Fetcher::download_file(BASE_DB_URL, db_path)) {
+            return false;
+        }
+        return parse_database(db_path);
+    }
+
+    bool parse_database(const fs::path& db_path) {
         try {
             std::ifstream f(db_path);
             if (!f.is_open()) {
-                out::error("Failed to open library database '{}'. Library detection will be limited.", db_path);
-                return;
+                out::error("Failed to open library database '{}'.", db_path);
+                return false;
             }
+
             json data = json::parse(f);
             if (!data.contains("libraries") || !data["libraries"].is_object()) {
                 out::error("Invalid database format: missing 'libraries' object");
-                return;
+                return false;
             }
 
+            detectionMap.clear();
+            detectionMap.reserve(data["libraries"].size());
+
             for (auto& [header, rule_json] : data["libraries"].items()) {
-                if (!rule_json.is_object()) continue; // Skip invalid entries
+                if (!rule_json.is_object()) continue;
 
                 DetectionRule rule;
                 if (rule_json.contains("direct_libs") && rule_json["direct_libs"].is_array()) {
-                    rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                    auto libs = rule_json["direct_libs"].get<std::vector<std::string>>();
+                    rule.direct_libs.reserve(libs.size());
+                    rule.direct_libs = std::move(libs);
                 }
                 if (rule_json.contains("pkg_configs") && rule_json["pkg_configs"].is_array()) {
-                    rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                    auto pkgs = rule_json["pkg_configs"].get<std::vector<std::string>>();
+                    rule.pkg_configs.reserve(pkgs.size());
+                    rule.pkg_configs = std::move(pkgs);
                 }
-                detectionMap[header] = rule;
+                detectionMap[header] = std::move(rule);
             }
+
             out::info("Loaded {} library detection rules.", detectionMap.size());
+            return true;
+
         } catch (const json::parse_error& e) {
-            out::error("Failed to parse library database '{}': {}. Attempting to re-download and parse.", db_path, e.what());
-            try {
-                fs::remove(db_path); // Remove corrupt file
-            } catch (const fs::filesystem_error& fs_error) {
-                out::error("Failed to remove corrupt database file '{}': {}", db_path, fs_error.what());
-            }
-            if (Fetcher::download_file(BASE_DB_URL, db_path)) {
-                // Try parsing again after a successful download
-                try {
-                    std::ifstream f(db_path);
-                    if (!f.is_open()) {
-                        out::error("Failed to open re-downloaded library database '{}'. Library detection will be limited.", db_path);
-                        return;
-                    }
-                    json data = json::parse(f);
-                    if (!data.contains("libraries") || !data["libraries"].is_object()) {
-                        out::error("Invalid database format: missing 'libraries' object");
-                        return;
-                    }
-
-                    for (auto& [header, rule_json] : data["libraries"].items()) {
-                        if (!rule_json.is_object()) continue; // Skip invalid entries
-
-                        DetectionRule rule;
-                        if (rule_json.contains("direct_libs") && rule_json["direct_libs"].is_array()) {
-                            rule.direct_libs = rule_json["direct_libs"].get<std::vector<std::string>>();
-                        }
-                        if (rule_json.contains("pkg_configs") && rule_json["pkg_configs"].is_array()) {
-                            rule.pkg_configs = rule_json["pkg_configs"].get<std::vector<std::string>>();
-                        }
-                        detectionMap[header] = rule;
-                    }
-                    out::info("Successfully re-downloaded and loaded {} library detection rules.", detectionMap.size());
-                } catch (const json::parse_error& e2) {
-                    out::error("Failed to parse re-downloaded library database '{}': {}. Library detection will be limited.", db_path, e2.what());
-                }
-            } else {
-                out::error("Failed to re-download library database. Library detection will be limited.");
-            }
+            out::error("Failed to parse library database '{}': {}", db_path, e.what());
+            return false;
         }
     }
+
+    void optimize_rules() {
+        sorted_rules.clear();
+        sorted_rules.reserve(detectionMap.size());
+
+        for (const auto& [header, rule] : detectionMap) {
+            sorted_rules.emplace_back(header, &rule);
+        }
+
+        // Sort by header length (longest first) for better matching efficiency
+        std::ranges::sort(sorted_rules,
+                          [](const auto& a, const auto& b) {
+                              return a.first.length() > b.first.length();
+                          });
+
+        rules_sorted = true;
+    }
+
 public:
-    LibraryDetector() { load_rules_from_file(DB_FILE_NAME); }
+    LibraryDetector() {
+        load_rules_from_file(DB_FILE_NAME);
+    }
+
     void detect(const std::vector<std::string>& includes, Target& target) {
-        std::vector collected_libs(target.external_libs.begin(), target.external_libs.end());
-        std::vector<std::string> processed_pkg_configs;
-        std::string additional_cflags;
-        std::string additional_ldflags;
+        if (!rules_sorted) optimize_rules();
 
+        // Use sets for O(1) duplicate detection
+        std::unordered_set collected_libs_set(target.external_libs.begin(), target.external_libs.end());
+        std::unordered_set<std::string> processed_pkg_configs;
+        std::unordered_set<std::string> matched_headers; // Avoid it if it is re-processing same headers
+
+        // Pre-allocate result containers
+        std::vector<std::string> pkg_configs_to_process;
+        pkg_configs_to_process.reserve(includes.size());
+
+        // First pass: collect all matches without executing pkg-config
         for (const auto& include : includes) {
-            for (const auto& [header_signature, rule] : detectionMap) {
+            if (matched_headers.contains(include)) continue;
+
+            for (const auto& [header_signature, rule_ptr] : sorted_rules) {
                 if (include.find(header_signature) != std::string::npos) {
-                    // Add direct libraries, ensuring no duplicates
-                    for (const auto& lib : rule.direct_libs) {
-                        if (std::ranges::find(collected_libs, lib) == collected_libs.end()) {
-                            collected_libs.emplace_back(lib);
-                        }
+                    matched_headers.insert(include);
+
+                    // Add direct libraries
+                    for (const auto& lib : rule_ptr->direct_libs) {
+                        collected_libs_set.insert(lib);
                     }
 
-                    // Process pkg-config
-                    for (const auto& pkg_name : rule.pkg_configs) {
-                        if (std::ranges::find(processed_pkg_configs, pkg_name) != processed_pkg_configs.end()) continue;
-
-                        if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
-                            // Parse pkg-config output and separate flags properly
-                            parsePkgConfigOutput(pkg_result, collected_libs, additional_cflags, additional_ldflags);
-                            out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
-                        } else {
-                            out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
+                    // Collect unique pkg-configs for batch processing
+                    for (const auto& pkg_name : rule_ptr->pkg_configs) {
+                        if (!processed_pkg_configs.contains(pkg_name)) {
+                            pkg_configs_to_process.push_back(pkg_name);
+                            processed_pkg_configs.insert(pkg_name);
                         }
-                        processed_pkg_configs.emplace_back(pkg_name);
                     }
+                    break; // Stop at the first match for this include
                 }
             }
         }
 
-        target.external_libs = collected_libs;
-
-        // Add compile flags to both cflags and cxxflags
-        if (!additional_cflags.empty()) {
-            if (target.cxxflags) *target.cxxflags += " " + additional_cflags; else target.cxxflags = additional_cflags;
-            if (target.cflags) *target.cflags += " " + additional_cflags; else target.cflags = additional_cflags;
+        // Second pass: batch process pkg-config calls
+        if (!pkg_configs_to_process.empty()) {
+            processPkgConfigs(pkg_configs_to_process, collected_libs_set, target);
         }
 
-        // Add linker flags to ldflags
-        if (!additional_ldflags.empty()) {
-            if (target.ldflags) *target.ldflags += " " + additional_ldflags; else target.ldflags = additional_ldflags;
-        }
+        // Convert set back to vector efficiently
+        target.external_libs.clear();
+        target.external_libs.reserve(collected_libs_set.size());
+        target.external_libs.assign(collected_libs_set.begin(), collected_libs_set.end());
     }
 
 private:
-    // Parses the output of `pkg-config --cflags --libs`, separating flags into categories.
-    static void parsePkgConfigOutput(const std::string& pkg_output, std::vector<std::string>& collected_libs, std::string& cflags, std::string& ldflags) {
+    void processPkgConfigs(const std::vector<std::string>& pkg_configs,
+                          std::unordered_set<std::string>& collected_libs_set,
+                          Target& target) {
+
+        const size_t num_threads = std::min(pkg_configs.size(),
+                                           static_cast<size_t>(std::thread::hardware_concurrency()));
+
+        if (num_threads <= 1 || pkg_configs.size() < 3) {
+            // Single-threaded for small workloads
+            for (const auto& pkg_name : pkg_configs) {
+                processSinglePkgConfig(pkg_name, collected_libs_set, target);
+            }
+            return;
+        }
+
+        std::vector<std::thread> threads;
+        std::atomic<size_t> next_pkg_index{0};
+
+        // Thread-local storage for results
+        struct ThreadResults {
+            std::unordered_set<std::string> libs;
+            std::string cflags;
+            std::string ldflags;
+        };
+
+        std::vector<ThreadResults> thread_results(num_threads);
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&, t] {
+                size_t pkg_index;
+                auto&[libs, cflags, ldflags] = thread_results[t];
+
+                while ((pkg_index = next_pkg_index.fetch_add(1)) < pkg_configs.size()) {
+                    const auto& pkg_name = pkg_configs[pkg_index];
+
+                    if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
+                        parsePkgConfigOutput(pkg_result, libs, cflags, ldflags);
+                    #ifdef VERBOSE
+                        out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
+                    #endif
+                    } else {
+                    #ifdef VERBOSE
+                        out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
+                    #endif
+                    }
+                }
+            });
+        }
+
+        // Wait for all threads to complete
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        // Merge results from all threads
+        std::string combined_cflags, combined_ldflags;
+        for (const auto&[libs, cflags, ldflags] : thread_results) {
+            collected_libs_set.insert(libs.begin(), libs.end());
+            if (!cflags.empty()) {
+                combined_cflags += cflags + " ";
+            }
+            if (!ldflags.empty()) {
+                combined_ldflags += ldflags + " ";
+            }
+        }
+
+        // Apply combined flags to the target
+        if (!combined_cflags.empty()) {
+            combined_cflags.pop_back(); // Remove trailing space
+            if (target.cxxflags) *target.cxxflags += " " + combined_cflags;
+            else target.cxxflags = combined_cflags;
+            if (target.cflags) *target.cflags += " " + combined_cflags;
+            else target.cflags = combined_cflags;
+        }
+
+        if (!combined_ldflags.empty()) {
+            combined_ldflags.pop_back(); // Remove trailing space
+            if (target.ldflags) *target.ldflags += " " + combined_ldflags;
+            else target.ldflags = combined_ldflags;
+        }
+    }
+
+    void processSinglePkgConfig(const std::string& pkg_name,
+                               std::unordered_set<std::string>& collected_libs_set,
+                               Target& target) {
+        if (const auto pkg_result = getPkgConfigFlags(pkg_name); !pkg_result.empty()) {
+            std::unordered_set<std::string> local_libs;
+            std::string additional_cflags, additional_ldflags;
+
+            parsePkgConfigOutput(pkg_result, local_libs, additional_cflags, additional_ldflags);
+            collected_libs_set.insert(local_libs.begin(), local_libs.end());
+
+            // Apply flags immediately for a single-threaded case
+            if (!additional_cflags.empty()) {
+                if (target.cxxflags) *target.cxxflags += " " + additional_cflags;
+                else target.cxxflags = additional_cflags;
+                if (target.cflags) *target.cflags += " " + additional_cflags;
+                else target.cflags = additional_cflags;
+            }
+
+            if (!additional_ldflags.empty()) {
+                if (target.ldflags) *target.ldflags += " " + additional_ldflags;
+                else target.ldflags = additional_ldflags;
+            }
+        #ifdef VERBOSE
+            out::info("Found dependency '{}', adding flags via pkg-config.", pkg_name);
+        #endif
+        } else {
+        #ifdef VERBOSE
+            out::warn("Found include for '{}' but 'pkg-config {}' failed. Is it installed?", pkg_name, pkg_name);
+        #endif
+        }
+    }
+
+    // Optimized version using sets instead of vectors for O(1) duplicate detection
+    static void parsePkgConfigOutput(const std::string& pkg_output,
+                                   std::unordered_set<std::string>& collected_libs,
+                                   std::string& cflags,
+                                   std::string& ldflags) {
         std::istringstream iss(pkg_output);
         std::string token;
 
+        // Pre-allocate string space to reduce reallocations
+        cflags.reserve(pkg_output.length() / 2);
+        ldflags.reserve(pkg_output.length() / 2);
+
         while (iss >> token) {
-            // Library link flags (e.g., -lfoo, -lbar)
             if (token.starts_with("-l")) {
-                if (std::ranges::find(collected_libs, token) == collected_libs.end()) {
-                    collected_libs.push_back(token);
-                }
-            // Other linker-specific flags (e.g., -L/path, -Wl,-rpath,...)
+                collected_libs.insert(token);
             } else if (token.starts_with("-L") || token.starts_with("-Wl,") ||
-                token.starts_with("-T") ||
-                token.starts_with("--dynamic-linker") ||
-                token.starts_with("-rpath")) {
-                ldflags += " " + token;
-            // Everything else is assumed to be a compiler flag (e.g., -I, -D, -pthread, -fPIC)
+                      token.starts_with("-T") || token.starts_with("--dynamic-linker") ||
+                      token.starts_with("-rpath")) {
+                if (!ldflags.empty()) ldflags += " ";
+                ldflags += token;
             } else {
-                cflags += " " + token;
+                if (!cflags.empty()) cflags += " ";
+                cflags += token;
             }
         }
     }
 
     std::string getPkgConfigFlags(const std::string& package) {
-        if (pkg_cache.contains(package)) return pkg_cache[package];
+        // Thread-safe cache access
+        {
+            std::shared_lock lock(cache_mutex);
+            if (const auto it = pkg_cache.find(package); it != pkg_cache.end()) {
+                return it->second;
+            }
+        }
+
         const std::string cmd = fmt::format("pkg-config --libs --cflags {}", package);
         auto [exit_code, stdout_output, stderr_output] = execute(cmd);
 
-        if (exit_code != 0) {
+        std::string result;
+        if (exit_code == 0) {
+            result = std::move(stdout_output);
+            if (!result.empty() && result.back() == '\n') {
+                result.pop_back();
+            }
+        } else {
             if (stderr_output.find("not found") != std::string::npos) {
                 out::warn("pkg-config for '{}' failed: Package not found. Is it installed?", package);
             } else if (!stderr_output.empty()) {
@@ -875,89 +1012,185 @@ private:
             } else {
                 out::warn("pkg-config for '{}' failed with unknown error.", package);
             }
-            return "";
         }
 
-        std::string stdout_result = stdout_output;
-        if (!stdout_result.empty() && stdout_result.back() == '\n') stdout_result.pop_back();
-        return pkg_cache[package] = stdout_result;
+        // Thread-safe cache update
+        {
+            std::unique_lock lock(cache_mutex);
+            pkg_cache[package] = result;
+        }
+
+        return result;
     }
 };
 
 class IncludeParser {
     std::regex include_regex{R"_(\s*#\s*include\s*(?:<([^>]+)>|"([^"]+)"))_"};
+
+    // Cache for file contents and header paths
+    mutable std::unordered_map<fs::path, std::vector<std::string>> file_cache;
+    mutable std::unordered_map<std::string, fs::path> header_path_cache;
+    mutable std::shared_mutex cache_mutex;
+
+    // Read a file once and cache the lines
+    std::vector<std::string> getFileLines(const fs::path& file_path) const {
+        {
+            std::shared_lock lock(cache_mutex);
+            if (auto it = file_cache.find(file_path); it != file_cache.end()) {
+                return it->second;
+            }
+        }
+
+        std::vector<std::string> lines;
+        if (std::ifstream file_stream(file_path); file_stream.is_open()) {
+            std::string line;
+            lines.reserve(1000); // Reserve some space to avoid reallocations
+            while (std::getline(file_stream, line)) {
+                lines.push_back(std::move(line));
+            }
+        }
+
+        {
+            std::unique_lock lock(cache_mutex);
+            file_cache[file_path] = lines;
+        }
+        return lines;
+    }
+
     static fs::path findHeader(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) {
         fs::path potential_path = relative_to / header_name;
         if (fs::exists(potential_path)) return fs::canonical(potential_path);
         for (const auto& dir_flag : include_dirs) {
-            // Handle both bare paths and -I flags for convenience
+            // Handle both bare paths and -I flag for convenience
             fs::path base_dir = dir_flag.starts_with("-I") ? dir_flag.substr(2) : dir_flag;
             potential_path = base_dir / header_name;
             if (fs::exists(potential_path)) return fs::canonical(potential_path);
         }
         return {};
     }
+
+    fs::path findHeaderCached(const std::string& header_name, const fs::path& relative_to, const std::vector<std::string>& include_dirs) const {
+        const std::string cache_key = header_name + "|" + relative_to.string();
+
+        {
+            std::shared_lock lock(cache_mutex);
+            if (const auto it = header_path_cache.find(cache_key); it != header_path_cache.end()) {
+                return it->second;
+            }
+        }
+
+        fs::path result = findHeader(header_name, relative_to, include_dirs);
+
+        {
+            std::unique_lock lock(cache_mutex);
+            header_path_cache[cache_key] = result;
+        }
+        return result;
+    }
+
+    // Extract includes from cached file lines
+    std::vector<std::pair<std::string, bool>> extractIncludes(const std::vector<std::string>& lines) const {
+        std::vector<std::pair<std::string, bool>> includes;
+        includes.reserve(lines.size() / 10); // Estimate
+
+        for (const auto& line : lines) {
+            if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
+                if (matches[1].matched) {
+                    includes.emplace_back(matches[1].str(), false); // system include
+                } else if (matches[2].matched) {
+                    includes.emplace_back(matches[2].str(), true);  // locally include
+                }
+            }
+        }
+        return includes;
+    }
+
 public:
     [[nodiscard]] DependencyMap parseSourceDependencies(const std::vector<fs::path>& sourceFiles, const std::vector<std::string>& include_dirs) const {
         DependencyMap dep_map;
-        for (const auto& src_file : sourceFiles) {
-            std::unordered_set<fs::path> dependencies;
-            std::vector files_to_scan = {src_file};
-            std::unordered_set<fs::path> scanned_files;
-            while (!files_to_scan.empty()) {
-                fs::path current_file = files_to_scan.back();
-                files_to_scan.pop_back();
-                if (scanned_files.contains(current_file)) continue;
-                scanned_files.insert(current_file);
-                std::ifstream file_stream(current_file);
-                if (!file_stream.is_open()) {
-                    out::warn("Could not open file for dependency parsing: {}", current_file);
-                    continue;
+        const size_t num_threads = std::min(sourceFiles.size(), static_cast<size_t>(std::thread::hardware_concurrency()));
+
+        if (num_threads <= 1 || sourceFiles.size() < 4) {
+            // Single-threaded for small workloads or single-core systems
+            for (const auto& src_file : sourceFiles) {
+                dep_map[src_file] = parseSingleFileDependencies(src_file, include_dirs);
+            }
+            return dep_map;
+        }
+
+        // Multithreaded processing
+        std::mutex dep_map_mutex;
+        std::vector<std::thread> threads;
+        std::atomic<size_t> next_file_index{0};
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&] {
+                size_t file_index;
+                while ((file_index = next_file_index.fetch_add(1)) < sourceFiles.size()) {
+                    const auto& src_file = sourceFiles[file_index];
+                    auto dependencies = parseSingleFileDependencies(src_file, include_dirs);
+
+                    std::lock_guard lock(dep_map_mutex);
+                    dep_map[src_file] = std::move(dependencies);
                 }
-                std::string line;
-                while (std::getline(file_stream, line)) {
-                    if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
-                        if (matches[2].matched) { // Only track local "..." includes for rebuild dependency
-                            const auto& header_name = matches[2].str();
-                            if (fs::path header_path = findHeader(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
-                                dependencies.insert(header_path);
-                                files_to_scan.push_back(header_path);
-                            }
-                        }
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        return dep_map;
+    }
+
+private:
+    std::unordered_set<fs::path> parseSingleFileDependencies(const fs::path& src_file, const std::vector<std::string>& include_dirs) const {
+        std::unordered_set<fs::path> dependencies;
+        std::vector files_to_scan = {src_file};
+        std::unordered_set<fs::path> scanned_files;
+
+        while (!files_to_scan.empty()) {
+            fs::path current_file = files_to_scan.back();
+            files_to_scan.pop_back();
+
+            if (scanned_files.contains(current_file)) continue;
+            scanned_files.insert(current_file);
+
+            auto lines = getFileLines(current_file);
+            if (lines.empty()) {
+                out::warn("Could not open file for dependency parsing: {}", current_file);
+                continue;
+            }
+
+            for (auto includes = extractIncludes(lines); const auto& [header_name, is_local] : includes) {
+                if (is_local) {
+                    if (fs::path header_path = findHeaderCached(header_name, current_file.parent_path(), include_dirs); !header_path.empty()) {
+                        dependencies.insert(header_path);
+                        files_to_scan.push_back(header_path);
                     }
                 }
             }
-            dep_map[src_file] = dependencies;
         }
-        return dep_map;
+
+        return dependencies;
     }
+
+public:
     [[nodiscard]] std::vector<std::string> getAllProjectIncludes(const std::vector<fs::path> &sourceFiles,
                                                                  const std::unordered_set<std::string> &ignored_dirs) const {
         std::unordered_set<std::string> unique_includes;
         std::unordered_set<fs::path> scanned_files;
 
-        // First, get all includes from all source and header files
-        auto scan_file_for_all_includes = [&](const fs::path& file_path) {
-            if (scanned_files.contains(file_path)) return;
-            scanned_files.insert(file_path);
+        // Collect all files to scan first
+        std::vector<fs::path> all_files;
+        all_files.reserve(sourceFiles.size() + 1000); // Reserve space for headers too
 
-            std::ifstream file_stream(file_path);
-            if (!file_stream.is_open()) return;
-
-            std::string line;
-            while(std::getline(file_stream, line)) {
-                if (std::smatch matches; std::regex_search(line, matches, include_regex)) {
-                    unique_includes.insert(matches[1].matched ? matches[1].str() : matches[2].str());
-                }
-            }
-        };
-
-        // Scan all source files provided
+        // Add source files
         for (const auto& src : sourceFiles) {
-            scan_file_for_all_includes(src);
+            all_files.push_back(src);
         }
 
-        // Scan all header files in the project directory
+        // Add header files in the project directory
         for (const auto& entry : fs::recursive_directory_iterator(".", fs::directory_options::skip_permission_denied)) {
             bool is_in_ignored_dir = false;
             for (const auto& part : entry.path()) {
@@ -969,16 +1202,57 @@ public:
             if (is_in_ignored_dir) continue;
 
             if (entry.is_regular_file()) {
-                if (const std::string ext = entry.path().extension().string(); ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
-                    scan_file_for_all_includes(entry.path());
+                if (const std::string ext = entry.path().extension().string();
+                    ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
+                    all_files.push_back(entry.path());
                 }
+            }
+        }
+
+        // Process files in parallel
+
+        if (const size_t num_threads = std::min(all_files.size(), static_cast<size_t>(std::thread::hardware_concurrency())); num_threads <= 1 || all_files.size() < 10) {
+            // Single-threaded for small workloads
+            for (const auto& file_path : all_files) {
+                auto lines = getFileLines(file_path);
+                for (auto includes = extractIncludes(lines); const auto &include: includes | std::views::keys) {
+                    unique_includes.insert(include);
+                }
+            }
+        } else {
+            std::mutex includes_mutex;
+            // Multithreaded processing
+            std::vector<std::thread> threads;
+            std::atomic<size_t> next_file_index{0};
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                threads.emplace_back([&] {
+                    std::unordered_set<std::string> local_includes;
+                    size_t file_index;
+
+                    while ((file_index = next_file_index.fetch_add(1)) < all_files.size()) {
+                        const auto& file_path = all_files[file_index];
+                        auto lines = getFileLines(file_path);
+
+                        for (auto includes = extractIncludes(lines); const auto &include: includes | std::views::keys) {
+                            local_includes.insert(include);
+                        }
+                    }
+
+                    // Merge local results into a global set
+                    std::lock_guard lock(includes_mutex);
+                    unique_includes.insert(local_includes.begin(), local_includes.end());
+                });
+            }
+
+            for (auto& thread : threads) {
+                thread.join();
             }
         }
 
         return {unique_includes.begin(), unique_includes.end()};
     }
 };
-
 
 class AutoCC {
 public:
@@ -994,27 +1268,20 @@ public:
     }
 
     void scanLocalHeaders() {
-        std::set<fs::path> header_dirs;
         const auto ignored_dirs_set = getIgnoredDirs();
+
+        // Use thread-safe containers for parallel processing
+        std::vector<fs::path> all_entries;
+        std::unordered_set<fs::path> header_dirs_set; // Use set for O(1) deduplication
+
+        // First pass: collect all filesystem entries in a single traversal
         try {
+            all_entries.reserve(10000); // Pre-allocate for typical project sizes
+
             for (const auto& entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied)) {
                 try {
                     if (!entry.exists()) continue;
-
-                    bool is_in_ignored_dir = false;
-                    for (const auto& part : entry.path()) {
-                        if (ignored_dirs_set.contains(part.string())) {
-                            is_in_ignored_dir = true;
-                            break;
-                        }
-                    }
-                    if (is_in_ignored_dir) continue;
-
-                    if (entry.is_regular_file()) {
-                        if (const std::string ext = entry.path().extension().string(); ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".hh") {
-                            header_dirs.insert(fs::canonical(entry.path().parent_path()));
-                        }
-                    }
+                    all_entries.push_back(entry.path());
                 } catch (const fs::filesystem_error& e) {
                     out::warn("Skipping file due to filesystem error: {}", e.what());
                 }
@@ -1024,12 +1291,49 @@ public:
             return;
         }
 
-        std::unordered_set<std::string> final_includes;
-        for (const auto& dir : config.include_dirs) final_includes.insert(dir);
-        for (const auto& dir : header_dirs) {
-            fs::path rel = fs::relative(dir, root);
-            final_includes.insert(rel.empty() ? dir.string() : rel.string());
+        // Early exit if no files found
+        if (all_entries.empty()) {
+            return;
         }
+
+        // Pre-compute ignored directory components for faster checking
+        std::unordered_set<std::string> ignored_components;
+        for (const auto& dir : ignored_dirs_set) {
+            ignored_components.insert(dir);
+            // Also add with trailing slash variants that might appear in paths
+            ignored_components.insert(dir + "/");
+            ignored_components.insert(dir + "\\");
+        }
+
+        // Parallel processing of entries
+        const size_t num_threads = std::min(all_entries.size() / 100 + 1, // At least 100 files per thread
+                                           static_cast<size_t>(std::thread::hardware_concurrency()));
+
+        processEntries(all_entries, ignored_components, header_dirs_set, num_threads);
+
+        // Efficiently merge with existing include directories
+        std::unordered_set<std::string> final_includes;
+        final_includes.reserve(config.include_dirs.size() + header_dirs_set.size());
+
+        // Add existing config include dirs
+        for (const auto& dir : config.include_dirs) {
+            final_includes.insert(dir);
+        }
+
+        // Add discovered header directories
+        for (const auto& dir : header_dirs_set) {
+            try {
+                fs::path rel = fs::relative(dir, root);
+                final_includes.insert(rel.empty() ? dir.string() : rel.string());
+            } catch (const fs::filesystem_error&) {
+                // Fallback to absolute path if relative fails
+                final_includes.insert(dir.string());
+            }
+        }
+
+        // Assign results efficiently
+        config.include_dirs.clear();
+        config.include_dirs.reserve(final_includes.size());
         config.include_dirs.assign(final_includes.begin(), final_includes.end());
     }
 
@@ -1117,28 +1421,42 @@ public:
         : config(std::move(cfg)), should_auto_detect(auto_detect) {
 
         const auto ignored_dirs = getIgnoredDirs();
+        out::info("Getting ignored directories...");
+
+        // Timer for find_source_files()
+        const auto find_files_start = std::chrono::high_resolution_clock::now();
+        out::info("Finding source files...");
         source_files = find_source_files(root, ignored_dirs, config.exclude_patterns);
+        const auto find_files_end = std::chrono::high_resolution_clock::now();
+        out::success("Sources found. -- {} us",
+                  std::chrono::duration_cast<std::chrono::microseconds>(find_files_end - find_files_start).count());
 
         if (should_auto_detect) {
             out::info("Running auto-detection for headers and libraries...");
+
+            const auto scan_headers_start = std::chrono::high_resolution_clock::now();
+            out::info("Scanning headers...");
             scanLocalHeaders();
+            const auto scan_headers_end = std::chrono::high_resolution_clock::now();
+            out::success("Header scan complete -- {} us",
+                      std::chrono::duration_cast<std::chrono::microseconds>(scan_headers_end - scan_headers_start).count());
+
+            const auto detect_libs_start = std::chrono::high_resolution_clock::now();
+            out::info("Evaluating dependencies...");
             detectLibraries();
+            const auto detect_libs_end = std::chrono::high_resolution_clock::now();
+            out::success("Dependencies resolved -- {} us",
+                      std::chrono::duration_cast<std::chrono::microseconds>(detect_libs_end - detect_libs_start).count());
         }
     }
 
-    static std::optional<AutoCC> load_from_cache() {
+    static std::unique_ptr<AutoCC> load_from_cache() {
         Config config;
-
-        if (!read_config_cache_static(config)) {
-            return std::nullopt;
-        }
-
-        AutoCC instance(std::move(config), false);
-
-        if (instance.source_files.empty()) {
+        read_config_cache_static(config);
+        auto instance = std::make_unique<AutoCC>(std::move(config), true);
+        if (instance->source_files.empty()) {
             out::warn("No source files found. This may be correct for a header-only library.");
         }
-
         return instance;
     }
 
@@ -1198,7 +1516,6 @@ public:
             }
         }
     }
-
 
 
     int build(const std::string& target_name = "") {
@@ -1346,6 +1663,89 @@ public:
         return true;
     }
 private:
+    static bool isInIgnoredDirectory(const fs::path& path, const std::unordered_set<std::string>& ignored_dirs_set) {
+        const std::string path_str = path.string();
+
+        // Check if any ignored directory appears as a path component
+        for (const auto& ignored_dir : ignored_dirs_set) {
+            // Look for "/ignored_dir/" or "\ignored_dir\" or at start/end of path
+            size_t pos = 0;
+            while ((pos = path_str.find(ignored_dir, pos)) != std::string::npos) {
+                // Check if it's a complete directory component
+                const bool is_start = pos == 0 || path_str[pos - 1] == '/' || path_str[pos - 1] == '\\';
+                const bool is_end = pos + ignored_dir.length() == path_str.length() ||
+                             path_str[pos + ignored_dir.length()] == '/' ||
+                             path_str[pos + ignored_dir.length()] == '\\';
+
+                if (is_start && is_end) {
+                    return true;
+                }
+                pos += ignored_dir.length();
+            }
+        }
+        return false;
+    }
+
+    static void processEntries(const std::vector<fs::path>& entries,
+                                const std::unordered_set<std::string>& ignored_components,
+                                std::unordered_set<fs::path>& header_dirs_set,
+                                const size_t num_threads) { // for scanLocalHeaders()
+
+        std::vector<std::thread> threads;
+        std::mutex result_mutex;
+        std::atomic<size_t> next_entry_index{0};
+
+        // Pre-compile header extensions for faster comparison
+        static const std::unordered_set<std::string> header_extensions = {
+            ".h", ".hpp", ".hxx", ".hh"
+        };
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&] {
+                std::unordered_set<fs::path> local_header_dirs;
+                local_header_dirs.reserve(entries.size() / num_threads + 100);
+
+                size_t entry_index;
+                while ((entry_index = next_entry_index.fetch_add(1)) < entries.size()) {
+                    const auto& entry_path = entries[entry_index];
+
+                    try {
+                        // Fast ignored directory check using path components
+                        if (isInIgnoredDirectory(entry_path, ignored_components)) {
+                            continue;
+                        }
+
+                        // Check if it's a regular file with header extension
+                        if (fs::is_regular_file(entry_path)) {
+                            if (const std::string ext = entry_path.extension().string(); header_extensions.contains(ext)) {
+                                if (auto parent = entry_path.parent_path(); !parent.empty()) {
+                                    try {
+                                        local_header_dirs.insert(fs::canonical(parent));
+                                    } catch (const fs::filesystem_error&) {
+                                        // If canonical fails, use the original path
+                                        local_header_dirs.insert(parent);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (const fs::filesystem_error& e) {
+                        out::warn("Skipping file due to filesystem error: {}", e.what());
+                    }
+                }
+
+                // Merge local results into global set
+                if (!local_header_dirs.empty()) {
+                    std::lock_guard lock(result_mutex);
+                    header_dirs_set.insert(local_header_dirs.begin(), local_header_dirs.end());
+                }
+            });
+        }
+
+        // Wait for all threads to complete
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
 
     int build_target(const Target& target) {
         target_source_files.clear();
@@ -1645,7 +2045,7 @@ void user_init(Config& config) {
         const auto component = Renderer([&] {
             // Get terminal dimensions
             const int term_width = Terminal::Size().dimx;
-            // Create decorative header that spans full width
+            // Create a decorative header that spans full width
             auto header = vbox({
                 text("╭" + std::string(term_width - 2, '-') + "╮") | dim,
                 hbox({
@@ -1779,7 +2179,7 @@ void user_init(Config& config) {
                 filler()   // Bottom spacer
             });
 
-            // Create the window with title
+            // Create the window with a title
             return window(
                 hbox({
                     text(" ⚙ ") | bold,
@@ -1999,9 +2399,7 @@ void user_init(Config& config) {
     }));
 }
 
-#endif
-
-#ifndef USE_TUI
+#else
 
 void user_init(Config& config) {
     auto get_input = [](const std::string_view prompt, const std::string_view default_val) -> std::string {
@@ -2012,7 +2410,6 @@ void user_init(Config& config) {
         std::getline(std::cin, input);
         return input.empty() ? std::string(default_val) : input;
     };
-
     config.cc = get_input("C Compiler", config.cc);
     config.cxx = get_input("C++ Compiler", config.cxx);
     config.as = get_input("Assembler", config.as);
@@ -2029,7 +2426,7 @@ void user_init(Config& config) {
     }
 
     out::info("Discovering potential build targets...");
-    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+    const auto ignored_dirs = std::unordered_set<std::string> {".git", config.build_dir, CACHE_DIR_NAME};
     auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
     auto discovered = TargetDiscovery::discover_targets(all_sources);
 
@@ -2135,6 +2532,8 @@ void default_init(Config& config) {
         target.name = discovered_target.suggested_name;
         target.main_file = discovered_target.main_file.string();
         target.output_name = target.name;
+        target.cflags = "-std=c11";
+        target.cxxflags = "-std=c++23";
 
         out::info("  -> Using all {} suggested source files.", discovered_target.suggested_sources.size());
         for (const auto& src : discovered_target.suggested_sources) {
@@ -2172,6 +2571,7 @@ private:
     const fs::path config_toml_path_ = CONFIG_FILE_NAME;
     const fs::path cache_dir_ = CACHE_DIR_NAME;
     const fs::path base_db_path_ = DB_FILE_NAME;
+    const fs::path log_path_ = AUTOCC_LOG_FILE_NAME;
 
     int handle_build(const std::vector<std::string>& args) const;
     int handle_fetch(const std::vector<std::string>& args) const;
@@ -2286,7 +2686,7 @@ bool CLIHandler::sync_config_if_needed() const {
 
     try {
         if (fs::last_write_time(config_toml_path_) <= fs::last_write_time(cache_dir_ / CONFIG_CACHE_FILE_NAME)) {
-            return true; // Cache is up-to-date.
+            return true; // Cache is up to date.
         }
     } catch(const fs::filesystem_error& e) {
         out::warn("Could not check file modification times: {}. Assuming sync is needed.", e.what());
@@ -2306,7 +2706,7 @@ int CLIHandler::handle_build(const std::vector<std::string>& args) const {
         return 1;
     }
 
-    auto autocc_opt = AutoCC::load_from_cache();
+    const auto autocc_opt = AutoCC::load_from_cache();
     if (!autocc_opt) {
         out::error("Failed to load project from cache. Try running 'autocc setup' again.");
         return 1;
@@ -2421,13 +2821,13 @@ int CLIHandler::handle_setup(const std::vector<std::string>&) const {
 }
 
 int CLIHandler::handle_clean(const std::vector<std::string>&) {
-    const auto autocc_opt = AutoCC::load_from_cache();
-    if (!autocc_opt) {
+    Config autocc_opt;
+    if (!AutoCC::read_config_cache_static(autocc_opt)) {
         out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
         return 0;
     }
 
-    const auto& build_dir = autocc_opt->config.build_dir;
+    const auto& build_dir = autocc_opt.build_dir;
     if (build_dir.empty() || build_dir == "." || build_dir == "/") {
         out::error("Invalid build directory configured: '{}'. Clean aborted for safety.", build_dir);
         return 1;
@@ -2448,15 +2848,16 @@ int CLIHandler::handle_clean(const std::vector<std::string>&) {
 
 int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
     Config temp_cfg;
-    if (auto optional = AutoCC::load_from_cache()) {
-        temp_cfg = optional->config;
-    } else if (auto toml_optional = load_config_from_toml(config_toml_path_)) {
-        temp_cfg = *toml_optional;
+    if (AutoCC::read_config_cache_static(temp_cfg)) {
+        // do nothing
+    } else {
+        out::error("Cannot read config.");
+        return 1;
     }
 
     out::warn("Wiping all autocc files (build dir and cache)...");
 
-    for (const std::vector<fs::path> paths_to_remove = {temp_cfg.build_dir, cache_dir_, base_db_path_}; const auto& path : paths_to_remove) {
+    for (const std::vector<fs::path> paths_to_remove = {temp_cfg.build_dir, cache_dir_, base_db_path_, log_path_}; const auto& path : paths_to_remove) {
         if (!fs::exists(path) || path.empty()) continue;
 
         try {
@@ -2506,7 +2907,7 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
         }
     }
 
-    // Build path to executable
+    // Build a path to executable
     const std::string build_path_str = config.build_dir;
     if (build_path_str.empty()) {
         out::error("Build directory is not configured.");
