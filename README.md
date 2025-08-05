@@ -3,18 +3,22 @@
 > A fast, minimal low-level build system with intelligent target management
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.5-green.svg)](autocc.cc)
+[![Version](https://img.shields.io/badge/version-0.1.6-green.svg)](autocc.cc)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
 ## 🎊 What's new? (v0.1.5)
-- **Codebase refector** - optimizations and better efficiency
-- **TUI-Based autoconfig** - easier project configuration.
+- **Optimization** - Introduce parallel processing to many functions.
+- **Enhanced execution pipeline** - Safer and faster execution.
+- **Added target types** - Extend capability for future upgrades.
+- **Refactored codebase** - A Cleaner, more efficient codebase.
+- **Added new fields in user configuration** - Adapting new changes.
 ## ✨ Features
 
 - **🎯 Incremental Builds** - For lightning fast rebuilds
 - **⚡ Parallel Compilation** - Multi-threaded compilation by default
-- **🎪 Multi-Target Support** - Build multiple executables from a single project with target-specific configurations
+- **🎪 Multi-Target Support** - Build multiple targets from a single project with target-specific configurations
+- **✅ Multi-Target Type** - Build multiple executable/dynamic libraries/static libraries from a single file;
 - **🔧 Smart Auto-detection** - Automatically discovers local headers, system libraries, and build targets
 - **📊 Extensible Knowledge Base** - Uses [JSON database](autocc.base.json) for library detection rules that update without recompilation
 - **🧠 Pre-Compiled Headers** - Automatically generates PCH for common headers to speed up compilation
@@ -49,6 +53,13 @@ cmake .. && make # -DWALL=ON for all possible warnings -DARM=ON for no optimizat
 # Or if you already have autocc:
 autocc setup && autocc
 ```
+### ZSH autocompletion
+```bash
+# to install _autocc completetion for zsh, in the project ROOT, run:
+chmod + x ./zsh/install.sh && ./zsh/install.sh 
+# to uninstall
+chmod + x ./zsh/install.sh && ./zsh/uninstall.sh 
+```
 ### target_compile_definitions() 
 ```cmake
 target_compile_definitions(autocc PUBLIC
@@ -57,6 +68,7 @@ target_compile_definitions(autocc PUBLIC
         # -DLOG_DISABLE_COLORS -- disable colors
         -DLOG_ENABLE_FILE # -- enable file logging
         # -DLOG_DISABLE_TIMESTAMP -- disable timestamps
+        # -DVERBOSE -- enable verbose logging
 )
 ```
 ---
@@ -106,50 +118,49 @@ autocc install
 
 ### Basic Configuration
 ```toml
-# AUTOCC 0.1.5 -- Validation pattern, remember to add!
-# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC v0.1.5, MAKE SURE YOU HAVE THE APPROPRIATE AUTOCC BUILD.
+# AUTOCC 0.1.6
+# CONFIGURATION FILE 'autocc.toml' IS WRITTEN BY AUTOCC 0.1.6, MAKE SURE YOU HAVE AN APPROPRIATE AUTOCC BUILD.
 # COPYRIGHT (C) assembler-0 2025
 [compilers]
-as = 'nasm'
-cc = 'clang'
-cxx = 'clang++'
+ar = 'ar'  # your archiver
+as = 'nasm'  # your assembler
+cc = 'clang'  # your C compiler
+cxx = 'clang++' # your C++ compiler
+launcher = 'ccache' # your launcer
+sl = 'clang++'  # your dynamic linker
 
 [features]
-use_pch = true
+use_pch = true  # use precompiled header
 
 [paths]
-exclude_patterns = []
-include_dirs = [ 'include' ]
+exclude_patterns = []  # global exclude pattern
+include_dirs = [ 'include', '.', 'include/imgui', 'include/imgui/backends' ] # global include directories
 
 [project]
-build_dir = '.autocc_build'
-default_target = 'autocc'
+build_dir = '.autocc_build'  # project build directory
+default_target = 'sift' # default target
 
 [[targets]]
-cflags = '-DUSE_TUI -O3 -march=native -std=c++23'
-cxxflags = '-DUSE_TUI -O3 -march=native -std=c++23'
-exclude_patterns = []
-external_libs = [
-    '-lz',
-    '-lpthread',
-    '-lssl',
-    '-lcrypto',
-    '-lftxui-component',
-    '-lftxui-dom',
-    '-lftxui-screen',
-    '-lfmt',
-    '-lxxhash',
-    '-lzstd',
-    '-lm',
-    '-lbrotlidec'
-]
-ldflags = ''
-main_file = './autocc.cc'
-name = 'autocc'
-output_name = 'autocc'
+cflags = '-std=c11' # cflags
+cxxflags = '-std=c++23' # c++ flags
+exclude_patterns = [] # target exclude patten
+external_libs = [ '-ldl', '-lz', '-llzma', '-lpthread', '-lm', '-lglfw', '-lGL' ] # external library
+ldflags = '' # Linker flags
+main_file = './src/main.cpp' # main file
+name = 'main' # target name
+output_name = 'main' # target output name
 sources = [
-    './autocc.cc',
+    './asm/3np1.asm',
+    './asm/aesDEC.asm',
+    './asm/aesENC.asm',
+    './asm/avx.asm',
+    './asm/branch.asm',
+    # snip...
+    './src/lzma.module.cpp',
+    './src/main.cpp',
+    './src/systemMonitor.manage.cpp'
 ]
+type = 'SLibrary' # Or 'Executable' 'SLibrary' 'DLlibrary'
 ```
 
 ---
@@ -157,22 +168,21 @@ sources = [
 ## ✅ Available Commands
 
 ```bash
-➜  ~ autocc help
-AutoCC v0.1.5 compiled on Jul 31 2025 at 12:07:36
+AutoCC 0.1.6 compiled on Aug  5 2025 at 13:14:43
 
-Usage: autocc [command]
+Usage: autocc [command] (target_name)
 
 Commands:
-  <none>               Builds the project incrementally using cached settings.
+  <none> or <target>   Builds the default target, or a specified target.
   ac/autoconfig        Creates 'autocc.toml' via an interactive prompt.
   setup/sync/sc        Converts 'autocc.toml' to the internal build cache.
-  edit/select          Open a TUI to visually select source files for targets.
+  edit/select          Open a TUI to visually select source files for targets (could be disabled).
   clean                Removes the build directory.
   wipe                 Removes all autocc generated files (cache, build dir, db).
   fetch                Download/update the library detection database.
   version              Show current version and build date.
   help                 Shows this help message.
-  install              Install default target.
+  install <target>     Install specified target to system binary dir.
 Flags:
   --default            For 'autocc autoconfig', use default settings.
 ```

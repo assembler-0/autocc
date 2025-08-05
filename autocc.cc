@@ -1483,7 +1483,7 @@ public:
         file << "build_dir:" << config.build_dir << "\n";
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
         file << "default_target:" << config.default_target << "\n";
-        out::info("{}", config.launcher);
+
         for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
         for (const auto& pattern : config.exclude_patterns) file << "exclude:" << pattern << "\n";
 
@@ -2656,7 +2656,7 @@ public:
             target.main_file = discovered_target.main_file.string();
             target.output_name = target.name;
             target.cflags = "-std=c11";
-            target.cxxflags = "-std=c++23";
+            target.cxxflags = "-std=c++20";
 
             out::info("  -> Using all {} suggested source files.", discovered_target.suggested_sources.size());
             for (const auto& src : discovered_target.suggested_sources) {
