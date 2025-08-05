@@ -30,7 +30,7 @@
     "GL/glut.h": { "direct_libs": ["-lglut"] },
     "GL/freeglut.h": { "direct_libs": ["-lglut"] },
     "glad/gl.h": {},
-    "GLFW/glfw3.h": { "direct_libs": ["-lglfw"], "pkg_configs": ["glfw3"] },
+    "GLFW/glfw3.h": { "pkg_configs": ["glfw3"] },
     "vulkan/vulkan.h": { "pkg_configs": ["vulkan"] },
     "vk_mem_alloc.h": {},
     "spirv_cross/spirv_cross.hpp": { "pkg_configs": ["spirv-cross-c"] },

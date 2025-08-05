@@ -11,8 +11,7 @@
 #include <fcntl.h>
 #include <unordered_map>
 #include <future>
-
-#include "log.hpp"
+#include <sys/mman.h>
 
 namespace fs = std::filesystem;
 
@@ -67,6 +66,202 @@ inline ExecutionCache& getExecutionCache() {
     static ExecutionCache execution_cache;
     return execution_cache;
 }
+
+static bool isInIgnoredDirectory(const fs::path& path, const std::unordered_set<std::string>& ignored_dirs_set) {
+    return std::ranges::any_of(path, [&ignored_dirs_set](const auto& component) {
+        return ignored_dirs_set.contains(component.string());
+    });
+}
+
+namespace search {
+    inline void validateFileAndPatterns(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
+        // Validate patterns
+        if (patterns.empty()) {
+            throw std::invalid_argument("Patterns vector cannot be empty");
+        }
+
+        for (const auto& pattern : patterns) {
+            if (pattern.empty()) {
+                throw std::invalid_argument("Pattern cannot be empty");
+            }
+        }
+
+        if (filePath.empty()) {
+            throw std::invalid_argument("File path cannot be empty");
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(filePath, ec)) {
+            throw std::runtime_error("File does not exist: " + filePath.string());
+        }
+
+        if (ec) {
+            throw std::system_error(ec, "Error checking file existence");
+        }
+
+        if (!std::filesystem::is_regular_file(filePath, ec)) {
+            throw std::runtime_error("Path is not a regular file: " + filePath.string());
+        }
+
+        if (ec) {
+            throw std::system_error(ec, "Error checking file type");
+        }
+    }
+}
+
+
+class Strings {
+public:
+
+    static bool matches_pattern(const std::string_view filename, const std::string_view pattern) {
+        auto filename_it = filename.begin();
+        auto pattern_it = pattern.begin();
+
+        auto filename_star_it = filename.end(); // Pointers for backtracking
+        auto pattern_star_it = pattern.end();
+
+        while (filename_it != filename.end()) {
+            if (pattern_it != pattern.end() && *pattern_it == '*') {
+                // Wildcard found. Store current positions for backtracking.
+                pattern_star_it = pattern_it;
+                filename_star_it = filename_it;
+                ++pattern_it; // Move pattern past '*'
+            } else if (pattern_it != pattern.end() && (*pattern_it == '?' || *pattern_it == *filename_it)) {
+                // Characters match (or '?' wildcard).
+                ++filename_it;
+                ++pattern_it;
+            } else if (pattern_star_it != pattern.end()) {
+                // Mismatch, but we have a '*' to backtrack to.
+                // The '*' will match one more character of the filename.
+                pattern_it = pattern_star_it + 1;
+                ++filename_star_it;
+                filename_it = filename_star_it;
+            } else {
+                // Mismatch with no '*' to backtrack to.
+                return false;
+            }
+        }
+
+        while (pattern_it != pattern.end() && *pattern_it == '*') {
+            ++pattern_it;
+        }
+
+        return pattern_it == pattern.end();
+    }
+
+    static bool searchPatternInFile(const std::filesystem::path& filePath, const std::string& pattern) {
+        const std::vector patterns = {pattern};
+        search::validateFileAndPatterns(filePath, patterns);
+
+        std::ifstream file(filePath, std::ios::in | std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open file: " + filePath.string());
+        }
+
+        try {
+            std::string line;
+            while (std::getline(file, line)) {
+                if (line.find(pattern) != std::string::npos) {
+                    return true;
+                }
+            }
+
+            if (file.bad()) {
+                throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+            }
+        }
+        catch (const std::ios_base::failure& e) {
+            throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
+        }
+
+        return false;
+    }
+
+    // New overloaded function
+    static bool searchPatternInFile(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
+        search::validateFileAndPatterns(filePath, patterns);
+
+        std::ifstream file(filePath, std::ios::in | std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open file: " + filePath.string());
+        }
+
+        try {
+            std::string line;
+            while (std::getline(file, line)) {
+                for (const auto& pattern : patterns) {
+                    if (line.find(pattern) != std::string::npos) {
+                        return true;  // Return true if ANY pattern is found
+                    }
+                }
+            }
+
+            if (file.bad()) {
+                throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+            }
+        }
+        catch (const std::ios_base::failure& e) {
+            throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
+        }
+
+        return false;
+    }
+
+    static std::vector<std::string> split_string(const std::string& cmd) {
+        if (cmd.empty()) return {};
+
+        std::vector<std::string> args;
+        args.reserve(8); // Most commands have < 8 args
+
+        std::string current_arg;
+        current_arg.reserve(256);
+
+        bool in_quotes = false;
+        bool in_single_quotes = false;
+        bool escape_next = false;
+
+        for (const char c : cmd) {
+            if (escape_next) {
+                current_arg += c;
+                escape_next = false;
+                continue;
+            }
+
+            if (c == '\\' && !in_single_quotes) {
+                escape_next = true;
+                continue;
+            }
+
+            if (c == '"' && !in_single_quotes) {
+                in_quotes = !in_quotes;
+                continue;
+            }
+
+            if (c == '\'' && !in_quotes) {
+                in_single_quotes = !in_single_quotes;
+                continue;
+            }
+
+            if (std::isspace(c) && !in_quotes && !in_single_quotes) {
+                if (!current_arg.empty()) {
+                    args.push_back(std::move(current_arg));
+                    current_arg.clear();
+                    current_arg.reserve(256);
+                }
+                continue;
+            }
+
+            current_arg += c;
+        }
+
+        if (!current_arg.empty()) {
+            args.push_back(std::move(current_arg));
+        }
+
+        return args;
+    }
+
+};
 
 class AsyncPipeReader {
 public:
@@ -137,417 +332,203 @@ private:
     }
 };
 
-static bool isFileExecutable(const std::string& path) {
-    char resolved_path[PATH_MAX];
-    if (realpath(path.c_str(), resolved_path) == nullptr) {
-        return false;
-    }
-
-    struct stat sb{};
-    if (stat(resolved_path, &sb) != 0) {
-        return false;
-    }
-
-    if (!S_ISREG(sb.st_mode)) {
-        return false;
-    }
-
-    if (access(resolved_path, X_OK) == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-inline bool isCommandExecutable(const std::string& command) {
-    if (command.empty() || command.find('\0') != std::string::npos) {
-        return false;
-    }
-
-    if (command.find("../") != std::string::npos) {
-        return false;
-    }
-
-    if (command.find('/') != std::string::npos) {
-        return isFileExecutable(command);
-    }
-
-    const char* path_env = std::getenv("PATH");
-    if (!path_env) {
-        return false; // No PATH variable set.
-    }
-
-    const std::string path_str(path_env);
-    std::stringstream ss(path_str);
-    std::string dir;
-
-    while (std::getline(ss, dir, ':')) {
-        if (dir.empty() || dir.find("..") != std::string::npos) {
-            continue;
-        }
-
-        std::string full_path = dir + "/" + command;
-
-        if (full_path.length() >= PATH_MAX) {
-            continue;
-        }
-
-        if (isFileExecutable(full_path)) {
-            return true;
-        }
-    }
-
-    return false; // Command not found or not executable.
-}
-
-// Helper function to determine if command should be cached
-inline bool shouldCache(const std::string& cmd) {
-    // Cache pkg-config, compiler version checks, etc.
-    return cmd.find("pkg-config") != std::string::npos ||
-           cmd.find("--version") != std::string::npos ||
-           cmd.find("which ") != std::string::npos;
-}
-
-// Optimized command splitting with proper quote handling
-inline std::vector<std::string> split_string(const std::string& cmd) {
-    if (cmd.empty()) return {};
-
-    std::vector<std::string> args;
-    args.reserve(8); // Most commands have < 8 args
-
-    std::string current_arg;
-    current_arg.reserve(256);
-
-    bool in_quotes = false;
-    bool in_single_quotes = false;
-    bool escape_next = false;
-
-    for (const char c : cmd) {
-        if (escape_next) {
-            current_arg += c;
-            escape_next = false;
-            continue;
-        }
-
-        if (c == '\\' && !in_single_quotes) {
-            escape_next = true;
-            continue;
-        }
-
-        if (c == '"' && !in_single_quotes) {
-            in_quotes = !in_quotes;
-            continue;
-        }
-
-        if (c == '\'' && !in_quotes) {
-            in_single_quotes = !in_single_quotes;
-            continue;
-        }
-
-        if (std::isspace(c) && !in_quotes && !in_single_quotes) {
-            if (!current_arg.empty()) {
-                args.push_back(std::move(current_arg));
-                current_arg.clear();
-                current_arg.reserve(256);
-            }
-            continue;
-        }
-
-        current_arg += c;
-    }
-
-    if (!current_arg.empty()) {
-        args.push_back(std::move(current_arg));
-    }
-
-    return args;
-}
-
-
-// Pre-flight check to avoid unnecessary forks
-inline bool canExecuteCommand(const std::vector<std::string>& args) {
-    if (args.empty()) return false;
-    return isCommandExecutable(args[0]);
-}
-
-// Optimized execute_vec with async I/O and error handling
-inline CommandResult execute_vec(const std::vector<std::string>& args) {
-    if (args.empty()) {
-        return {127, "", "Error: empty command"};
-    }
-
-    // Pre-flight check
-    if (!canExecuteCommand(args)) {
-        return {127, "", "Error: command not found or not executable: " + args[0]};
-    }
-
-    int stdout_pipe[2], stderr_pipe[2];
-    if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
-        return {127, "", "Error: failed to create pipes"};
-    }
-
-    const pid_t pid = fork();
-    if (pid == -1) {
-        close(stdout_pipe[0]); close(stdout_pipe[1]);
-        close(stderr_pipe[0]); close(stderr_pipe[1]);
-        return {127, "", "Error: fork failed"};
-    }
-
-    if (pid == 0) {
-        // Child process - optimized setup
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stderr_pipe[1], STDERR_FILENO);
-        close(stdout_pipe[0]); close(stdout_pipe[1]);
-        close(stderr_pipe[0]); close(stderr_pipe[1]);
-
-        // Prepare argv efficiently
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 1);
-        for (const auto& s : args) {
-            argv.push_back(const_cast<char*>(s.c_str()));
-        }
-        argv.push_back(nullptr);
-
-        execvp(argv[0], argv.data());
-        _exit(127); // exec failed
-    }
-
-    // Parent process - async I/O
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
-
-    // Read from pipes asynchronously
-    auto [stdout_result, stderr_result] = AsyncPipeReader::readPipes(stdout_pipe[0], stderr_pipe[0]);
-
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
-
-    // Wait for child process
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    return {WEXITSTATUS(status), std::move(stdout_result), std::move(stderr_result)};
-}
-
-// Cached execute function
-[[nodiscard]] inline CommandResult execute(const std::string& cmd) {
-    // Check cache first for expensive operations
-    if (auto cached = getExecutionCache().get(cmd)) {
-        return *cached;
-    }
-
-    auto result = execute_vec(split_string(cmd));
-
-    // Cache successful results of potentially expensive commands
-    if (result.exit_code == 0 && shouldCache(cmd)) {
-        getExecutionCache().put(cmd, result);
-    }
-
-    return result;
-}
-
-// Async execute for non-blocking operations
-inline std::future<CommandResult> execute_async(const std::string& cmd) {
-    return std::async(std::launch::async, [cmd] {
-        return execute(cmd);
-    });
-}
-
-
-inline bool matches_pattern(const std::string_view filename, const std::string_view pattern) {
-    auto filename_it = filename.begin();
-    auto pattern_it = pattern.begin();
-
-    auto filename_star_it = filename.end(); // Pointers for backtracking
-    auto pattern_star_it = pattern.end();
-
-    while (filename_it != filename.end()) {
-        if (pattern_it != pattern.end() && *pattern_it == '*') {
-            // Wildcard found. Store current positions for backtracking.
-            pattern_star_it = pattern_it;
-            filename_star_it = filename_it;
-            ++pattern_it; // Move pattern past '*'
-        } else if (pattern_it != pattern.end() && (*pattern_it == '?' || *pattern_it == *filename_it)) {
-            // Characters match (or '?' wildcard).
-            ++filename_it;
-            ++pattern_it;
-        } else if (pattern_star_it != pattern.end()) {
-            // Mismatch, but we have a '*' to backtrack to.
-            // The '*' will match one more character of the filename.
-            pattern_it = pattern_star_it + 1;
-            ++filename_star_it;
-            filename_it = filename_star_it;
-        } else {
-            // Mismatch with no '*' to backtrack to.
+class Execution {
+public:
+    static bool isFileExecutable(const std::string& path) {
+        char resolved_path[PATH_MAX];
+        if (realpath(path.c_str(), resolved_path) == nullptr) {
             return false;
         }
+
+        struct stat sb{};
+        if (stat(resolved_path, &sb) != 0) {
+            return false;
+        }
+
+        if (!S_ISREG(sb.st_mode)) {
+            return false;
+        }
+
+        if (access(resolved_path, X_OK) == 0) {
+            return true;
+        }
+
+        return false;
     }
 
-    while (pattern_it != pattern.end() && *pattern_it == '*') {
-        ++pattern_it;
-    }
+    static bool isCommandExecutable(const std::string& command) {
+        if (command.empty() || command.find('\0') != std::string::npos) {
+            return false;
+        }
 
-    return pattern_it == pattern.end();
-}
+        if (command.find("../") != std::string::npos) {
+            return false;
+        }
 
-inline std::vector<fs::path> find_source_files(const fs::path& dir,
-                                              const std::unordered_set<std::string>& ignored_dirs,
-                                              const std::vector<std::string>& exclude_patterns = {}) {
-    std::vector<fs::path> files;
-    std::error_code ec;
+        if (command.find('/') != std::string::npos) {
+            return isFileExecutable(command);
+        }
 
-    if (!fs::exists(dir, ec)) return files;
+        const char* path_env = std::getenv("PATH");
+        if (!path_env) {
+            return false; // No PATH variable set.
+        }
 
-    try {
-        files.reserve(1000);
+        const std::string path_str(path_env);
+        std::stringstream ss(path_str);
+        std::string dir;
 
-        static const std::unordered_set<std::string_view> source_extensions = {
-            ".cpp", ".c", ".cc", ".s", ".S", ".asm", ".c++", ".cxx"
-        };
-
-        fs::recursive_directory_iterator iter(dir, fs::directory_options::skip_permission_denied, ec);
-        if (ec) return files;
-
-        for (const auto& entry : iter) {
-            if (!entry.is_regular_file(ec)) {
-                if (ec) continue;
-            }
-
-            const auto& path = entry.path();
-            if (const std::string ext = path.extension().string(); !source_extensions.contains(ext)) {
+        while (std::getline(ss, dir, ':')) {
+            if (dir.empty() || dir.find("..") != std::string::npos) {
                 continue;
             }
 
-            bool is_in_ignored_dir = false;
-            for (const auto& part : path) {
-                if (ignored_dirs.contains(part.string())) {
-                    is_in_ignored_dir = true;
-                    break;
-                }
-            }
+            std::string full_path = dir + "/" + command;
 
-            if (is_in_ignored_dir) {
+            if (full_path.length() >= PATH_MAX) {
                 continue;
             }
 
-            if (!exclude_patterns.empty()) {
-                const std::string filename_str = path.filename().string(); // Materialize once
-                bool should_exclude = false;
-
-                for (const auto& pattern : exclude_patterns) {
-                    if (matches_pattern(filename_str, pattern)) { // Pass const ref safely
-                        should_exclude = true;
-                        out::warn("Excluding file '{}' (matches pattern '{}')", filename_str, pattern);
-                        break;
-                    }
-                }
-
-                if (!should_exclude) {
-                    files.emplace_back(path);
-                }
-            } else {
-                files.emplace_back(path);
-            }
-        }
-    } catch(const fs::filesystem_error& e) {
-        out::warn("Filesystem error while scanning: {}", e.what());
-    }
-    return files;
-}
-
-// Helper function to follow DRY
-namespace search {
-    inline void validateFileAndPatterns(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
-        // Validate patterns
-        if (patterns.empty()) {
-            throw std::invalid_argument("Patterns vector cannot be empty");
-        }
-
-        for (const auto& pattern : patterns) {
-            if (pattern.empty()) {
-                throw std::invalid_argument("Pattern cannot be empty");
-            }
-        }
-
-        if (filePath.empty()) {
-            throw std::invalid_argument("File path cannot be empty");
-        }
-
-        std::error_code ec;
-        if (!std::filesystem::exists(filePath, ec)) {
-            throw std::runtime_error("File does not exist: " + filePath.string());
-        }
-
-        if (ec) {
-            throw std::system_error(ec, "Error checking file existence");
-        }
-
-        if (!std::filesystem::is_regular_file(filePath, ec)) {
-            throw std::runtime_error("Path is not a regular file: " + filePath.string());
-        }
-
-        if (ec) {
-            throw std::system_error(ec, "Error checking file type");
-        }
-    }
-}
-
-// Original function (updated to use helper)
-inline bool searchPatternInFile(const std::filesystem::path& filePath, const std::string& pattern) {
-    const std::vector patterns = {pattern};
-    search::validateFileAndPatterns(filePath, patterns);
-
-    std::ifstream file(filePath, std::ios::in | std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filePath.string());
-    }
-
-    try {
-        std::string line;
-        while (std::getline(file, line)) {
-            if (line.find(pattern) != std::string::npos) {
+            if (isFileExecutable(full_path)) {
                 return true;
             }
         }
 
-        if (file.bad()) {
-            throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+        return false; // Command not found or not executable.
+    }
+
+    // Helper function to determine if command should be cached
+    static bool shouldCache(const std::string& cmd) {
+        // Cache pkg-config, compiler version checks, etc.
+        return cmd.find("pkg-config") != std::string::npos ||
+               cmd.find("--version") != std::string::npos ||
+               cmd.find("which ") != std::string::npos;
+    }
+
+    // Pre-flight check to avoid unnecessary forks
+    static bool canExecuteCommand(const std::vector<std::string>& args) {
+        if (args.empty()) return false;
+        return isCommandExecutable(args[0]);
+    }
+
+    // Optimized execute_vec with async I/O and error handling
+    static CommandResult execute_vec(const std::vector<std::string>& args) {
+        if (args.empty()) {
+            return {127, "", "Error: empty command"};
         }
-    }
-    catch (const std::ios_base::failure& e) {
-        throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
-    }
 
-    return false;
-}
+        // Pre-flight check
+        if (!canExecuteCommand(args)) {
+            return {127, "", "Error: command not found or not executable: " + args[0]};
+        }
 
-// New overloaded function
-inline bool searchPatternInFile(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
-    search::validateFileAndPatterns(filePath, patterns);
+        int stdout_pipe[2], stderr_pipe[2];
+        if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
+            return {127, "", "Error: failed to create pipes"};
+        }
 
-    std::ifstream file(filePath, std::ios::in | std::ios::binary);
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filePath.string());
-    }
+        const pid_t pid = fork();
+        if (pid == -1) {
+            close(stdout_pipe[0]); close(stdout_pipe[1]);
+            close(stderr_pipe[0]); close(stderr_pipe[1]);
+            return {127, "", "Error: fork failed"};
+        }
 
-    try {
-        std::string line;
-        while (std::getline(file, line)) {
-            for (const auto& pattern : patterns) {
-                if (line.find(pattern) != std::string::npos) {
-                    return true;  // Return true if ANY pattern is found
-                }
+        if (pid == 0) {
+            // Child process - optimized setup
+            dup2(stdout_pipe[1], STDOUT_FILENO);
+            dup2(stderr_pipe[1], STDERR_FILENO);
+            close(stdout_pipe[0]); close(stdout_pipe[1]);
+            close(stderr_pipe[0]); close(stderr_pipe[1]);
+
+            // Prepare argv efficiently
+            std::vector<char*> argv;
+            argv.reserve(args.size() + 1);
+            for (const auto& s : args) {
+                argv.push_back(const_cast<char*>(s.c_str()));
             }
+            argv.push_back(nullptr);
+
+            execvp(argv[0], argv.data());
+            _exit(127); // exec failed
         }
 
-        if (file.bad()) {
-            throw std::runtime_error("Error occurred while reading file: " + filePath.string());
+        // Parent process - async I/O
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+
+        // Read from pipes asynchronously
+        auto [stdout_result, stderr_result] = AsyncPipeReader::readPipes(stdout_pipe[0], stderr_pipe[0]);
+
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+
+        // Wait for child process
+        int status = 0;
+        waitpid(pid, &status, 0);
+
+        return {WEXITSTATUS(status), std::move(stdout_result), std::move(stderr_result)};
+    }
+
+    // Cached execute function
+    [[nodiscard]] static  CommandResult execute(const std::string& cmd) {
+        // Check cache first for expensive operations
+        if (auto cached = getExecutionCache().get(cmd)) {
+            return *cached;
         }
-    }
-    catch (const std::ios_base::failure& e) {
-        throw std::runtime_error("I/O error while reading file: " + std::string(e.what()));
+
+        auto result = execute_vec(Strings::split_string(cmd));
+
+        // Cache successful results of potentially expensive commands
+        if (result.exit_code == 0 && shouldCache(cmd)) {
+            getExecutionCache().put(cmd, result);
+        }
+
+        return result;
     }
 
-    return false;
-}
+    // Async execute for non-blocking operations
+    static std::future<CommandResult> execute_async(const std::string& cmd) {
+        return std::async(std::launch::async, [cmd] {
+            return execute(cmd);
+        });
+    }
+};
 
+class MemoryMappedFile {
+    void* data;
+    size_t size;
+public:
+    explicit MemoryMappedFile(const fs::path& path) {
+        const int fd = open(path.c_str(), O_RDONLY);
+        struct stat sb;
+        fstat(fd, &sb);
+        size = sb.st_size;
+        data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+    }
+
+    std::string_view content() const {
+        return {static_cast<char*>(data), size};
+    }
+
+    ~MemoryMappedFile() { munmap(data, size); }
+};
+
+
+class StringInterner {
+    std::unordered_set<std::string> pool;
+    mutable std::shared_mutex mutex;
+public:
+    std::string_view intern(std::string_view str) {
+        std::shared_lock lock(mutex);
+        if (const auto it = pool.find(std::string(str)); it != pool.end()) {
+            return *it;
+        }
+
+        std::unique_lock ulock(mutex);
+        return *pool.emplace(str).first;
+    }
+};
+
+static StringInterner g_interner;

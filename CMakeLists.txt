@@ -30,6 +30,7 @@ target_include_directories(autocc PUBLIC include)
 # Common compile definitions
 target_compile_definitions(autocc PUBLIC
         -DLOG_ENABLE_FILE
+        -DAGGRESSIVE # skips files more aggressively, actually saves ram
         #-DVERBOSE
 )
 
