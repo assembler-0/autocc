@@ -7,7 +7,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
-## 🎊 What's new? (v0.1.5)
+## 🎊 What's new? (v0.1.6)
 - **Optimization** - Introduce parallel processing to many functions.
 - **Enhanced execution pipeline** - Safer and faster execution.
 - **Added target types** - Extend capability for future upgrades.
