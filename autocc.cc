@@ -87,8 +87,8 @@ struct Target {
     std::vector<std::string> sources;
     std::string output_name;
     std::vector<std::string> exclude_patterns;
-    std::optional<std::string> cflags;
-    std::optional<std::string> cxxflags;
+    std::optional<std::string> cflags = "-std=c11";
+    std::optional<std::string> cxxflags = "-std=c++23";
     std::optional<std::string> ldflags;
     std::vector<std::string> external_libs; // Per-target external libraries
 };
@@ -97,6 +97,7 @@ struct Config {
     std::string cc = "clang";
     std::string cxx = "clang++";
     std::string as = "nasm";
+    std::string launcher;
     std::string build_dir = ".autocc_build";
     bool use_pch = true;
     std::vector<std::string> include_dirs;
@@ -472,7 +473,8 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         {"compilers", toml::table{
             {"cxx", config.cxx},
             {"cc", config.cc},
-            {"as", config.as}
+            {"as", config.as},
+            {"launcher", config.launcher}
         }},
 
         {"features", toml::table{
@@ -531,9 +533,10 @@ std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
         config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
         config.default_target = get_or(tbl["project"]["default_target"].as_string(), "");
 
-        config.cxx = get_or(tbl["compilers"]["cxx"].as_string(), "clang++");
-        config.cc = get_or(tbl["compilers"]["cc"].as_string(), "clang");
-        config.as = get_or(tbl["compilers"]["as"].as_string(), "nasm");
+        config.cxx = get_or(tbl["compilers"]["cxx"].as_string(), config.cxx);
+        config.cc = get_or(tbl["compilers"]["cc"].as_string(), config.cc);
+        config.as = get_or(tbl["compilers"]["as"].as_string(), config.as);
+        config.launcher = get_or(tbl["compilers"]["launcher"].as_string(), config.launcher);
         config.use_pch = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
 
         if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
@@ -1453,7 +1456,7 @@ public:
     static std::unique_ptr<AutoCC> load_from_cache() {
         Config config;
         read_config_cache_static(config);
-        auto instance = std::make_unique<AutoCC>(std::move(config), true);
+        auto instance = std::make_unique<AutoCC>(std::move(config), false); // lmao, anyways.
         if (instance->source_files.empty()) {
             out::warn("No source files found. This may be correct for a header-only library.");
         }
@@ -1480,6 +1483,7 @@ public:
         file << "cxx:" << config.cxx << "\n";
         file << "cc:" << config.cc << "\n";
         file << "as:" << config.as << "\n";
+        file << "launcher:" << config.launcher << "\n"; // eg. ccache
         file << "build_dir:" << config.build_dir << "\n";
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
         file << "default_target:" << config.default_target << "\n";
@@ -1576,6 +1580,7 @@ public:
             if (key == "cxx") config.cxx = value;
             else if (key == "cc") config.cc = value;
             else if (key == "as") config.as = value;
+            else if (key == "launcher") { config.launcher = value; out::info("val: {}", config.launcher); }
             else if (key == "build_dir") config.build_dir = value;
             else if (key == "use_pch") config.use_pch = value == "true";
             else if (key == "default_target") config.default_target = value;
@@ -1793,13 +1798,16 @@ private:
                                 target.cflags.value_or(""),
                                 target.cxxflags.value_or(""),
                                 target.ldflags.value_or(""),
-                                target.external_libs);
+                                target.external_libs,
+                                config.launcher);
     }
 
 
     int build_with_files(const std::vector<fs::path>& files_to_build, const std::string& output_name,
                     const std::string& target_cflags, const std::string& target_cxxflags,
-                    const std::string& target_ldflags, const std::vector<std::string>& target_libs) {
+                    const std::string& target_ldflags, const std::vector<std::string>& target_libs,
+                    const std::string& launcher) {
+
         if (files_to_build.empty()) {
             out::error("No source files found to build.");
             return 1;
@@ -1913,11 +1921,11 @@ private:
                         fs::path obj = build_path / src.filename().replace_extension(".o");
                         std::string cmd;
                         if (compiler == config.as) {
-                            cmd = fmt::format("{} {} -felf64 -o {}", compiler, src, obj);
+                            cmd = fmt::format("{} {} {} -felf64 -o {}", launcher, compiler, src, obj);
                         } else {
                             std::string_view flags = compiler == config.cxx ? target_cxxflags : target_cflags;
                             std::string current_pch_flags = compiler == config.cxx && !pch_flags.empty() ? pch_flags : "";
-                            cmd = fmt::format("{} -c {} -o {} {} {} {}", compiler, src, obj, flags, current_pch_flags,
+                            cmd = fmt::format("{} {} -c {} -o {} {} {} {}", launcher, compiler, src, obj, flags, current_pch_flags,
                                   fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
                         }
                         out::command("{}", cmd);
@@ -1940,9 +1948,9 @@ private:
         const fs::path target_path = fs::path(config.build_dir) / output_name;
 
         out::info("Linking target...");
-        // REFINED: Added target_cxxflags to the link command. This is crucial for flags like -pthread
-        // or -fopenmp that are needed at both compile and link time and are often part of cxxflags.
-        const std::string link_cmd = fmt::format("{} -o {} {} {} {} {}",
+
+        const std::string link_cmd = fmt::format("{} {} -o {} {} {} {} {}",
+            launcher,
             config.cxx, target_path,
             fmt::join(object_files, " "),
             target_cxxflags, // Added for link-time flags
@@ -2225,6 +2233,7 @@ void user_init(Config& config) {
     config.cc = get_input("C Compiler", config.cc);
     config.cxx = get_input("C++ Compiler", config.cxx);
     config.as = get_input("Assembler", config.as);
+    config.launcher = get_input("Launcher", config.launcher);
     config.build_dir = get_input("Build Directory", config.build_dir);
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = pch_choice == "yes" || pch_choice == "y";
@@ -2323,8 +2332,8 @@ void user_init(Config& config) {
             target.name = get_input("Target Name", discovered_target.suggested_name);
             target.main_file = discovered_target.main_file.string();
             target.output_name = get_input("Output Executable Name", target.name);
-            target.cxxflags = get_input("CXX Flags for this target", "");
-            target.cflags = get_input("C Flags for this target", "");
+            target.cxxflags = get_input("CXX Flags for this target", target.cxxflags.value());
+            target.cflags = get_input("C Flags for this target", target.cflags.value());
             target.ldflags = get_input("Linker Flags for this target", "");
 
             if (std::string libs_input = get_input("External libs for this target (e.g. -lpthread)", ""); !libs_input.empty()) {
@@ -2413,6 +2422,7 @@ void user_init(Config& config) {
     config.cc = get_input("C Compiler", config.cc);
     config.cxx = get_input("C++ Compiler", config.cxx);
     config.as = get_input("Assembler", config.as);
+    config.launcher = get_input("Launcher", config.launcher);
     config.build_dir = get_input("Build Directory", config.build_dir);
     std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
     config.use_pch = pch_choice == "yes" || pch_choice == "y";
@@ -2506,7 +2516,6 @@ void user_init(Config& config) {
 #endif
 
 void default_init(Config& config) {
-    out::warn("The '--default' option is no longer maintained and is only supported by autocc version 0.1.4 or lower, use with caution.");
     out::info("Discovering potential build targets to create a default configuration...");
     const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
     const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);

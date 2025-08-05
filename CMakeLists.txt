@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 project(autocc LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 
 # Build options
 option(NUSE_TUI "Disable TUI interface (Not USE TUI)" OFF)  # OFF by default → TUI enabled unless turned ON

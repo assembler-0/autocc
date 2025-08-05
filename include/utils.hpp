@@ -63,7 +63,10 @@ public:
     }
 };
 
-static ExecutionCache execution_cache;
+inline ExecutionCache& getExecutionCache() {
+    static ExecutionCache execution_cache;
+    return execution_cache;
+}
 
 class AsyncPipeReader {
 public:
@@ -133,62 +136,6 @@ private:
         return fcntl(fd, F_GETFD) != -1;
     }
 };
-
-// Optimized command splitting with proper quote handling
-inline std::vector<std::string> split_string_advanced(const std::string& cmd) {
-    if (cmd.empty()) return {};
-
-    std::vector<std::string> args;
-    args.reserve(8); // Most commands have < 8 args
-
-    std::string current_arg;
-    current_arg.reserve(256);
-
-    bool in_quotes = false;
-    bool in_single_quotes = false;
-    bool escape_next = false;
-
-    for (const char c : cmd) {
-        if (escape_next) {
-            current_arg += c;
-            escape_next = false;
-            continue;
-        }
-
-        if (c == '\\' && !in_single_quotes) {
-            escape_next = true;
-            continue;
-        }
-
-        if (c == '"' && !in_single_quotes) {
-            in_quotes = !in_quotes;
-            continue;
-        }
-
-        if (c == '\'' && !in_quotes) {
-            in_single_quotes = !in_single_quotes;
-            continue;
-        }
-
-        if (std::isspace(c) && !in_quotes && !in_single_quotes) {
-            if (!current_arg.empty()) {
-                args.push_back(std::move(current_arg));
-                current_arg.clear();
-                current_arg.reserve(256);
-            }
-            continue;
-        }
-
-        current_arg += c;
-    }
-
-    if (!current_arg.empty()) {
-        args.push_back(std::move(current_arg));
-    }
-
-    return args;
-}
-
 
 static bool isFileExecutable(const std::string& path) {
     char resolved_path[PATH_MAX];
@@ -385,7 +332,7 @@ inline CommandResult execute_vec(const std::vector<std::string>& args) {
 // Cached execute function
 [[nodiscard]] inline CommandResult execute(const std::string& cmd) {
     // Check cache first for expensive operations
-    if (auto cached = execution_cache.get(cmd)) {
+    if (auto cached = getExecutionCache().get(cmd)) {
         return *cached;
     }
 
@@ -393,7 +340,7 @@ inline CommandResult execute_vec(const std::vector<std::string>& args) {
 
     // Cache successful results of potentially expensive commands
     if (result.exit_code == 0 && shouldCache(cmd)) {
-        execution_cache.put(cmd, result);
+        getExecutionCache().put(cmd, result);
     }
 
     return result;
@@ -508,7 +455,7 @@ inline std::vector<fs::path> find_source_files(const fs::path& dir,
     return files;
 }
 
-// Helper function to avoid code duplication
+// Helper function to follow DRY
 namespace search {
     inline void validateFileAndPatterns(const std::filesystem::path& filePath, const std::vector<std::string>& patterns) {
         // Validate patterns
