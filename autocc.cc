@@ -37,7 +37,7 @@ using namespace ftxui;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "0.1.6" // REMEMBER TO UPDATE VALIDATION_PATTERN!
+#define VERSION "0.1.6"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -62,18 +62,6 @@ std::ofstream g_log_file(AUTOCC_LOG_FILE_NAME); // I forgot, sorry
 #endif
 std::mutex g_output_mutex;
 
-static std::vector<std::string> getAllValidationPattern() {
-    static const std::vector<std::string> patterns = {
-        "# AUTOCC 0.1.5",
-        "# AUTOCC 0.1.6"
-    };
-    return patterns;
-}
-
-static std::string getCurrentValidationPattern() {
-    return fmt::format("# AUTOCC {}", VERSION);
-}
-
 template <>
 struct fmt::formatter<fs::path> : formatter<std::string_view> {
     auto format(const fs::path& p, format_context& ctx) const{
@@ -81,14 +69,16 @@ struct fmt::formatter<fs::path> : formatter<std::string_view> {
     }
 };
 
+
 struct Target {
+    std::string type = "Executable";
     std::string name;
     std::string main_file;
     std::vector<std::string> sources;
     std::string output_name;
     std::vector<std::string> exclude_patterns;
     std::optional<std::string> cflags = "-std=c11";
-    std::optional<std::string> cxxflags = "-std=c++23";
+    std::optional<std::string> cxxflags = "-std=c++20";
     std::optional<std::string> ldflags;
     std::vector<std::string> external_libs; // Per-target external libraries
 };
@@ -98,6 +88,8 @@ struct Config {
     std::string cxx = "clang++";
     std::string as = "nasm";
     std::string launcher;
+    std::string ar = "ar";
+    std::string shared = "clang++";
     std::string build_dir = ".autocc_build";
     bool use_pch = true;
     std::vector<std::string> include_dirs;
@@ -106,12 +98,33 @@ struct Config {
     std::string default_target;
 };
 
-bool validateVersion() {
-    if (searchPatternInFile(CONFIG_FILE_NAME, getAllValidationPattern())) {
-        return true;
+
+class Validation {
+public:
+    static std::vector<std::string> getAllValidationPattern() {
+        static const std::vector<std::string> patterns = {
+            "# AUTOCC 0.1.5",
+            "# AUTOCC 0.1.6"
+        };
+        return patterns;
     }
-    return false;
-}
+
+    static std::string getCurrentValidationPattern() {
+        return fmt::format("# AUTOCC {}", VERSION);
+    }
+
+    static bool isTypeValid(const std::string& str) {
+        static const std::vector<std::string> valid = {"Executable", "DLibrary", "SLibrary"};
+        return std::ranges::find(valid, str) != valid.end();
+    }
+
+    static bool validateVersion() {
+        if (searchPatternInFile(CONFIG_FILE_NAME, getAllValidationPattern())) {
+            return true;
+        }
+        return false;
+    }
+};
 
 class TargetDiscovery {
 public:
@@ -399,36 +412,10 @@ public:
 };
 #endif
 
-std::string hash_file(const fs::path& path) {
-    const int fd = open(path.c_str(), O_RDONLY);
-    if (fd == -1) return "";
 
-    struct stat sb{};
-    if (fstat(fd, &sb) == -1) {
-        close(fd);
-        return "";
-    }
-
-    if (sb.st_size == 0) {
-        close(fd);
-        return "ef46db3751d8e999"; // XXH64 of empty data
-    }
-
-    void* mapped = mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        close(fd);
-        return "";
-    }
-
-    XXH64_hash_t hash_val = XXH64(mapped, sb.st_size, 0);
-
-    munmap(mapped, sb.st_size);
-    close(fd);
-
-    return fmt::format("{:016x}", hash_val);
-}
-
-void write_config_to_toml(const Config& config, const fs::path& toml_path) {
+class Configuration {
+public:
+    static void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     auto includes_arr = toml::array{};
     for (const auto& dir : config.include_dirs) {
         includes_arr.push_back(dir);
@@ -440,7 +427,7 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     }
 
     auto targets_arr = toml::array{};
-    for (const auto&[name, main_file, sources, output_name, exclude_patterns, cflags, cxxflags, ldflags, external_libs] : config.targets) {
+    for (const auto&[type, name, main_file, sources, output_name, exclude_patterns, cflags, cxxflags, ldflags, external_libs] : config.targets) {
         auto sources_arr = toml::array{};
         for (const auto& src : sources) sources_arr.push_back(src);
 
@@ -451,6 +438,7 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
         for (const auto& lib : external_libs) libs_arr.push_back(lib);
 
         auto target_tbl = toml::table{
+            {"type", type},
             {"name", name},
             {"main_file", main_file},
             {"sources", sources_arr},
@@ -474,7 +462,9 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
             {"cxx", config.cxx},
             {"cc", config.cc},
             {"as", config.as},
-            {"launcher", config.launcher}
+            {"launcher", config.launcher},
+            {"ar", config.ar},
+            {"sl", config.shared}
         }},
 
         {"features", toml::table{
@@ -500,95 +490,100 @@ void write_config_to_toml(const Config& config, const fs::path& toml_path) {
     out::success("Configuration saved to '{}'.", toml_path);
 }
 
-void validate_config(Config& config) {
-    std::unordered_set<std::string> names, outputs;
-    for (const auto& t : config.targets) {
-        if (t.name.empty()) out::warn("A target has an empty name.");
-        if (t.main_file.empty()) out::warn("Target '{}' has an empty main_file.", t.name);
-        if (t.sources.empty()) out::warn("Target '{}' has no sources.", t.name);
-        if (!names.insert(t.name).second) out::error("Duplicate target name '{}'.", t.name);
-        if (!outputs.insert(t.output_name).second) out::warn("Duplicate output_name '{}'.", t.output_name);
-    }
-    if (!config.default_target.empty() &&
-        std::ranges::none_of(config.targets, [&](const Target& t){ return t.name == config.default_target; }))
-        out::warn("default_target '{}' does not match any target name.", config.default_target);
-}
-
-std::optional<Config> load_config_from_toml(const fs::path& toml_path) {
-    if (!fs::exists(toml_path)) {
-        return std::nullopt;
+    static void validate_config(Config& config) {
+        std::unordered_set<std::string> names, outputs;
+        for (const auto& t : config.targets) {
+            if (t.name.empty()) out::warn("A target has an empty name.");
+            if (t.main_file.empty()) out::warn("Target '{}' has an empty main_file.", t.name);
+            if (t.sources.empty()) out::warn("Target '{}' has no sources.", t.name);
+            if (!names.insert(t.name).second) out::error("Duplicate target name '{}'.", t.name);
+            if (!outputs.insert(t.output_name).second) out::warn("Duplicate output_name '{}'.", t.output_name);
+        }
+        if (!config.default_target.empty() &&
+            std::ranges::none_of(config.targets, [&](const Target& t){ return t.name == config.default_target; }))
+            out::warn("default_target '{}' does not match any target name.", config.default_target);
     }
 
-    try {
-        toml::table tbl = toml::parse_file(toml_path.string());
-        Config config;
-
-        auto get_or = [&](const toml::node* node, const std::string& default_val) {
-            return node ? node->value_or(default_val) : default_val;
-        };
-        auto get_bool_or = [&](const toml::node* node, bool default_val) {
-            return node ? node->value_or(default_val) : default_val;
-        };
-
-        config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
-        config.default_target = get_or(tbl["project"]["default_target"].as_string(), "");
-
-        config.cxx = get_or(tbl["compilers"]["cxx"].as_string(), config.cxx);
-        config.cc = get_or(tbl["compilers"]["cc"].as_string(), config.cc);
-        config.as = get_or(tbl["compilers"]["as"].as_string(), config.as);
-        config.launcher = get_or(tbl["compilers"]["launcher"].as_string(), config.launcher);
-        config.use_pch = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
-
-        if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
-            for (const auto& elem : *includes) {
-                std::string dir = elem.value_or("");
-                if (!dir.empty() && fs::path(dir).is_absolute()) {
-                    out::warn("Include directory '{}' in autocc.toml is absolute. This may break portability. Consider using a relative path.", dir);
-                }
-                config.include_dirs.emplace_back(dir);
-            }
+    static std::optional<Config> read_config_from_toml(const fs::path& toml_path) {
+        if (!fs::exists(toml_path)) {
+            return std::nullopt;
         }
 
-        if (auto* excludes = tbl["paths"]["exclude_patterns"].as_array()) {
-            for (const auto& elem : *excludes) { config.exclude_patterns.emplace_back(elem.value_or("")); }
-        }
+        try {
+            toml::table tbl = toml::parse_file(toml_path.string());
+            Config config;
 
-        if (auto* targets_arr = tbl["targets"].as_array()) {
-            for (const auto& target_node : *targets_arr) {
-                if (auto* target_tbl = target_node.as_table()) {
-                    Target target;
-                    target.name = get_or((*target_tbl)["name"].as_string(), "");
-                    target.main_file = get_or((*target_tbl)["main_file"].as_string(), "");
-                    target.output_name = get_or((*target_tbl)["output_name"].as_string(), target.name);
+            auto get_or = [&](const toml::node* node, const std::string& default_val) {
+                return node ? node->value_or(default_val) : default_val;
+            };
+            auto get_bool_or = [&](const toml::node* node, bool default_val) {
+                return node ? node->value_or(default_val) : default_val;
+            };
 
-                    if (auto* node = (*target_tbl)["cflags"].as_string()) target.cflags = node->get();
-                    if (auto* node = (*target_tbl)["cxxflags"].as_string()) target.cxxflags = node->get();
-                    if (auto* node = (*target_tbl)["ldflags"].as_string()) target.ldflags = node->get();
+            config.build_dir = get_or(tbl["project"]["build_dir"].as_string(), ".autocc_build");
+            config.default_target = get_or(tbl["project"]["default_target"].as_string(), "");
 
-                    if (auto* sources = (*target_tbl)["sources"].as_array()) {
-                        for (const auto& elem : *sources) target.sources.emplace_back(elem.value_or(""));
+            config.cxx = get_or(tbl["compilers"]["cxx"].as_string(), config.cxx);
+            config.cc = get_or(tbl["compilers"]["cc"].as_string(), config.cc);
+            config.as = get_or(tbl["compilers"]["as"].as_string(), config.as);
+            config.launcher = get_or(tbl["compilers"]["launcher"].as_string(), config.launcher);
+            config.ar = get_or(tbl["compilers"]["ar"].as_string(), config.ar);
+            config.shared = get_or(tbl["compilers"]["sl"].as_string(), config.shared);
+            config.use_pch = get_bool_or(tbl["features"]["use_pch"].as_boolean(), false);
+
+            if (auto* includes = tbl["paths"]["include_dirs"].as_array()) {
+                for (const auto& elem : *includes) {
+                    std::string dir = elem.value_or("");
+                    if (!dir.empty() && fs::path(dir).is_absolute()) {
+                        out::warn("Include directory '{}' in autocc.toml is absolute. This may break portability. Consider using a relative path.", dir);
                     }
-                    if (auto* target_excludes = (*target_tbl)["exclude_patterns"].as_array()) {
-                        for (const auto& elem : *target_excludes) target.exclude_patterns.emplace_back(elem.value_or(""));
-                    }
-                    if (auto* libs = (*target_tbl)["external_libs"].as_array()) {
-                        for (const auto& elem : *libs) target.external_libs.emplace_back(elem.value_or(""));
-                    }
-                    if (!target.name.empty() && !target.main_file.empty()) {
-                        config.targets.push_back(target);
-                    }
+                    config.include_dirs.emplace_back(dir);
                 }
             }
+
+            if (auto* excludes = tbl["paths"]["exclude_patterns"].as_array()) {
+                for (const auto& elem : *excludes) { config.exclude_patterns.emplace_back(elem.value_or("")); }
+            }
+
+            if (auto* targets_arr = tbl["targets"].as_array()) {
+                for (const auto& target_node : *targets_arr) {
+                    if (auto* target_tbl = target_node.as_table()) {
+                        Target target;
+                        target.type = get_or((*target_tbl)["type"].as_string(), target.type);
+                        target.name = get_or((*target_tbl)["name"].as_string(), target.name);
+                        target.main_file = get_or((*target_tbl)["main_file"].as_string(), target.main_file);
+                        target.output_name = get_or((*target_tbl)["output_name"].as_string(), target.output_name);
+
+                        if (auto* node = (*target_tbl)["cflags"].as_string()) target.cflags = node->get();
+                        if (auto* node = (*target_tbl)["cxxflags"].as_string()) target.cxxflags = node->get();
+                        if (auto* node = (*target_tbl)["ldflags"].as_string()) target.ldflags = node->get();
+
+                        if (auto* sources = (*target_tbl)["sources"].as_array()) {
+                            for (const auto& elem : *sources) target.sources.emplace_back(elem.value_or(""));
+                        }
+                        if (auto* target_excludes = (*target_tbl)["exclude_patterns"].as_array()) {
+                            for (const auto& elem : *target_excludes) target.exclude_patterns.emplace_back(elem.value_or(""));
+                        }
+                        if (auto* libs = (*target_tbl)["external_libs"].as_array()) {
+                            for (const auto& elem : *libs) target.external_libs.emplace_back(elem.value_or(""));
+                        }
+                        if (!target.name.empty() && !target.main_file.empty()) {
+                            config.targets.push_back(target);
+                        }
+                    }
+                }
+            }
+
+            validate_config(config);
+            return config;
+
+        } catch (const toml::parse_error& err) {
+            out::error("Failed to parse '{}':\n{}", toml_path, err.description());
+            return std::nullopt;
         }
-
-        validate_config(config);
-        return config;
-
-    } catch (const toml::parse_error& err) {
-        out::error("Failed to parse '{}':\n{}", toml_path, err.description());
-        return std::nullopt;
     }
-}
+};
+
 
 class Fetcher {
 public:
@@ -1395,7 +1390,9 @@ public:
         const std::string pch_compile_cmd = fmt::format("{} -x c++-header {} -o {} {}",
             config.cxx, pch_source, pch_out,
             fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
+        #ifdef VERBOSE
         out::command("{}", pch_compile_cmd);
+        #endif
         if (auto [exit_code, stdout_output, stderr_output] = execute(pch_compile_cmd); exit_code != 0) {
             out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
             return "";
@@ -1456,16 +1453,13 @@ public:
     static std::unique_ptr<AutoCC> load_from_cache() {
         Config config;
         read_config_cache_static(config);
-        auto instance = std::make_unique<AutoCC>(std::move(config), false); // lmao, anyways.
+        auto instance = std::make_unique<AutoCC>(std::move(config), false);
         if (instance->source_files.empty()) {
             out::warn("No source files found. This may be correct for a header-only library.");
         }
         return instance;
     }
 
-    static AutoCC create_with_auto_detection(Config config) {
-        return AutoCC(std::move(config), true);
-    }
 
     void writeConfigCache() const {
         try {
@@ -1484,14 +1478,16 @@ public:
         file << "cc:" << config.cc << "\n";
         file << "as:" << config.as << "\n";
         file << "launcher:" << config.launcher << "\n"; // eg. ccache
+        file << "ar:" << config.ar << "\n";
+        file << "sl:" << config.shared << "\n";
         file << "build_dir:" << config.build_dir << "\n";
         file << "use_pch:" << (config.use_pch ? "true" : "false") << "\n";
         file << "default_target:" << config.default_target << "\n";
-
+        out::info("{}", config.launcher);
         for (const auto& dir : config.include_dirs) file << "include:" << dir << "\n";
         for (const auto& pattern : config.exclude_patterns) file << "exclude:" << pattern << "\n";
 
-        for (const auto&[name, main_file, sources, output_name, exclude_patterns, cflags, cxxflags, ldflags, external_libs] : config.targets) {
+        for (const auto&[type, name, main_file, sources, output_name, exclude_patterns, cflags, cxxflags, ldflags, external_libs] : config.targets) {
             auto escape_pipes = [](const std::string& str) {
                 std::string result = str;
                 size_t pos = 0;
@@ -1502,7 +1498,8 @@ public:
                 return result;
             };
 
-            file << "target:" << escape_pipes(name) << "|"
+            file << "target:" << escape_pipes(type) << "|"
+                << escape_pipes(name) << "|"
                 << escape_pipes(main_file) << "|"
                 << escape_pipes(output_name) << "|"
                 << escape_pipes(cflags.value_or("")) << "|"
@@ -1580,7 +1577,9 @@ public:
             if (key == "cxx") config.cxx = value;
             else if (key == "cc") config.cc = value;
             else if (key == "as") config.as = value;
-            else if (key == "launcher") { config.launcher = value; out::info("val: {}", config.launcher); }
+            else if (key == "launcher") config.launcher = value;
+            else if (key == "ar") config.ar = value;
+            else if (key == "sl") config.shared = value;
             else if (key == "build_dir") config.build_dir = value;
             else if (key == "use_pch") config.use_pch = value == "true";
             else if (key == "default_target") config.default_target = value;
@@ -1610,14 +1609,15 @@ public:
                 }
                 parts.push_back(unescape_pipes(value_str.substr(start)));
 
-                if (parts.size() >= 6) {
+                if (parts.size() >= 7) {
                     Target target;
-                    target.name = parts[0];
-                    target.main_file = parts[1];
-                    target.output_name = parts[2];
-                    if (!parts[3].empty()) target.cflags = parts[3];
-                    if (!parts[4].empty()) target.cxxflags = parts[4];
-                    if (!parts[5].empty()) target.ldflags = parts[5];
+                    target.type = parts[0];
+                    target.name = parts[1];
+                    target.main_file = parts[2];
+                    target.output_name = parts[3];
+                    if (!parts[4].empty()) target.cflags = parts[4];
+                    if (!parts[5].empty()) target.cxxflags = parts[5];
+                    if (!parts[6].empty()) target.ldflags = parts[6];
                     target_map[target.name] = target;
                 } else {
                     out::warn("Invalid target format in cache, skipping: {}", line);
@@ -1668,6 +1668,36 @@ public:
         return true;
     }
 private:
+
+    static std::string hash_file(const fs::path& path) {
+        const int fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) return "";
+
+        struct stat sb{};
+        if (fstat(fd, &sb) == -1) {
+            close(fd);
+            return "";
+        }
+
+        if (sb.st_size == 0) {
+            close(fd);
+            return "ef46db3751d8e999"; // XXH64 of empty data
+        }
+
+        void* mapped = mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mapped == MAP_FAILED) {
+            close(fd);
+            return "";
+        }
+
+        XXH64_hash_t hash_val = XXH64(mapped, sb.st_size, 0);
+
+        munmap(mapped, sb.st_size);
+        close(fd);
+
+        return fmt::format("{:016x}", hash_val);
+    }
+
     static bool isInIgnoredDirectory(const fs::path& path, const std::unordered_set<std::string>& ignored_dirs_set) {
         const std::string path_str = path.string();
 
@@ -1789,24 +1819,31 @@ private:
             return 1;
         }
 
-        out::info("Target '{}' building {} source files:", target.name, target_source_files.size());
+        #ifdef VERBOSE
+        out::info("Target '{}' needs {} source files:", target.name, target_source_files.size());
         for (const auto& file : target_source_files) {
             out::info("  - {}", fs::relative(file).string());
         }
+        #endif
 
         return build_with_files(target_source_files, target.output_name,
                                 target.cflags.value_or(""),
                                 target.cxxflags.value_or(""),
                                 target.ldflags.value_or(""),
                                 target.external_libs,
-                                config.launcher);
+                                config.launcher, target.type);
     }
 
 
-    int build_with_files(const std::vector<fs::path>& files_to_build, const std::string& output_name,
+        int build_with_files(const std::vector<fs::path>& files_to_build, const std::string& output_name,
                     const std::string& target_cflags, const std::string& target_cxxflags,
                     const std::string& target_ldflags, const std::vector<std::string>& target_libs,
-                    const std::string& launcher) {
+                    const std::string& launcher, const std::string& type) {
+
+        if (!Validation::isTypeValid(type)) {
+            out::error("Unknown type: {}", type);
+            return 1;
+        }
 
         if (files_to_build.empty()) {
             out::error("No source files found to build.");
@@ -1887,7 +1924,9 @@ private:
             }
             if (needs_recompile) {
                 files_to_compile.push_back(src_file);
+                #ifdef VERBOSE
                 out::info("Will recompile {}: {}.", fs::relative(src_file).string(), reason);
+                #endif
             }
             new_build_cache[obj_file.string()] = {
                 {"source", src_file.string()},
@@ -1925,10 +1964,16 @@ private:
                         } else {
                             std::string_view flags = compiler == config.cxx ? target_cxxflags : target_cflags;
                             std::string current_pch_flags = compiler == config.cxx && !pch_flags.empty() ? pch_flags : "";
-                            cmd = fmt::format("{} {} -c {} -o {} {} {} {}", launcher, compiler, src, obj, flags, current_pch_flags,
+                            if (type == "DLibrary" || type == "SLibrary")
+                            cmd = fmt::format("{} {} -c -fPIC {} -o {} {} {} {}", launcher, compiler, src, obj, flags, current_pch_flags,
                                   fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
+                            else
+                            cmd = fmt::format("{} {} -c {} -o {} {} {} {}", launcher, compiler, src, obj, flags, current_pch_flags,
+                              fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
                         }
+                        #ifdef VERBOSE
                         out::command("{}", cmd);
+                        #endif
                         if (auto [exit_code, stdout_output, stderr_output] = execute(cmd); exit_code != 0) {
                             out::error("Failed to compile: {}", src);
                             std::lock_guard lock(g_output_mutex);
@@ -1938,6 +1983,7 @@ private:
                     }
                 });
             }
+
             for (auto& w : workers) w.join();
             if (compilation_failed) {
                 out::error("Compilation failed. Aborting.");
@@ -1947,27 +1993,83 @@ private:
 
         const fs::path target_path = fs::path(config.build_dir) / output_name;
 
-        out::info("Linking target...");
+        if (type == "Executable") {
+            out::info("Linking executable target...");
 
-        const std::string link_cmd = fmt::format("{} {} -o {} {} {} {} {}",
-            launcher,
-            config.cxx, target_path,
-            fmt::join(object_files, " "),
-            target_cxxflags, // Added for link-time flags
-            target_ldflags,
-            fmt::join(target_libs, " "));
-        out::command("{}", link_cmd);
-
-        if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
-            out::error("Failed to link target: {}", output_name);
-            std::lock_guard lock(g_output_mutex);
-            fmt::print(stderr, "{}\n", stderr_output);
-            return 1;
+            const std::string link_cmd = fmt::format("{} {} -o {} {} {} {} {}",
+                launcher,
+                config.cxx, target_path,
+                fmt::join(object_files, " "),
+                target_cxxflags, // Added for link-time flags
+                target_ldflags,
+                fmt::join(target_libs, " "));
+            #ifdef VERBOSE
+            out::command("{}", link_cmd);
+            #endif
+            if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
+                out::error("Failed to link target: {}", output_name);
+                std::lock_guard lock(g_output_mutex);
+                fmt::print(stderr, "{}\n", stderr_output);
+                return 1;
+            }
+            std::ofstream out_cache(dep_cache_file);
+            out_cache << new_build_cache.dump(2);
+            out::success("Target '{}' built successfully in '{}'.", output_name, config.build_dir);
+            return 0;
         }
-        std::ofstream out_cache(dep_cache_file);
-        out_cache << new_build_cache.dump(2);
-        out::success("Target '{}' built successfully in '{}'.", output_name, config.build_dir);
-        return 0;
+
+        if (type == "DLibrary") {
+            out::info("Linking dynamic target...");
+            if (target_path.extension() != ".so") out::warn("Target name {} with type {} Does not have correct extension.", target_path, type);
+            const std::string link_cmd = fmt::format("{} {} -shared -o {} {} {} {}",
+                launcher,
+                config.shared,
+                target_path,
+                fmt::join(object_files, " "),
+                target_ldflags,
+                fmt::join(target_libs, " ")
+                );
+            #ifdef VERBOSE
+            out::command("{}", link_cmd);
+            #endif
+            if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
+                out::error("Failed to link target: {}", output_name);
+                std::lock_guard lock(g_output_mutex);
+                fmt::print(stderr, "{}\n", stderr_output);
+                return 1;
+            }
+            std::ofstream out_cache(dep_cache_file);
+            out_cache << new_build_cache.dump(2);
+            out::success("Target '{}' built successfully in '{}'.", output_name, config.build_dir);
+            return 0;
+        }
+
+        if (type == "SLibrary") {
+            out::info("Linking static target...");
+            if (target_path.extension() != ".a") out::warn("Target name {} with type {} Does not have correct extension.", target_path, type);
+            const std::string link_cmd = fmt::format("{} {} rcs {} {} {}",
+                launcher,
+                config.ar,
+                target_path,
+                fmt::join(object_files, " "),
+                target_ldflags
+                );
+            #ifdef VERBOSE
+            out::command("{}", link_cmd);
+            #endif
+            if (auto [exit_code, stdout_output, stderr_output] = execute(link_cmd); exit_code != 0) {
+                out::error("Failed to link target: {}", output_name);
+                std::lock_guard lock(g_output_mutex);
+                fmt::print(stderr, "{}\n", stderr_output);
+                return 1;
+            }
+            std::ofstream out_cache(dep_cache_file);
+            out_cache << new_build_cache.dump(2);
+            out::success("Target '{}' built successfully in '{}'.", output_name, config.build_dir);
+            return 0;
+        }
+
+        return 1; // should not reach here
     }
 
     const fs::path root = PROJECT_ROOT;
@@ -1979,584 +2081,599 @@ private:
 };
 
 // info and help
+class Information {
+public:
+    static void show_version() {
+        fmt::print("AutoCC {} compiled on {} at {}\n",
+            fmt::styled(VERSION, COLOR_SUCCESS),
+            fmt::styled(DATE, COLOR_INFO),
+            fmt::styled(TIME, COLOR_INFO)
+        );
+    }
 
-void show_version() {
-    fmt::print("AutoCC {} compiled on {} at {}\n",
-        fmt::styled(VERSION, COLOR_SUCCESS),
-        fmt::styled(DATE, COLOR_INFO),
-        fmt::styled(TIME, COLOR_INFO)
-    );
-}
+    static void show_help() {
+        using fmt::styled;
+        show_version();
 
-void show_help() {
-    using fmt::styled;
-    show_version();
+        fmt::print(
+            "\n"
+            "Usage: autocc [command] (target_name)\n\n"
+            "Commands:\n"
+            "  {}   Builds the default target, or a specified target.\n"
+            "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
+            "  {}        Converts 'autocc.toml' to the internal build cache.\n"
+            "  {}          Open a TUI to visually select source files for targets (could be disabled).\n"
+            "  {}                Removes the build directory.\n"
+            "  {}                 Removes all autocc generated files (cache, build dir, db).\n"
+            "  {}                Download/update the library detection database.\n"
+            "  {}              Show current version and build date.\n"
+            "  {}                 Shows this help message.\n"
+            "  {}     Install specified target to system binary dir.\n"
+            "Flags:\n"
+            "  {}            For 'autocc autoconfig', use default settings.\n",
+            styled("<none> or <target>", COLOR_PROMPT),
+            styled("ac/autoconfig", COLOR_PROMPT),
+            styled("setup/sync/sc", COLOR_PROMPT),
+            styled("edit/select", COLOR_PROMPT),
+            styled("clean", COLOR_PROMPT),
+            styled("wipe", COLOR_PROMPT),
+            styled("fetch", COLOR_PROMPT),
+            styled("version", COLOR_PROMPT),
+            styled("help", COLOR_PROMPT),
+            styled("install <target>", COLOR_PROMPT),
+            styled("--default", COLOR_PROMPT)
+        );
+    }
+};
 
-    fmt::print(
-        "\n"
-        "Usage: autocc [command] (target_name)\n\n"
-        "Commands:\n"
-        "  {}   Builds the default target, or a specified target.\n"
-        "  {}        Creates 'autocc.toml' via an interactive prompt.\n"
-        "  {}        Converts 'autocc.toml' to the internal build cache.\n"
-        "  {}          Open a TUI to visually select source files for targets (could be disabled).\n"
-        "  {}                Removes the build directory.\n"
-        "  {}                 Removes all autocc generated files (cache, build dir, db).\n"
-        "  {}                Download/update the library detection database.\n"
-        "  {}              Show current version and build date.\n"
-        "  {}                 Shows this help message.\n"
-        "  {}     Install specified target to system binary dir.\n"
-        "Flags:\n"
-        "  {}            For 'autocc autoconfig', use default settings.\n",
-        styled("<none> or <target>", COLOR_PROMPT),
-        styled("ac/autoconfig", COLOR_PROMPT),
-        styled("setup/sync/sc", COLOR_PROMPT),
-        styled("edit/select", COLOR_PROMPT),
-        styled("clean", COLOR_PROMPT),
-        styled("wipe", COLOR_PROMPT),
-        styled("fetch", COLOR_PROMPT),
-        styled("version", COLOR_PROMPT),
-        styled("help", COLOR_PROMPT),
-        styled("install <target>", COLOR_PROMPT),
-        styled("--default", COLOR_PROMPT)
-    );
-}
+class Setup {
+public:
 
 #ifdef USE_TUI
 
-void user_init(Config& config) {
-    using namespace ftxui;
-    int current_step = 0;
-    constexpr int total_steps = 5;
+    static void user_init(Config& config) {
+        using namespace ftxui;
+        int current_step = 0;
+        constexpr int total_steps = 5;
 
-    // Helper to format the step title like "[1/5] Title"
-    auto format_step_title = [&](const std::string& title) {
-        return fmt::format("[{}/{}] {}", current_step, total_steps, title);
-    };
+        // Helper to format the step title like "[1/5] Title"
+        auto format_step_title = [&](const std::string& title) {
+            return fmt::format("[{}/{}] {}", current_step, total_steps, title);
+        };
 
-    // Helper to create a progress bar that adapts to terminal width
-    auto create_progress_bar = [&](const int width) {
-        const float progress = static_cast<float>(current_step) / total_steps;
-        const int bar_width = std::min(30, width / 3); // Adaptive width, max 30
-        const int filled = static_cast<int>(progress) * bar_width;
-        std::string bar = "[";
-        for (int i = 0; i < bar_width; i++) {
-            bar += i < filled ? "█" : "░";
-        }
-        bar += "]";
-        return text(bar) | dim;
-    };
-    // Helper to display a fullscreen message box
-    auto display_message = [&](const std::string& title, const Element &message_element) {
-        current_step++;
-        auto screen = ScreenInteractive::Fullscreen();
-        const auto component = Renderer([&] {
-            // Get terminal dimensions
-            const int term_width = Terminal::Size().dimx;
-            // Create a decorative header that spans full width
-            auto header = vbox({
-                text("╭" + std::string(term_width - 2, '-') + "╮") | dim,
-                hbox({
-                    text("│ ") | dim,
-                    text("AutoCC Configuration Wizard") | bold,
-                    filler(),
-                    create_progress_bar(term_width),
-                    text(" │") | dim
-                }),
-                text("╰" + std::string(term_width - 2, '-') + "╯") | dim,
-            });
-
-            // Create the main content area with proper padding
-            const auto padded_content = vbox({
-                filler(),  // Top filler to center content
-                message_element | center,
-                filler(),  // Bottom filler to center content
-                separatorEmpty(),
-                hbox({
-                    filler(),
-                    text("[ Press ") | dim,
-                    text("ENTER") | bold | underlined,
-                    text(" to continue ]") | dim,
-                    filler()
-                }),
-                separatorEmpty()
-            });
-
-            // Create the step indicator
-            const auto step_indicator = hbox({
-                text(" ◆ ") | bold,
-                text(format_step_title(title)) | bold,
-                text(" ◆ ") | bold
-            }) | center;
-
-            // Combine everything with proper margins
-            auto main_content = vbox({
-                header,
-                separatorEmpty(),
-                window(
-                    step_indicator,
-                    padded_content | flex
-                ) | borderDouble | flex,
-                separatorEmpty(),
-                text("© AutoCC Build System") | dim | center
-            });
-
-            return main_content;
-        });
-
-        const auto final_component = CatchEvent(component, [&](const Event& event) {
-            if (event == Event::Return) {
-                screen.Exit();
-                return true;
+        // Helper to create a progress bar that adapts to terminal width
+        auto create_progress_bar = [&](const int width) {
+            const float progress = static_cast<float>(current_step) / total_steps;
+            const int bar_width = std::min(30, width / 3); // Adaptive width, max 30
+            const int filled = static_cast<int>(progress) * bar_width;
+            std::string bar = "[";
+            for (int i = 0; i < bar_width; i++) {
+                bar += i < filled ? "█" : "░";
             }
-            return false;
-        });
-        screen.Loop(final_component);
-    };
+            bar += "]";
+            return text(bar) | dim;
+        };
+        // Helper to display a fullscreen message box
+        auto display_message = [&](const std::string& title, const Element &message_element) {
+            current_step++;
+            auto screen = ScreenInteractive::Fullscreen();
+            const auto component = Renderer([&] {
+                // Get terminal dimensions
+                const int term_width = Terminal::Size().dimx;
+                // Create a decorative header that spans full width
+                auto header = vbox({
+                    text("╭" + std::string(term_width - 2, '-') + "╮") | dim,
+                    hbox({
+                        text("│ ") | dim,
+                        text("AutoCC Configuration Wizard") | bold,
+                        filler(),
+                        create_progress_bar(term_width),
+                        text(" │") | dim
+                    }),
+                    text("╰" + std::string(term_width - 2, '-') + "╯") | dim,
+                });
 
-    // Helper for getting user input with fullscreen layout
-    auto get_input = [&](const std::string& prompt, const std::string& default_val) -> std::string {
-        std::string value;
-        auto screen = ScreenInteractive::Fullscreen();
-        auto input_component = Input(&value, default_val);
-        const auto component = Container::Vertical({ input_component });
+                // Create the main content area with proper padding
+                const auto padded_content = vbox({
+                    filler(),  // Top filler to center content
+                    message_element | center,
+                    filler(),  // Bottom filler to center content
+                    separatorEmpty(),
+                    hbox({
+                        filler(),
+                        text("[ Press ") | dim,
+                        text("ENTER") | bold | underlined,
+                        text(" to continue ]") | dim,
+                        filler()
+                    }),
+                    separatorEmpty()
+                });
 
-        const auto renderer = Renderer(component, [&] {
-            // Get terminal dimensions
-            const int term_width = Terminal::Size().dimx;
-            const int content_width = std::min(80, term_width - 10); // Max 80 chars wide for readability
+                // Create the step indicator
+                const auto step_indicator = hbox({
+                    text(" ◆ ") | bold,
+                    text(format_step_title(title)) | bold,
+                    text(" ◆ ") | bold
+                }) | center;
 
-            // Create decorative elements
-            auto divider = text(std::string(content_width, '=')) | dim | center;
+                // Combine everything with proper margins
+                auto main_content = vbox({
+                    header,
+                    separatorEmpty(),
+                    window(
+                        step_indicator,
+                        padded_content | flex
+                    ) | borderDouble | flex,
+                    separatorEmpty(),
+                    text("© AutoCC Build System") | dim | center
+                });
 
-            // Format the prompt with better typography
-            auto prompt_section = vbox({
-                hbox({
-                    text(" ▶ ") | bold,
-                    text(prompt) | bold
-                }) | center,
-                separatorEmpty(),
-                hbox({
-                    text("Default: ") | dim,
-                    default_val.empty() ? text("<none>") | dim | italic : text(default_val) | underlined | dim
-                }) | center
+                return main_content;
             });
 
-            // Create the input field with visual indicators
-            auto input_field = hbox({
-                text("╭─ ") | dim,
-                text("Input") | bold,
-                text(" ─╮") | dim
-            }) | center;
+            const auto final_component = CatchEvent(component, [&](const Event& event) {
+                if (event == Event::Return) {
+                    screen.Exit();
+                    return true;
+                }
+                return false;
+            });
+            screen.Loop(final_component);
+        };
 
-            const auto input_box_width = std::min(60, content_width - 10);
-            auto input_area = vbox({
-                input_field,
-                hbox({
-                    filler(),
-                    text("│ ") | dim,
-                    input_component->Render() | size(WIDTH, EQUAL, input_box_width) | borderLight,
-                    text(" │") | dim,
-                    filler()
-                }),
-                hbox({
-                    filler(),
-                    text("╰" + std::string(input_box_width + 4, '-') + "╯") | dim,
-                    filler()
-                })
+        // Helper for getting user input with fullscreen layout
+        auto get_input = [&](const std::string& prompt, const std::string& default_val) -> std::string {
+            std::string value;
+            auto screen = ScreenInteractive::Fullscreen();
+            auto input_component = Input(&value, default_val);
+            const auto component = Container::Vertical({ input_component });
+
+            const auto renderer = Renderer(component, [&] {
+                // Get terminal dimensions
+                const int term_width = Terminal::Size().dimx;
+                const int content_width = std::min(80, term_width - 10); // Max 80 chars wide for readability
+
+                // Create decorative elements
+                auto divider = text(std::string(content_width, '=')) | dim | center;
+
+                // Format the prompt with better typography
+                auto prompt_section = vbox({
+                    hbox({
+                        text(" ▶ ") | bold,
+                        text(prompt) | bold
+                    }) | center,
+                    separatorEmpty(),
+                    hbox({
+                        text("Default: ") | dim,
+                        default_val.empty() ? text("<none>") | dim | italic : text(default_val) | underlined | dim
+                    }) | center
+                });
+
+                // Create the input field with visual indicators
+                auto input_field = hbox({
+                    text("╭─ ") | dim,
+                    text("Input") | bold,
+                    text(" ─╮") | dim
+                }) | center;
+
+                const auto input_box_width = std::min(60, content_width - 10);
+                auto input_area = vbox({
+                    input_field,
+                    hbox({
+                        filler(),
+                        text("│ ") | dim,
+                        input_component->Render() | size(WIDTH, EQUAL, input_box_width) | borderLight,
+                        text(" │") | dim,
+                        filler()
+                    }),
+                    hbox({
+                        filler(),
+                        text("╰" + std::string(input_box_width + 4, '-') + "╯") | dim,
+                        filler()
+                    })
+                });
+
+                // Help text
+                auto help_text = hbox({
+                    text("💡 ") | dim,
+                    text("Tip: Press Enter to use default value") | dim | italic
+                }) | center;
+
+                // Combine all elements with proper vertical centering
+                const auto content = vbox({
+                    filler(),  // Top spacer
+                    divider,
+                    separatorEmpty(),
+                    prompt_section,
+                    separatorEmpty(),
+                    input_area,
+                    separatorEmpty(),
+                    help_text,
+                    separatorEmpty(),
+                    divider,
+                    filler()   // Bottom spacer
+                });
+
+                // Create the window with a title
+                return window(
+                    hbox({
+                        text(" ⚙ ") | bold,
+                        text("Configuration Input") | bold,
+                        text(" ⚙ ") | bold
+                    }) | center,
+                    content
+                ) | borderDouble;
             });
 
-            // Help text
-            auto help_text = hbox({
-                text("💡 ") | dim,
-                text("Tip: Press Enter to use default value") | dim | italic
-            }) | center;
-
-            // Combine all elements with proper vertical centering
-            const auto content = vbox({
-                filler(),  // Top spacer
-                divider,
-                separatorEmpty(),
-                prompt_section,
-                separatorEmpty(),
-                input_area,
-                separatorEmpty(),
-                help_text,
-                separatorEmpty(),
-                divider,
-                filler()   // Bottom spacer
+            const auto final_component = CatchEvent(renderer, [&](const Event& event) {
+                if (event == Event::Return) {
+                    screen.Exit();
+                    return true;
+                }
+                return false;
             });
+            screen.Loop(final_component);
+            return value.empty() ? default_val : value;
+        };
 
-            // Create the window with a title
-            return window(
-                hbox({
-                    text(" ⚙ ") | bold,
-                    text("Configuration Input") | bold,
-                    text(" ⚙ ") | bold
-                }) | center,
-                content
-            ) | borderDouble;
-        });
-
-        const auto final_component = CatchEvent(renderer, [&](const Event& event) {
-            if (event == Event::Return) {
-                screen.Exit();
-                return true;
-            }
-            return false;
-        });
-        screen.Loop(final_component);
-        return value.empty() ? default_val : value;
-    };
-
-    // --- The logic below remains unchanged but with enhanced display ---
-    display_message("Welcome", vbox({
-        text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
-        separatorEmpty(),
-        text("Welcome to the AutoCC Configuration Wizard") | bold | center,
-        separatorEmpty(),
-        text("This utility will guide you through creating a configuration file") | center,
-        text("for your C/C++ build system. The wizard will help you:") | center,
-        separatorEmpty(),
-        vbox({
-            text("  • Configure compilers and build tools ") | center,
-            text("  • Set up build directories and options") | center,
-            text("  • Discover and configure build targets") | center,
-            text("  • Define source files and dependencies") | center
-        }) | dim,
-        separatorEmpty(),
-        text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
-        separatorEmpty(),
-        text("💡 Press Enter on any prompt to accept the default value shown") | italic | center
-    }));
-
-    config.cc = get_input("C Compiler", config.cc);
-    config.cxx = get_input("C++ Compiler", config.cxx);
-    config.as = get_input("Assembler", config.as);
-    config.launcher = get_input("Launcher", config.launcher);
-    config.build_dir = get_input("Build Directory", config.build_dir);
-    std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
-    config.use_pch = pch_choice == "yes" || pch_choice == "y";
-
-    if (std::string exclude_input = get_input("Global exclude patterns (space-separated)", ""); !exclude_input.empty()) {
-        std::stringstream ss(exclude_input);
-        std::string item;
-        while (ss >> item) {
-            config.exclude_patterns.push_back(item);
-        }
-    }
-
-    display_message("Discovery", vbox({
-        text("🔍 Searching for potential build targets...") | bold | center,
-        separatorEmpty(),
-        text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
-        separatorEmpty(),
-        text("The wizard is now scanning your project directory to") | center,
-        text("automatically discover executable targets based on:") | center,
-        separatorEmpty(),
-        vbox({
-            text("  • Files containing main() functions") | center,
-            text("  • Common source file patterns") | center,
-            text("  • Directory structure conventions") | center
-        }) | dim,
-        separatorEmpty(),
-        text("This may take a moment depending on project size...") | italic | dim | center
-    }));
-
-    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
-    auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
-    auto discovered = TargetDiscovery::discover_targets(all_sources);
-
-    if (discovered.empty()) {
-        display_message("Warning", vbox({
-            text("⚠️  No Targets Discovered") | bold | center,
+        // --- The logic below remains unchanged but with enhanced display ---
+        display_message("Welcome", vbox({
+            text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
             separatorEmpty(),
-            text("─────────────────────────────────────────────────────") | dim | center,
+            text("Welcome to the AutoCC Configuration Wizard") | bold | center,
             separatorEmpty(),
-            text("The wizard could not automatically discover any build targets.") | center,
-            text("This could mean:") | center,
+            text("This utility will guide you through creating a configuration file") | center,
+            text("for your C/C++ build system. The wizard will help you:") | center,
             separatorEmpty(),
             vbox({
-                text("  • No source files with main() were found") | center,
-                text("  • Source files are in excluded directories") | center,
-                text("  • Non-standard project structure") | center
+                text("  • Configure compilers and build tools ") | center,
+                text("  • Set up build directories and options") | center,
+                text("  • Discover and configure build targets") | center,
+                text("  • Define source files and dependencies") | center
             }) | dim,
             separatorEmpty(),
-            text("You'll need to configure targets manually in autocc.toml") | bold | center,
+            text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
             separatorEmpty(),
-            text("─────────────────────────────────────────────────────") | dim | center
+            text("💡 Press Enter on any prompt to accept the default value shown") | italic | center
         }));
-        return;
-    }
 
-    {
-        Elements target_elements;
-        target_elements.push_back(text("📦 Found the following potential targets:") | bold | center);
-        target_elements.push_back(separatorEmpty());
-        target_elements.push_back(text("═══════════════════════════════════════════════════════════════") | dim | center);
+        config.cc = get_input("C Compiler", config.cc);
+        config.cxx = get_input("C++ Compiler", config.cxx);
+        config.as = get_input("Assembler", config.as);
+        config.launcher = get_input("Launcher", config.launcher);
+        config.ar = get_input("Archiver", config.ar);
+        config.shared = get_input("Shared library linker", config.shared);
+        config.build_dir = get_input("Build Directory", config.build_dir);
+        std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
+        config.use_pch = pch_choice == "yes" || pch_choice == "y";
 
-        for (const auto&[suggested_name, main_file, suggested_sources, reason] : discovered) {
-            target_elements.push_back(separatorEmpty());
-            target_elements.push_back(
+        if (std::string exclude_input = get_input("Global exclude patterns (space-separated)", ""); !exclude_input.empty()) {
+            std::stringstream ss(exclude_input);
+            std::string item;
+            while (ss >> item) {
+                config.exclude_patterns.push_back(item);
+            }
+        }
+
+        display_message("Discovery", vbox({
+            text("🔍 Searching for potential build targets...") | bold | center,
+            separatorEmpty(),
+            text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
+            separatorEmpty(),
+            text("The wizard is now scanning your project directory to") | center,
+            text("automatically discover executable targets based on:") | center,
+            separatorEmpty(),
+            vbox({
+                text("  • Files containing main() functions") | center,
+                text("  • Common source file patterns") | center,
+                text("  • Directory structure conventions") | center
+            }) | dim,
+            separatorEmpty(),
+            text("This may take a moment depending on project size...") | italic | dim | center
+        }));
+
+        const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+        auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+        auto discovered = TargetDiscovery::discover_targets(all_sources);
+
+        if (discovered.empty()) {
+            display_message("Warning", vbox({
+                text("⚠️  No Targets Discovered") | bold | center,
+                separatorEmpty(),
+                text("─────────────────────────────────────────────────────") | dim | center,
+                separatorEmpty(),
+                text("The wizard could not automatically discover any build targets.") | center,
+                text("This could mean:") | center,
+                separatorEmpty(),
                 vbox({
-                    hbox({
-                        text("  ▸ ") | bold,
-                        text(suggested_name) | bold | underlined,
-                        text(" (") | dim,
-                        text(std::to_string(suggested_sources.size())) | bold,
-                        text(" sources)") | dim
-                    }) | center,
-                    hbox({
-                        text("    Main: ") | dim,
-                        text(main_file.filename().string())
-                    }) | center,
-                    hbox({
-                        text("    Reason: ") | dim,
-                        text(reason) | italic
-                    }) | center
-                })
-            );
-            target_elements.push_back(text("  ─────────────────────────────────────────────────────────") | dim | center);
+                    text("  • No source files with main() were found") | center,
+                    text("  • Source files are in excluded directories") | center,
+                    text("  • Non-standard project structure") | center
+                }) | dim,
+                separatorEmpty(),
+                text("You'll need to configure targets manually in autocc.toml") | bold | center,
+                separatorEmpty(),
+                text("─────────────────────────────────────────────────────") | dim | center
+            }));
+            return;
         }
 
-        target_elements.push_back(text("═══════════════════════════════════════════════════════════════") | dim | center);
-        current_step--;
-        display_message("Discovered Targets", vbox(target_elements));
-        current_step++;
-    }
+        {
+            Elements target_elements;
+            target_elements.push_back(text("📦 Found the following potential targets:") | bold | center);
+            target_elements.push_back(separatorEmpty());
+            target_elements.push_back(text("═══════════════════════════════════════════════════════════════") | dim | center);
 
-    for (const auto& discovered_target : discovered) {
-        std::string prompt = fmt::format("Configure target '{}'?", discovered_target.suggested_name);
-        if (std::string accept = get_input(prompt, "y"); accept == "y" || accept == "yes" || accept == "Y") {
-            Target target;
-            target.name = get_input("Target Name", discovered_target.suggested_name);
-            target.main_file = discovered_target.main_file.string();
-            target.output_name = get_input("Output Executable Name", target.name);
-            target.cxxflags = get_input("CXX Flags for this target", target.cxxflags.value());
-            target.cflags = get_input("C Flags for this target", target.cflags.value());
-            target.ldflags = get_input("Linker Flags for this target", "");
-
-            if (std::string libs_input = get_input("External libs for this target (e.g. -lpthread)", ""); !libs_input.empty()) {
-                std::stringstream ss(libs_input);
-                std::string lib;
-                while (ss >> lib) target.external_libs.push_back(lib);
+            for (const auto&[suggested_name, main_file, suggested_sources, reason] : discovered) {
+                target_elements.push_back(separatorEmpty());
+                target_elements.push_back(
+                    vbox({
+                        hbox({
+                            text("  ▸ ") | bold,
+                            text(suggested_name) | bold | underlined,
+                            text(" (") | dim,
+                            text(std::to_string(suggested_sources.size())) | bold,
+                            text(" sources)") | dim
+                        }) | center,
+                        hbox({
+                            text("    Main: ") | dim,
+                            text(main_file.filename().string())
+                        }) | center,
+                        hbox({
+                            text("    Reason: ") | dim,
+                            text(reason) | italic
+                        }) | center
+                    })
+                );
+                target_elements.push_back(text("  ─────────────────────────────────────────────────────────") | dim | center);
             }
 
-            {
-                Elements source_elements;
-                source_elements.push_back(text("📄 Suggested source files:") | bold | center);
-                source_elements.push_back(separatorEmpty());
-                source_elements.push_back(text("─────────────────────────────────────────────────") | dim | center);
-                for (const auto& src : discovered_target.suggested_sources) {
-                    source_elements.push_back(hbox({
-                        text("    • "),
-                        text(src.string()) | dim
-                    }) | center);
-                }
-                source_elements.push_back(text("─────────────────────────────────────────────────") | dim | center);
-                display_message(fmt::format("Sources for '{}'", target.name), vbox(source_elements));
-            }
-
-            if (std::string use_suggested = get_input("Use these suggested sources? (y/n)", "y");
-                use_suggested == "y" || use_suggested == "yes" || use_suggested == "Y") {
-                for (const auto& src : discovered_target.suggested_sources) {
-                    target.sources.push_back(src.string());
-                }
-            } else {
-                if (std::string sources_input = get_input("Enter source files manually (space-separated)", ""); !sources_input.empty()) {
-                    std::stringstream ss(sources_input);
-                    std::string src;
-                    while (ss >> src) target.sources.push_back(src);
-                }
-            }
-
-            std::string target_excludes_prompt = fmt::format("Target-specific exclude patterns for '{}'", target.name);
-            if (std::string target_excludes = get_input(target_excludes_prompt, ""); !target_excludes.empty()) {
-                std::stringstream ss(target_excludes);
-                std::string pattern;
-                while (ss >> pattern) target.exclude_patterns.push_back(pattern);
-            }
-            config.targets.push_back(target);
+            target_elements.push_back(text("═══════════════════════════════════════════════════════════════") | dim | center);
+            current_step--;
+            display_message("Discovered Targets", vbox(target_elements));
+            current_step++;
         }
-    }
 
-    if (!config.targets.empty()) {
-        config.default_target = get_input("Default Build Target", config.targets[0].name);
-    }
+        for (const auto& discovered_target : discovered) {
+            std::string prompt = fmt::format("Configure target '{}'?", discovered_target.suggested_name);
+            if (std::string accept = get_input(prompt, "y"); accept == "y" || accept == "yes" || accept == "Y") {
+                Target target;
+                target.type = get_input("Target Type (Case-sensitive) (Executable, DLibrary, SLibrary)", target.type);
+                while (!Validation::isTypeValid(target.type)) target.type = get_input("Target Type (Case-sensitive) (Executable, DLibrary, SLibrary)", target.type);
+                target.name = get_input("Target Name", discovered_target.suggested_name);
+                target.main_file = discovered_target.main_file.string();
+                target.output_name = get_input("Output target Name", target.name);
+                target.cxxflags = get_input("CXX Flags for this target", target.cxxflags.value());
+                target.cflags = get_input("C Flags for this target", target.cflags.value());
+                target.ldflags = get_input("Linker Flags for this target", "");
 
-    display_message("Complete", vbox({
-        text("✨ Configuration Complete! ✨") | bold | center,
-        separatorEmpty(),
-        text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
-        separatorEmpty(),
-        text("Your build system has been successfully configured!") | center,
-        separatorEmpty(),
-        text("Summary:") | bold | center,
-        vbox({
-            hbox({text("  • Compiler: "), text(config.cxx) | dim}) | center,
-            hbox({text("  • Build Dir: "), text(config.build_dir) | dim}) | center,
-            hbox({text("  • Targets: "), text(std::to_string(config.targets.size())) | dim}) | center,
-            hbox({text("  • PCH: "), text(config.use_pch ? "Enabled" : "Disabled") | dim}) | center
-        }),
-        separatorEmpty(),
-        text("Your settings will be saved to: ") | center,
-        text("autocc.toml") | bold | underlined | center,
-        separatorEmpty(),
-        text("You can now build your project with: autocc") | italic | center,
-        separatorEmpty(),
-        text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center
-    }));
-}
+                if (std::string libs_input = get_input("External libs for this target (e.g. -lpthread)", ""); !libs_input.empty()) {
+                    std::stringstream ss(libs_input);
+                    std::string lib;
+                    while (ss >> lib) target.external_libs.push_back(lib);
+                }
+
+                {
+                    Elements source_elements;
+                    source_elements.push_back(text("📄 Suggested source files:") | bold | center);
+                    source_elements.push_back(separatorEmpty());
+                    source_elements.push_back(text("─────────────────────────────────────────────────") | dim | center);
+                    for (const auto& src : discovered_target.suggested_sources) {
+                        source_elements.push_back(hbox({
+                            text("    • "),
+                            text(src.string()) | dim
+                        }) | center);
+                    }
+                    source_elements.push_back(text("─────────────────────────────────────────────────") | dim | center);
+                    display_message(fmt::format("Sources for '{}'", target.name), vbox(source_elements));
+                }
+
+                if (std::string use_suggested = get_input("Use these suggested sources? (y/n)", "y");
+                    use_suggested == "y" || use_suggested == "yes" || use_suggested == "Y") {
+                    for (const auto& src : discovered_target.suggested_sources) {
+                        target.sources.push_back(src.string());
+                    }
+                } else {
+                    if (std::string sources_input = get_input("Enter source files manually (space-separated)", ""); !sources_input.empty()) {
+                        std::stringstream ss(sources_input);
+                        std::string src;
+                        while (ss >> src) target.sources.push_back(src);
+                    }
+                }
+
+                std::string target_excludes_prompt = fmt::format("Target-specific exclude patterns for '{}'", target.name);
+                if (std::string target_excludes = get_input(target_excludes_prompt, ""); !target_excludes.empty()) {
+                    std::stringstream ss(target_excludes);
+                    std::string pattern;
+                    while (ss >> pattern) target.exclude_patterns.push_back(pattern);
+                }
+                config.targets.push_back(target);
+            }
+        }
+
+        if (!config.targets.empty()) {
+            config.default_target = get_input("Default Build Target", config.targets[0].name);
+        }
+
+        display_message("Complete", vbox({
+            text("✨ Configuration Complete! ✨") | bold | center,
+            separatorEmpty(),
+            text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center,
+            separatorEmpty(),
+            text("Your project has been successfully configured!") | center,
+            separatorEmpty(),
+            text("Summary:") | bold | center,
+            vbox({
+                hbox({text("  • Compiler: "), text(config.cxx) | dim}) | center,
+                hbox({text("  • Build Dir: "), text(config.build_dir) | dim}) | center,
+                hbox({text("  • Targets: "), text(std::to_string(config.targets.size())) | dim}) | center,
+                hbox({text("  • PCH: "), text(config.use_pch ? "Enabled" : "Disabled") | dim}) | center
+            }),
+            separatorEmpty(),
+            text("Your settings will be saved to: ") | center,
+            text("autocc.toml") | bold | underlined | center,
+            separatorEmpty(),
+            text("You can now build your project with: autocc") | italic | center,
+            separatorEmpty(),
+            text("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━") | dim | center
+        }));
+    }
 
 #else
 
-void user_init(Config& config) {
-    auto get_input = [](const std::string_view prompt, const std::string_view default_val) -> std::string {
-        fmt::print(stdout, "{} ({})? ",
-            fmt::styled(prompt, COLOR_PROMPT),
-            fmt::styled(default_val, COLOR_DEFAULT));
-        std::string input;
-        std::getline(std::cin, input);
-        return input.empty() ? std::string(default_val) : input;
-    };
-    config.cc = get_input("C Compiler", config.cc);
-    config.cxx = get_input("C++ Compiler", config.cxx);
-    config.as = get_input("Assembler", config.as);
-    config.launcher = get_input("Launcher", config.launcher);
-    config.build_dir = get_input("Build Directory", config.build_dir);
-    std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
-    config.use_pch = pch_choice == "yes" || pch_choice == "y";
+    static void user_init(Config& config) {
+        auto get_input = [](const std::string_view prompt, const std::string_view default_val) -> std::string {
+            fmt::print(stdout, "{} ({})? ",
+                fmt::styled(prompt, COLOR_PROMPT),
+                fmt::styled(default_val, COLOR_DEFAULT));
+            std::string input;
+            std::getline(std::cin, input);
+            return input.empty() ? std::string(default_val) : input;
+        };
+        config.cc = get_input("C Compiler", config.cc);
+        config.cxx = get_input("C++ Compiler", config.cxx);
+        config.as = get_input("Assembler", config.as);
+        config.launcher = get_input("Launcher", config.launcher);
+        config.ar = get_input("Archiver", config.ar);
+        config.shared = get_input("Shared library linker", config.shared);
+        config.build_dir = get_input("Build Directory", config.build_dir);
+        std::string pch_choice = get_input("Use Pre-Compiled Headers (yes/no)", config.use_pch ? "yes" : "no");
+        config.use_pch = pch_choice == "yes" || pch_choice == "y";
 
-    if (std::string exclude_input = get_input("Global exclude patterns (space-separated, e.g. 'test_*.cpp *_test.cpp')", ""); !exclude_input.empty()) {
-        std::stringstream ss(exclude_input);
-        std::string item;
-        while (ss >> item) {
-            config.exclude_patterns.push_back(item);
+        if (std::string exclude_input = get_input("Global exclude patterns (space-separated, e.g. 'test_*.cpp *_test.cpp')", ""); !exclude_input.empty()) {
+            std::stringstream ss(exclude_input);
+            std::string item;
+            while (ss >> item) {
+                config.exclude_patterns.push_back(item);
+            }
+        }
+
+        out::info("Discovering potential build targets...");
+        const auto ignored_dirs = std::unordered_set<std::string> {".git", config.build_dir, CACHE_DIR_NAME};
+        auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+        auto discovered = TargetDiscovery::discover_targets(all_sources);
+
+        if (discovered.empty()) {
+            out::warn("No targets discovered. You'll need to configure them manually in autocc.toml");
+            return;
+        }
+
+        out::info("Discovered {} potential target(s):", discovered.size());
+        for (size_t i = 0; i < discovered.size(); ++i) {
+            const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
+            out::info("  {}: {} ({}) - {} source files",
+                     i + 1, suggested_name, main_file.filename().string(),
+                     suggested_sources.size());
+            out::info("     Reason: {}", reason);
+        }
+
+        fmt::print("\n");
+
+        for (const auto& discovered_target : discovered) {
+            std::string accept = get_input(
+                fmt::format("Configure target '{}' with main file '{}'? (y/n)",
+                           discovered_target.suggested_name, discovered_target.main_file.filename().string()),
+                "y");
+
+            if (accept == "y" || accept == "yes" || accept == "Y") {
+                Target target;
+                target.type = get_input("Target type", target.type);
+                target.name = get_input("Target name", discovered_target.suggested_name);
+                target.main_file = discovered_target.main_file.string();
+                target.output_name = get_input("Output executable name", target.name);
+                target.cxxflags = get_input("CXX Flags for this target", "");
+                target.cflags = get_input("CC Flags for this target", "");
+                target.ldflags = get_input("Linker Flags for this target", "");
+                if (std::string libs_input = get_input("External libs for this target (space-separated, e.g. -lpthread -lSDL2)", ""); !libs_input.empty()) {
+                    std::stringstream ss(libs_input);
+                    std::string lib;
+                    while (ss >> lib) target.external_libs.push_back(lib);
+                }
+
+                out::info("Suggested source files for target '{}':", target.name);
+                for (const auto& src : discovered_target.suggested_sources) {
+                    out::info("  - {}", src.string());
+                }
+
+                if (std::string use_suggested = get_input("Use these suggested sources? (y/n)", "y"); use_suggested == "y" || use_suggested == "yes" || use_suggested == "Y") {
+                    for (const auto& src : discovered_target.suggested_sources) {
+                        target.sources.push_back(src.string());
+                    }
+                } else {
+                    out::info("Enter source files manually (space-separated, relative paths):");
+                    std::string sources_input;
+                    std::getline(std::cin, sources_input);
+                    if (!sources_input.empty()) {
+                        std::stringstream ss(sources_input);
+                        std::string src;
+                        while (ss >> src) target.sources.push_back(src);
+                    }
+                }
+
+                std::string target_excludes = get_input(
+                    fmt::format("Target-specific exclude patterns for '{}' (optional)", target.name), "");
+                if (!target_excludes.empty()) {
+                    std::stringstream ss(target_excludes);
+                    std::string pattern;
+                    while (ss >> pattern) target.exclude_patterns.push_back(pattern);
+                }
+
+                config.targets.push_back(target);
+            }
+        }
+
+        if (!config.targets.empty()) {
+            config.default_target = get_input("Default target", config.targets[0].name);
         }
     }
 
-    out::info("Discovering potential build targets...");
-    const auto ignored_dirs = std::unordered_set<std::string> {".git", config.build_dir, CACHE_DIR_NAME};
-    auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
-    auto discovered = TargetDiscovery::discover_targets(all_sources);
+#endif
 
-    if (discovered.empty()) {
-        out::warn("No targets discovered. You'll need to configure them manually in autocc.toml");
-        return;
-    }
+    static void default_init(Config& config) {
+        out::info("Discovering potential build targets to create a default configuration...");
+        const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
+        const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
+        auto discovered = TargetDiscovery::discover_targets(all_sources);
 
-    out::info("Discovered {} potential target(s):", discovered.size());
-    for (size_t i = 0; i < discovered.size(); ++i) {
-        const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
-        out::info("  {}: {} ({}) - {} source files",
-                 i + 1, suggested_name, main_file.filename().string(),
-                 suggested_sources.size());
-        out::info("     Reason: {}", reason);
-    }
+        if (discovered.empty()) {
+            out::warn("No targets discovered. A default autocc.toml will be created without targets.");
+            return;
+        }
 
-    fmt::print("\n");
+        out::info("Discovered {} potential target(s). Auto-configuring with defaults.", discovered.size());
+        for (size_t i = 0; i < discovered.size(); ++i) {
+            const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
+            out::info("  {}: Found {} ({}) - {} source files. Reason: {}",
+                     i + 1, suggested_name, main_file.filename().string(),
+                     suggested_sources.size(), reason);
+        }
+        fmt::print("\n");
 
-    for (const auto& discovered_target : discovered) {
-        std::string accept = get_input(
-            fmt::format("Configure target '{}' with main file '{}'? (y/n)",
-                       discovered_target.suggested_name, discovered_target.main_file.filename().string()),
-            "y");
-
-        if (accept == "y" || accept == "yes" || accept == "Y") {
+        for (const auto& discovered_target : discovered) {
+            out::info("Automatically configuring target '{}'", discovered_target.suggested_name);
             Target target;
-            target.name = get_input("Target name", discovered_target.suggested_name);
+            target.name = discovered_target.suggested_name;
             target.main_file = discovered_target.main_file.string();
-            target.output_name = get_input("Output executable name", target.name);
-            target.cxxflags = get_input("CXX Flags for this target", "");
-            target.cflags = get_input("CC Flags for this target", "");
-            target.ldflags = get_input("Linker Flags for this target", "");
-            if (std::string libs_input = get_input("External libs for this target (space-separated, e.g. -lpthread -lSDL2)", ""); !libs_input.empty()) {
-                std::stringstream ss(libs_input);
-                std::string lib;
-                while (ss >> lib) target.external_libs.push_back(lib);
-            }
+            target.output_name = target.name;
+            target.cflags = "-std=c11";
+            target.cxxflags = "-std=c++23";
 
-            out::info("Suggested source files for target '{}':", target.name);
+            out::info("  -> Using all {} suggested source files.", discovered_target.suggested_sources.size());
             for (const auto& src : discovered_target.suggested_sources) {
-                out::info("  - {}", src.string());
-            }
-
-            if (std::string use_suggested = get_input("Use these suggested sources? (y/n)", "y"); use_suggested == "y" || use_suggested == "yes" || use_suggested == "Y") {
-                for (const auto& src : discovered_target.suggested_sources) {
-                    target.sources.push_back(src.string());
-                }
-            } else {
-                out::info("Enter source files manually (space-separated, relative paths):");
-                std::string sources_input;
-                std::getline(std::cin, sources_input);
-                if (!sources_input.empty()) {
-                    std::stringstream ss(sources_input);
-                    std::string src;
-                    while (ss >> src) target.sources.push_back(src);
-                }
-            }
-
-            std::string target_excludes = get_input(
-                fmt::format("Target-specific exclude patterns for '{}' (optional)", target.name), "");
-            if (!target_excludes.empty()) {
-                std::stringstream ss(target_excludes);
-                std::string pattern;
-                while (ss >> pattern) target.exclude_patterns.push_back(pattern);
+                target.sources.push_back(src.string());
             }
 
             config.targets.push_back(target);
         }
-    }
 
-    if (!config.targets.empty()) {
-        config.default_target = get_input("Default target", config.targets[0].name);
-    }
-}
-
-#endif
-
-void default_init(Config& config) {
-    out::info("Discovering potential build targets to create a default configuration...");
-    const auto ignored_dirs = std::unordered_set<std::string>{".git", config.build_dir, CACHE_DIR_NAME};
-    const auto all_sources = find_source_files(".", ignored_dirs, config.exclude_patterns);
-    auto discovered = TargetDiscovery::discover_targets(all_sources);
-
-    if (discovered.empty()) {
-        out::warn("No targets discovered. A default autocc.toml will be created without targets.");
-        return;
-    }
-
-    out::info("Discovered {} potential target(s). Auto-configuring with defaults.", discovered.size());
-    for (size_t i = 0; i < discovered.size(); ++i) {
-        const auto&[suggested_name, main_file, suggested_sources, reason] = discovered[i];
-        out::info("  {}: Found {} ({}) - {} source files. Reason: {}",
-                 i + 1, suggested_name, main_file.filename().string(),
-                 suggested_sources.size(), reason);
-    }
-     fmt::print("\n");
-
-    for (const auto& discovered_target : discovered) {
-        out::info("Automatically configuring target '{}'", discovered_target.suggested_name);
-        Target target;
-        target.name = discovered_target.suggested_name;
-        target.main_file = discovered_target.main_file.string();
-        target.output_name = target.name;
-        target.cflags = "-std=c11";
-        target.cxxflags = "-std=c++23";
-
-        out::info("  -> Using all {} suggested source files.", discovered_target.suggested_sources.size());
-        for (const auto& src : discovered_target.suggested_sources) {
-            target.sources.push_back(src.string());
+        if (!config.targets.empty()) {
+            config.default_target = config.targets[0].name;
+            out::info("Setting default target to '{}'", config.default_target);
         }
-
-        config.targets.push_back(target);
     }
+};
 
-    if (!config.targets.empty()) {
-        config.default_target = config.targets[0].name;
-        out::info("Setting default target to '{}'", config.default_target);
-    }
-}
+
 
 class CLIHandler {
 public:
@@ -2654,8 +2771,8 @@ bool CLIHandler::is_project_setup() const {
 }
 
 int CLIHandler::do_setup() const {
-    if (!validateVersion()) {
-        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", getCurrentValidationPattern(), CONFIG_FILE_NAME);
+    if (!Validation::validateVersion()) {
+        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", Validation::getCurrentValidationPattern(), CONFIG_FILE_NAME);
         return 1;
     }
 
@@ -2664,9 +2781,9 @@ int CLIHandler::do_setup() const {
         return 1;
     }
 
-    const auto config_opt = load_config_from_toml(config_toml_path_);
+    const auto config_opt = Configuration::read_config_from_toml(config_toml_path_);
     if (!config_opt) {
-        return 1; // Error already printed by load_config_from_toml
+        return 1; // Error already printed by read_config_from_toml
     }
 
     out::info("Syncing '{}' to internal cache...", config_toml_path_);
@@ -2731,12 +2848,12 @@ int CLIHandler::handle_fetch(const std::vector<std::string>&) const {
 }
 
 int CLIHandler::handle_help(const std::vector<std::string>&) {
-    show_help();
+    Information::show_help();
     return 0;
 }
 
 int CLIHandler::handle_version(const std::vector<std::string>&) {
-    show_version();
+    Information::show_version();
     return 0;
 }
 
@@ -2747,26 +2864,26 @@ int CLIHandler::handle_autoconfig(const std::vector<std::string>& args) const {
 
     Config config;
     if (args.size() > 2 && args[2] == "--default") {
-        default_init(config);
+        Setup::default_init(config);
     } else {
-        user_init(config);
+        Setup::user_init(config);
     }
 
     // Auto-detection runs here to populate includes and libraries before writing the TOML
-    const AutoCC scanner = AutoCC::create_with_auto_detection(std::move(config));
-    write_config_to_toml(scanner.config, config_toml_path_);
+    const auto scanner = AutoCC(std::move(config), true);
+    Configuration::write_config_to_toml(scanner.config, config_toml_path_);
     out::info("Run 'autocc setup' to prepare for building.");
     return 0;
 }
 #ifdef USE_TUI
 int CLIHandler::handle_edit(const std::vector<std::string>&) const {
     out::info("Loading configuration for editing...");
-    if (!validateVersion()) {
-        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", getCurrentValidationPattern(), CONFIG_FILE_NAME);
+    if (!Validation::validateVersion()) {
+        out::error("Version mismatch. please make sure you have a compatible autocc build and '{}' in your '{}'.", Validation::getCurrentValidationPattern(), CONFIG_FILE_NAME);
         return 1;
     }
 
-    const auto config_opt = load_config_from_toml(config_toml_path_);
+    const auto config_opt = Configuration::read_config_from_toml(config_toml_path_);
     if (!config_opt) {
         out::error("Could not load '{}'. Run 'autocc autoconfig' first.", config_toml_path_);
         return 1;
@@ -2816,7 +2933,7 @@ int CLIHandler::handle_edit(const std::vector<std::string>&) const {
     std::getline(std::cin, confirmation);
 
     if (confirmation == "y" || confirmation == "yes") {
-        write_config_to_toml(config, config_toml_path_);
+        Configuration::write_config_to_toml(config, config_toml_path_);
         out::info("To apply changes, run 'autocc setup' to sync the new config to the cache.");
     } else {
         out::info("Operation cancelled. 'autocc.toml' was not modified.");
@@ -2832,8 +2949,8 @@ int CLIHandler::handle_setup(const std::vector<std::string>&) const {
 int CLIHandler::handle_clean(const std::vector<std::string>&) {
     Config autocc_opt;
     if (!AutoCC::read_config_cache_static(autocc_opt)) {
-        out::warn("Cache not found, cannot determine build directory. Nothing to clean.");
-        return 0;
+        out::error("Cache not found, cannot determine build directory. Nothing to clean.");
+        return 1;
     }
 
     const auto& build_dir = autocc_opt.build_dir;
@@ -2860,7 +2977,7 @@ int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
     if (AutoCC::read_config_cache_static(temp_cfg)) {
         // do nothing
     } else {
-        out::error("Cannot read config.");
+        out::error("Cache not found, cannot determine build directory. Nothing to clean.");
         return 1;
     }
 
@@ -2883,7 +3000,7 @@ int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
 
 int CLIHandler::handle_install(const std::vector<std::string>& args) {
     Config config;
-    if (!validateVersion()) {
+    if (!Validation::validateVersion()) {
         out::warn("Your config file might not be up-to-date with current autocc version.");
     }
     if (!AutoCC::read_config_cache_static(config)) {
@@ -2906,7 +3023,7 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
 
     // Validate target exists
     if (!target_name.empty() && !config.targets.empty()) {
-        auto target_it = std::ranges::find_if(config.targets,
+        const auto target_it = std::ranges::find_if(config.targets,
                                             [&](const Target& t) { return t.name == target_name; });
         if (target_it == config.targets.end()) {
             out::error("Target '{}' not found. Available targets: {}",
