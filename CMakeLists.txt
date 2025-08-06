@@ -32,6 +32,7 @@ target_compile_definitions(autocc PUBLIC
         -DLOG_ENABLE_FILE
         -DAGGRESSIVE # skips files more aggressively, actually saves ram
         #-DVERBOSE
+        #-DUNSAFE
 )
 
 # Only enable TUI if NUSE_TUI is NOT enabled

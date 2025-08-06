@@ -7,12 +7,13 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
-## 🎊 What's new? (v0.1.6)
+## 🎊 What's new? (v0.1.6-2)
 - **Optimization** - Introduce parallel processing to many functions.
 - **Enhanced execution pipeline** - Safer and faster execution.
 - **Added target types** - Extend capability for future upgrades.
 - **Refactored codebase** - A Cleaner, more efficient codebase.
 - **Added new fields in user configuration** - Adapting new changes.
+- **Install targets safer** - Smarter installation.
 ## ✨ Features
 
 - **🎯 Incremental Builds** - For lightning fast rebuilds
@@ -24,7 +25,7 @@
 - **🧠 Pre-Compiled Headers** - Automatically generates PCH for common headers to speed up compilation
 - **🎯 Target Discovery** - Intelligently discovers main() functions and suggests build targets
 - **🤖 Automated setup** - with `autoconfig` setting up a project becomes easy
-- **✅ TUI-Based editor** - using `edit` to edit configuration files without any external edtior
+- **✅ TUI-Based selector** - using `edit` to edit configuration files without any external edtior
 
 ---
 
@@ -109,7 +110,11 @@ autocc test_suite
 ### 4. Install your project
 ```bash
 # install default target (may need root privileges)
-autocc install
+autocc install # for default target
+# install specific target 
+autocc install my_target
+# install all targets 
+autocc install <target> --prefix=<path to install> # to install to a specific path
 ```
 
 ---
@@ -168,7 +173,7 @@ type = 'SLibrary' # Or 'Executable' 'SLibrary' 'DLlibrary'
 ## ✅ Available Commands
 
 ```bash
-AutoCC 0.1.6 compiled on Aug  5 2025 at 13:14:43
+AutoCC 0.1.6-2 compiled on Aug  5 2025 at 13:14:43
 
 Usage: autocc [command] (target_name)
 
@@ -185,6 +190,7 @@ Commands:
   install <target>     Install specified target to system binary dir.
 Flags:
   --default            For 'autocc autoconfig', use default settings.
+  --prefix             For 'autocc install', install to a specific path.
 ```
 
 ---
