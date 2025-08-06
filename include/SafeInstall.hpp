@@ -28,7 +28,7 @@ public:
 
     int install_target(const Target& target, const fs::path& target_path) {
         // Pre-installation validation
-        if (auto result = validate_installation(target, target_path); result != 0) {
+        if (const auto result = validate_installation(target, target_path); result != 0) {
             return result;
         }
 
@@ -74,7 +74,7 @@ public:
     }
 
 private:
-    int validate_installation(const Target& target, const fs::path& target_path) {
+    int validate_installation(const Target& target, const fs::path& target_path) const {
         // Check if target exists
         if (!fs::exists(target_path)) {
             out::error("Target '{}' not found at '{}'. Please build it first.",
@@ -91,8 +91,8 @@ private:
 
         // For executables, check if they're actually executable
         if (target.type == "Executable") {
-            auto perms = fs::status(target_path).permissions();
-            if ((perms & fs::perms::owner_exec) == fs::perms::none) {
+          if (const auto perms = fs::status(target_path).permissions();
+              (perms & fs::perms::owner_exec) == fs::perms::none) {
                 out::warn("Target executable '{}' is not marked as executable", target_path);
             }
         }
@@ -105,9 +105,9 @@ private:
         return 0;
     }
 
-    bool check_permissions() {
+    bool check_permissions() const {
         // Test write access to target directories
-        std::vector<fs::path> test_dirs = {
+        std::vector test_dirs = {
             fs::path(options.prefix) / options.bin_dir,
             fs::path(options.prefix) / options.lib_dir,
             fs::path(options.prefix) / options.include_dir
@@ -121,8 +121,7 @@ private:
             // Test write permission with a temporary file
             auto temp_file = dir / ".autocc_test_write";
             try {
-                std::ofstream test(temp_file);
-                if (!test.good()) {
+              if (std::ofstream test(temp_file); !test.good()) {
                     return false;
                 }
                 fs::remove(temp_file);
@@ -133,14 +132,14 @@ private:
         return true;
     }
 
-    void suggest_alternatives() {
+    static void suggest_alternatives() {
         out::info("Consider these alternatives:");
         out::info("  1. Run with sudo: sudo autocc install");
         out::info("  2. Install to user directory: autocc install --user");
         out::info("  3. Set custom prefix: autocc install --prefix=$HOME/.local");
     }
 
-    bool check_conflicts(const Target& target) {
+    bool check_conflicts(const Target& target) const {
         fs::path dest_path;
 
         if (target.type == "Executable") {
@@ -153,10 +152,11 @@ private:
             out::warn("File '{}' already exists", dest_path);
 
             // Check if it's the same file (by comparing size and timestamp)
-            auto existing_time = fs::last_write_time(dest_path);
-            auto new_time = fs::last_write_time(fs::path(target.output_name));
+            const auto existing_time = fs::last_write_time(dest_path);
 
-            if (existing_time >= new_time) {
+            if (const auto new_time =
+                    fs::last_write_time(fs::path(target.output_name));
+                existing_time >= new_time) {
                 out::info("Existing file is newer or same age. Use --force to overwrite.");
                 return true;
             }
@@ -180,8 +180,9 @@ private:
             );
 
             // Also backup headers if they exist
-            auto header_dir = fs::path(options.prefix) / options.include_dir / target.name;
-            if (fs::exists(header_dir)) {
+            if (const auto header_dir = fs::path(options.prefix) /
+                                  options.include_dir / target.name;
+                fs::exists(header_dir)) {
                 files_to_backup.push_back(header_dir);
             }
         }
@@ -205,7 +206,7 @@ private:
     }
 
     int install_executable_safe(const fs::path& target_path, const std::string& target_name) {
-        auto dest_dir = fs::path(options.prefix) / options.bin_dir;
+      const auto dest_dir = fs::path(options.prefix) / options.bin_dir;
         auto dest_path = dest_dir / target_name;
 
         if (options.dry_run) {
@@ -219,7 +220,7 @@ private:
         }
 
         // Copy with proper permissions
-        if (!copy_file_with_permissions(target_path, dest_path, 0755)) {
+        if (!copy_file_with_permissions(target_path, dest_path, fs::perms::owner_all)) {
             return 1;
         }
 
@@ -234,7 +235,7 @@ private:
     }
 
     int install_dynamic_library_safe(const fs::path& target_path, const std::string& target_name) {
-        auto lib_dir = fs::path(options.prefix) / options.lib_dir;
+      const auto lib_dir = fs::path(options.prefix) / options.lib_dir;
         auto dest_path = lib_dir / target_path.filename();
 
         if (options.dry_run) {
@@ -247,14 +248,14 @@ private:
         }
 
         // Copy library file
-        if (!copy_file_with_permissions(target_path, dest_path, 0644)) {
+        if (!copy_file_with_permissions(target_path, dest_path, fs::perms::group_read)) {
             return 1;
         }
 
         installed_files.push_back(dest_path);
 
         // Install headers
-        if (auto header_result = install_headers_safe(target_name); header_result != 0) {
+        if (const auto header_result = install_headers_safe(target_name); header_result != 0) {
             return header_result;
         }
 
@@ -266,7 +267,7 @@ private:
     }
 
     int install_static_library_safe(const fs::path& target_path, const std::string& target_name) {
-        auto lib_dir = fs::path(options.prefix) / options.lib_dir;
+      const auto lib_dir = fs::path(options.prefix) / options.lib_dir;
         auto dest_path = lib_dir / target_path.filename();
 
         if (options.dry_run) {
@@ -279,14 +280,14 @@ private:
         }
 
         // Copy library file
-        if (!copy_file_with_permissions(target_path, dest_path, 0644)) {
+        if (!copy_file_with_permissions(target_path, dest_path, fs::perms::group_read)) {
             return 1;
         }
 
         installed_files.push_back(dest_path);
 
         // Install headers
-        if (auto header_result = install_headers_safe(target_name); header_result != 0) {
+        if (const auto header_result = install_headers_safe(target_name); header_result != 0) {
             return header_result;
         }
 
@@ -295,17 +296,13 @@ private:
     }
 
     int install_headers_safe(const std::string& target_name) {
-        const std::vector<std::string> header_dirs = {"include", "inc", "headers"};
 
-        for (const auto& dir : header_dirs) {
+      for (const std::vector<std::string> header_dirs = {"include", "inc",
+                                                         "headers"};
+           const auto& dir : header_dirs) {
             if (!fs::exists(dir) || !fs::is_directory(dir)) continue;
 
             auto dest_dir = fs::path(options.prefix) / options.include_dir / target_name;
-
-            if (options.dry_run) {
-                out::info("Would install headers from '{}' to '{}'", dir, dest_dir);
-                return 0;
-            }
 
             if (!ensure_directory_exists(dest_dir)) {
                 return 1;
@@ -321,7 +318,7 @@ private:
                         // Ensure parent directory exists
                         ensure_directory_exists(dest_file.parent_path());
 
-                        if (!copy_file_with_permissions(entry.path(), dest_file, 0644)) {
+                        if (!copy_file_with_permissions(entry.path(), dest_file, fs::perms::group_read)) {
                             out::warn("Failed to copy header '{}'", entry.path());
                             continue;
                         }
@@ -342,7 +339,7 @@ private:
         return 0;
     }
 
-    bool ensure_directory_exists(const fs::path& dir) {
+    static bool ensure_directory_exists(const fs::path& dir) {
         if (fs::exists(dir)) return true;
 
         try {
@@ -354,10 +351,11 @@ private:
         }
     }
 
-    bool copy_file_with_permissions(const fs::path& src, const fs::path& dest, int mode) {
+    static bool copy_file_with_permissions(const fs::path& src, const fs::path& dest,
+                                           const fs::perms perms) {
         try {
             fs::copy_file(src, dest, fs::copy_options::overwrite_existing);
-            fs::permissions(dest, static_cast<fs::perms>(mode));
+            fs::permissions(dest, perms);
             return true;
         } catch (const std::exception& e) {
             out::error("Failed to copy '{}' to '{}': {}", src, dest, e.what());
@@ -365,15 +363,15 @@ private:
         }
     }
 
-    bool verify_executable_installation(const fs::path& exe_path) {
+    static bool verify_executable_installation(const fs::path& exe_path) {
         // Basic verification that the executable is functional
         if (!fs::exists(exe_path)) {
             out::error("Installation verification failed: '{}' does not exist", exe_path);
             return false;
         }
 
-        auto perms = fs::status(exe_path).permissions();
-        if ((perms & fs::perms::owner_exec) == fs::perms::none) {
+        if (const auto perms = fs::status(exe_path).permissions();
+            (perms & fs::perms::owner_exec) == fs::perms::none) {
             out::error("Installation verification failed: '{}' is not executable", exe_path);
             return false;
         }
@@ -381,15 +379,15 @@ private:
         return true;
     }
 
-    void handle_library_cache(const fs::path& lib_path) {
+    void handle_library_cache(const fs::path& lib_path) const {
         // Only run ldconfig if we're installing to system directories
         if (options.system_install && Execution::isCommandExecutable("ldconfig")) {
             // Check if library is in a standard path that ldconfig will find
-            std::string lib_dir = lib_path.parent_path();
-            if (lib_dir.find("/usr/local/lib") != std::string::npos ||
+          if (const std::string lib_dir = lib_path.parent_path();
+              lib_dir.find("/usr/local/lib") != std::string::npos ||
                 lib_dir.find("/usr/lib") != std::string::npos) {
 
-                if (auto result = Execution::execute("ldconfig"); result.exit_code == 0) {
+                if (const auto result = Execution::execute("ldconfig"); result.exit_code == 0) {
                     out::info("Updated system library cache");
                 } else {
                     out::warn("Failed to update library cache, you may need to run 'ldconfig' manually");
@@ -398,12 +396,12 @@ private:
         }
     }
 
-    void post_install_tasks(const Target& target) {
+    void post_install_tasks(const Target& target) const {
         if (options.dry_run) return;
 
         // Create symbolic links if requested
         if (options.create_symlinks && target.type == "Executable") {
-            create_symlinks(target);
+            create_symlinks();
         }
 
         // Update PATH suggestion for user installations
@@ -412,18 +410,18 @@ private:
         }
     }
 
-    void create_symlinks(const Target& target) {
+    static void create_symlinks() {
         // Create common symlinks (e.g., versioned names)
         // This is target-specific logic that could be expanded
     }
 
-    void suggest_path_update() {
+    void suggest_path_update() const {
         auto bin_dir = fs::path(options.prefix) / options.bin_dir;
         out::info("Add '{}' to your PATH to use installed executables:", bin_dir);
         out::info("  echo 'export PATH=\"{}:$PATH\"' >> ~/.bashrc", bin_dir);
     }
 
-    void rollback_installation() {
+    void rollback_installation() const {
         out::info("Rolling back installation...");
 
         for (const auto& file : installed_files) {
@@ -455,7 +453,7 @@ private:
         }
     }
 
-    void cleanup_backups() {
+    void cleanup_backups() const {
         for (const auto& backup : backup_files) {
             try {
                 if (fs::exists(backup)) {
@@ -467,8 +465,8 @@ private:
         }
     }
 
-    std::string get_user_prefix() {
-        if (auto home = std::getenv("HOME")) {
+    static std::string get_user_prefix() {
+        if (const auto home = std::getenv("HOME")) {
             return std::string(home) + "/.local";
         }
         return "/tmp/autocc_install"; // Fallback

@@ -1253,8 +1253,8 @@ public:
         return dep_map;
     }
 
-    std::vector<std::string> getAllProjectIncludes(const std::vector<fs::path> &sourceFiles,
-                                             const std::unordered_set<std::string> &ignored_dirs) const {
+    static std::vector<std::string> getAllProjectIncludes(const std::vector<fs::path> &sourceFiles,
+                                             const std::unordered_set<std::string> &ignored_dirs) {
 
     #ifdef AGGRESSIVE
         out::warn("THIS BUILD OF AUTOCC HAVE 'AGGRESSIVE' OPTION ENABLED.");
@@ -1340,7 +1340,7 @@ public:
             std::advance(chunk_end, std::min(chunk_size, static_cast<size_t>(std::distance(chunk_start, file_cache.end()))));
             cache_iter = chunk_end;
 
-            futures.push_back(std::async(std::launch::async, [chunk_start, chunk_end, this] {
+            futures.push_back(std::async(std::launch::async, [chunk_start, chunk_end] {
                 std::unordered_set<std::string> local_includes;
                 for (auto it = chunk_start; it != chunk_end; ++it) {
                     const auto& content = it->second;
@@ -1526,7 +1526,7 @@ public:
 
     void detectLibraries() {
         const auto ignored_dirs = getIgnoredDirs();
-        const auto all_includes = include_parser.getAllProjectIncludes(source_files, ignored_dirs);
+        const auto all_includes = IncludeParser::getAllProjectIncludes(source_files, ignored_dirs);
 
         #ifdef AGGRESSIVE
         // PARALLEL TARGET PROCESSING
@@ -3079,7 +3079,7 @@ void CLIHandler::register_commands() {
     commands_["wipe"] = {"Remove all autocc files (build dir, cache, db)",
         [this](const auto& args) { return handle_wipe(args); }, {}};
     commands_["install"] = {"Install the default target to the system",
-        [this](const auto& args) { return handle_install(args); }, {}};
+        [](const auto& args) { return handle_install(args); }, {}};
     #ifdef USE_TUI
     commands_["edit"] = {"Edit target source files interactively",
         [this](const auto& args) { return handle_edit(args); }, {"select"}};
@@ -3342,6 +3342,8 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
     Config config;
     if (!Validation::validateVersion()) {
         out::warn("Your config file might not be up-to-date with current autocc version.");
+        out::info("Please regenerate your config with 'autocc autoconfig' or update autocc.");
+        return 1;
     }
 
     if (!AutoCC::read_config_cache_static(config)) {
@@ -3359,8 +3361,13 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
             options.dry_run = true;
         } else if (args[i] == "--force") {
             options.force = true;
-        } else if (args[i] == "--user") {
-            options.system_install = false;
+        } else if (args[i].starts_with("--prefix=")) {
+            std::string prefix_value = args[i].substr(9);
+            if (prefix_value.empty()) {
+                out::error("--prefix requires a value. Usage: --prefix=/path/to/install");
+                return 1;
+            }
+            options.prefix = prefix_value;
         } else if (args[i].starts_with("--prefix=")) {
             options.prefix = args[i].substr(9);
         } else if (target_name.empty()) {
