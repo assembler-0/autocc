@@ -460,7 +460,7 @@ public:
 
 class Configuration {
 public:
-    static void WrtiteConfigurationTOML(const Config& config, const fs::path& toml_path) {
+    static void WriteConfigurationTOML(const Config& config, const fs::path& toml_path) {
         auto includes_arr = toml::array{};
         for (const auto& dir : config.include_dirs) {
             includes_arr.push_back(dir);
@@ -3216,7 +3216,7 @@ int CLIHandler::handle_autoconfig(const std::vector<std::string>& args) const {
 
     // Auto-detection runs here to populate includes and libraries before writing the TOML
     const auto scanner = AutoCC(std::move(config), true);
-    Configuration::WrtiteConfigurationTOML(scanner.config, config_toml_path_);
+    Configuration::WriteConfigurationTOML(scanner.config, config_toml_path_);
     out::info("Run 'autocc setup' to prepare for building.");
     return 0;
 }
@@ -3278,7 +3278,7 @@ int CLIHandler::handle_edit(const std::vector<std::string>&) const {
     std::getline(std::cin, confirmation);
 
     if (confirmation == "y" || confirmation == "yes") {
-        Configuration::WrtiteConfigurationTOML(config, config_toml_path_);
+        Configuration::WriteConfigurationTOML(config, config_toml_path_);
         out::info("To apply changes, run 'autocc setup' to sync the new config to the cache.");
     } else {
         out::info("Operation cancelled. 'autocc.toml' was not modified.");
