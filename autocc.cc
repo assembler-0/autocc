@@ -37,7 +37,7 @@ using namespace ftxui;
 
 #define DATE __DATE__
 #define TIME __TIME__
-#define VERSION "0.1.6"
+#define VERSION "0.1.6-2"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -51,7 +51,6 @@ static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 static constexpr auto DB_FILE_NAME = "autocc.base.json";
 static constexpr auto AUTOINSTALL_SCRIPT_PATH = "scripts/autoinstall";
-static constexpr auto DEFAULT_INSTALL_PATH = "/usr/local/bin";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
 static constexpr auto PROJECT_ROOT = ".";
 static constexpr auto AUTOCC_LOG_FILE_NAME = "autocc.log";
@@ -177,15 +176,7 @@ public:
                     continue;
                 }
 
-                bool is_in_ignored_dir = false;
-                for (const auto& part : path) {
-                    if (ignored_dirs.contains(part.string())) {
-                        is_in_ignored_dir = true;
-                        break;
-                    }
-                }
-
-                if (is_in_ignored_dir) {
+                if (isInIgnoredDirectory(path, ignored_dirs)) {
                     continue;
                 }
 
@@ -1345,8 +1336,6 @@ public:
                 size_t idx;
                 while ((idx = file_index.fetch_add(1)) < files_to_scan.size()) {
                     const auto& file_path = files_to_scan[idx];
-
-                    // Use your MemoryMappedFile class here
                     try {
                         MemoryMappedFile mmf(file_path);
                         std::string content(mmf.content());
@@ -1611,60 +1600,179 @@ public:
     }
 
 
-    std::string generatePCH(const fs::path& build_path, const std::string& cxxflags) {
-        out::info("Analyzing for Pre-Compiled Header generation...");
+    std::string generatePCH(const fs::path &build_path, const std::string &target_cxxflags) {
+    out::info("Analyzing for Pre-Compiled Header generation...");
+
+    #ifdef AGGRESSIVE
+        // PHASE 1: Parallel include analysis using memory-mapped files
+        std::unordered_map<std::string, std::atomic<int>> include_counts;
+        std::atomic cpp_file_count{0};
+
+        const size_t num_threads = std::min(target_source_files.size(),
+                                           static_cast<size_t>(std::thread::hardware_concurrency()));
+
+        if (num_threads > 1 && target_source_files.size() > 4) {
+            // Parallel processing
+            std::vector<std::thread> workers;
+            std::atomic<size_t> file_index{0};
+            std::mutex counts_mutex;
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                workers.emplace_back([&] {
+                    std::unordered_map<std::string, int> local_counts;
+                    int local_cpp_count = 0;
+                    size_t idx;
+
+                    while ((idx = file_index.fetch_add(1)) < target_source_files.size()) {
+                        const auto& src = target_source_files[idx];
+                        if (getCompiler(src) != config.cxx) continue;
+
+                        local_cpp_count++;
+
+                        // Use memory-mapped file for speed
+                        MemoryMappedFile mmf(src);
+                        if (!mmf.is_valid()) continue;
+
+                        auto content = mmf.content();
+
+                        // Fast regex-free parsing
+                        size_t pos = 0;
+                        while ((pos = content.find("#include <", pos)) != std::string_view::npos) {
+                            pos += 10; // Skip "#include <"
+                            const size_t end = content.find('>', pos);
+                            if (end != std::string_view::npos) {
+                                std::string header(content.substr(pos, end - pos));
+                                local_counts[header]++;
+                            }
+                            pos = end;
+                        }
+                    }
+
+                    // Merge local results
+                    std::lock_guard lock(counts_mutex);
+                    cpp_file_count += local_cpp_count;
+                    for (const auto& [header, count] : local_counts) {
+                        include_counts[header] += count;
+                    }
+                });
+            }
+
+            for (auto& worker : workers) {
+                worker.join();
+            }
+        } else {
+            // Sequential fallback
+            for (const auto& src : target_source_files) {
+                if (getCompiler(src) != config.cxx) continue;
+                ++cpp_file_count;
+
+                MemoryMappedFile mmf(src);
+                if (!mmf.is_valid()) continue;
+
+                auto content = mmf.content();
+                size_t pos = 0;
+                while ((pos = content.find("#include <", pos)) != std::string_view::npos) {
+                    pos += 10;
+                    size_t end = content.find('>', pos);
+                    if (end != std::string_view::npos) {
+                        std::string header(content.substr(pos, end - pos));
+                        ++include_counts[header];
+                    }
+                    pos = end;
+                }
+            }
+        }
+
+    #else
+        // Original regex-based version (slower)
         std::unordered_map<std::string, int> include_counts;
         int cpp_file_count = 0;
+
         for (const auto& src : target_source_files) {
             if (getCompiler(src) != config.cxx) continue;
             cpp_file_count++;
+
             std::ifstream stream(src);
-            if (!stream.is_open()) {
-                out::warn("Could not open source file for PCH analysis: {}", src);
-                continue;
-            }
+            if (!stream.is_open()) continue;
+
             std::string line;
-            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_" );
-            while(std::getline(stream, line)) {
-                if(std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
+            std::regex pch_candidate_regex(R"_(\s*#\s*include\s*<([^>]+)>)_");
+            while (std::getline(stream, line)) {
+                if (std::smatch matches; std::regex_search(line, matches, pch_candidate_regex)) {
                     include_counts[matches[1].str()]++;
                 }
             }
         }
+    #endif
+
         if (cpp_file_count < 3) {
             out::info("PCH skipped: Not enough C++ source files.");
             return "";
         }
+
+        // PHASE 2: Smart header selection
         std::vector<std::string> pch_headers;
-        for(const auto& [header, count] : include_counts) {
-            if (count > cpp_file_count / 2) {
-                pch_headers.push_back(header);
+        pch_headers.reserve(include_counts.size());
+
+        const int threshold = std::max(2, cpp_file_count / 3); // More aggressive threshold
+
+        // Sort by frequency for better PCH effectiveness
+        std::vector<std::pair<std::string, int>> sorted_headers;
+        sorted_headers.reserve(include_counts.size());
+
+        for (const auto& [header, count] : include_counts) {
+            if (count >= threshold) {
+                sorted_headers.emplace_back(header, count);
             }
         }
-        if (pch_headers.empty()) {
-             out::info("PCH skipped: No sufficiently common headers found.");
-             return "";
+
+        std::ranges::sort(sorted_headers, [](const auto& a, const auto& b) {
+            return a.second > b.second; // Sort by frequency (descending)
+        });
+
+        // Take top headers (limit to avoid bloat)
+        const size_t max_headers = std::min(sorted_headers.size(), size_t{50});
+        for (size_t i = 0; i < max_headers; ++i) {
+            pch_headers.push_back(sorted_headers[i].first);
         }
+
+        if (pch_headers.empty()) {
+            out::info("PCH skipped: No sufficiently common headers found.");
+            return "";
+        }
+
+        // PHASE 3: Generate and compile PCH
         fs::path pch_source = build_path / PCH_HEADER_NAME;
         fs::path pch_out = pch_source.string() + ".gch";
-        out::info("Generating PCH from headers: {}", fmt::join(pch_headers, ", "));
+
+
+        // Fast file writing
         std::ofstream pch_file(pch_source);
         if (!pch_file.is_open()) {
             out::error("Failed to create PCH source file: {}", pch_source);
             return "";
         }
-        for(const auto& header : pch_headers) pch_file << "#include <" << header << ">\n";
+
+        // Write headers in frequency order for better compilation
+        for (const auto& header : pch_headers) {
+            pch_file << "#include <" << header << ">\n";
+        }
         pch_file.close();
+
+        // Compile with all the right flags
         const std::string pch_compile_cmd = fmt::format("{} -x c++-header -fPIC {} -o {} {} {}",
-            config.cxx, pch_source, pch_out, cxxflags,
+            config.cxx, pch_source, pch_out, target_cxxflags,
             fmt::join(config.include_dirs | std::views::transform([](const std::string& d){ return "-I" + d; }), " "));
+
         #ifdef VERBOSE
         out::command("{}", pch_compile_cmd);
         #endif
+
         if (auto [exit_code, stdout_output, stderr_output] = Execution::execute(pch_compile_cmd); exit_code != 0) {
             out::warn("PCH generation failed. Continuing without it.\n   Compiler error: {}", stderr_output);
             return "";
         }
+
         if (!fs::exists(pch_out)) {
             out::warn("PCH compilation appeared successful but output file missing: {}", pch_out);
             try {
@@ -1672,8 +1780,10 @@ public:
             } catch (...) {}
             return "";
         }
+
         return fmt::format("-include {}", pch_source.string());
     }
+
 
     std::string getCompiler(const fs::path& file) const {
         const std::string ext = file.extension().string();
@@ -1935,9 +2045,27 @@ public:
 
         return true;
     }
+
 private:
 
     static std::string hash_file(const fs::path& path) {
+    #ifdef AGGRESSIVE
+        // Use memory-mapped file for maximum speed
+        const MemoryMappedFile mmf(path);
+        if (mmf.is_valid() && !mmf.empty()) {
+            const auto content = mmf.content();
+            XXH64_hash_t hash_val = XXH64(content.data(), content.size(), 0);
+            return fmt::format("{:016x}", hash_val);
+        }
+
+        // Fallback for invalid/empty files
+        if (mmf.is_valid() && mmf.empty()) {
+            return "ef46db3751d8e999"; // XXH64 of empty data
+        }
+
+    #endif
+
+        // Original fallback implementation
         const int fd = open(path.c_str(), O_RDONLY);
         if (fd == -1) return "";
 
@@ -1949,7 +2077,7 @@ private:
 
         if (sb.st_size == 0) {
             close(fd);
-            return "ef46db3751d8e999"; // XXH64 of empty data
+            return "ef46db3751d8e999";
         }
 
         void* mapped = mmap(nullptr, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -1957,6 +2085,9 @@ private:
             close(fd);
             return "";
         }
+
+        // Hint for sequential access
+        madvise(mapped, sb.st_size, MADV_SEQUENTIAL);
 
         XXH64_hash_t hash_val = XXH64(mapped, sb.st_size, 0);
 
@@ -2188,7 +2319,7 @@ private:
         if (files_to_compile.empty()) {
             out::success("All {} files are up to date.", files_to_build.size());
         } else {
-            out::info("Compiling {}/{} source files...", files_to_compile.size(), files_to_build.size());
+            out::info("Compiling source files...", files_to_compile.size(), files_to_build.size());
             std::atomic compilation_failed = false;
             std::atomic<size_t> file_index = 0;
             const unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
@@ -2956,7 +3087,10 @@ private:
     static int handle_version(const std::vector<std::string>& args);
     static int handle_clean(const std::vector<std::string>& args);
     static int handle_install(const std::vector<std::string>& args);
-
+    static void install_headers(const std::string& include_dir, const std::string& target_name);
+    static int install_executable(const fs::path& target_path, const std::string& target_name);
+    static int install_static_library(const fs::path& target_path, const std::string& target_name);
+    static int install_dynamic_library(const fs::path& target_path, const std::string& target_name);
     bool is_project_setup() const;
     bool sync_config_if_needed() const;
     int do_setup() const;
@@ -3015,7 +3149,6 @@ CLIHandler::CommandResult CLIHandler::handle_command(const int argc, char* argv[
     // Default to build command (no args or unknown target name)
     return {handle_build(args), true};
 }
-
 
 bool CLIHandler::is_project_setup() const {
     return fs::exists(cache_dir_ / CONFIG_CACHE_FILE_NAME);
@@ -3221,9 +3354,7 @@ int CLIHandler::handle_clean(const std::vector<std::string>&) {
 
 int CLIHandler::handle_wipe(const std::vector<std::string>&) const {
     Config temp_cfg;
-    if (AutoCC::read_config_cache_static(temp_cfg)) {
-        // do nothing
-    } else {
+    if (!AutoCC::read_config_cache_static(temp_cfg)) {
         out::error("Cache not found, cannot determine build directory. Nothing to clean.");
         return 1;
     }
@@ -3255,69 +3386,153 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
         return 1;
     }
 
-    // Determine which target to install
-    std::string target_name;
-    if (args.size() > 2) {
-        target_name = args[2];
-    } else {
-        target_name = config.default_target;
-        out::info("Using default target {}", target_name);
-        if (target_name.empty()) {
-            out::error("No default target is set. Cannot run install.");
-            return 1;
-        }
-    }
-
-    // Validate target exists
-    if (!target_name.empty() && !config.targets.empty()) {
-        const auto target_it = std::ranges::find_if(config.targets,
-                                            [&](const Target& t) { return t.name == target_name; });
-        if (target_it == config.targets.end()) {
-            out::error("Target '{}' not found. Available targets: {}",
-                      target_name,
-                      fmt::join(config.targets | std::views::transform([](const Target& t) { return t.name; }), ", "));
-            return 1;
-        }
-    }
-
-    // Build a path to executable
-    const std::string build_path_str = config.build_dir;
-    if (build_path_str.empty()) {
-        out::error("Build directory is not configured.");
+    // Determine target
+    std::string target_name = args.size() > 2 ? args[2] : config.default_target;
+    if (target_name.empty()) {
+        out::error("No default target is set. Cannot run install.");
         return 1;
     }
 
-    const fs::path target_executable = fs::path(build_path_str) / target_name;
-    if (!fs::exists(target_executable)) {
-        out::error("Target executable '{}' not found. Please build it first by running 'autocc {}'.", target_executable, target_name);
+    // Find target
+    const auto target_it = std::ranges::find_if(config.targets,
+        [&](const Target& t) { return t.name == target_name; });
+
+    if (target_it == config.targets.end()) {
+        out::error("Target '{}' not found. Available targets: {}",
+                  target_name,
+                  fmt::join(config.targets | std::views::transform([](const Target& t) { return t.name; }), ", "));
         return 1;
     }
 
-    // Execute installation
+    const auto& target = *target_it;
+    const fs::path target_path = fs::path(config.build_dir) / target.output_name;
+
+    if (!fs::exists(target_path)) {
+        out::error("Target '{}' not found at '{}'. Please build it first with 'autocc {}'.",
+                  target_name, target_path, target_name);
+        return 1;
+    }
+
+    // Handle different target types
+    if (target.type == "Executable")
+        return install_executable(target_path, target_name);
+    if (target.type == "DLibrary")
+        return install_dynamic_library(target_path, target_name);
+    if (target.type == "SLibrary")
+        return install_static_library(target_path, target_name);
+    out::error("Unknown target type: {}", target.type);
+    return 1;
+}
+
+int CLIHandler::install_executable(const fs::path& target_path, const std::string& target_name) {
+    const std::string install_dir = "/usr/local/bin";
+
     std::string cmd;
     if (fs::exists(AUTOINSTALL_SCRIPT_PATH)) {
-        out::info("Using local autoinstall script.");
-        cmd = fmt::format("./{} {}", AUTOINSTALL_SCRIPT_PATH, target_executable.string());
-    } else if (Execution::isCommandExecutable("dvk")) {
-        out::info("Using 'dvk' from system PATH");
-        cmd = fmt::format("dvk install {}", target_executable.string());
-    } else if (Execution::isCommandExecutable("autoinstall")) {
-        out::info("Using 'autoinstall' from system PATH.");
-        cmd = fmt::format("autoinstall {} --auto", target_executable.string());
+        cmd = fmt::format("./{} {}", AUTOINSTALL_SCRIPT_PATH, target_path.string());
+    } else if (Execution::isCommandExecutable("install")) {
+        cmd = fmt::format("install -m 755 {} {}/{}", target_path, install_dir, target_name);
     } else {
-        out::info("No 'autoinstall' script found, falling back to 'cp'.");
-        cmd = fmt::format("cp -f {} {}", target_executable.string(), DEFAULT_INSTALL_PATH);
+        cmd = fmt::format("cp -f {} {}/{} && chmod +x {}/{}",
+                        target_path, install_dir, target_name, install_dir, target_name);
     }
 
-    if (const ::CommandResult res = Execution::execute(cmd); res.exit_code != 0) {
-        out::error("Failed to install target '{}'. Exit code: {}.", target_name, res.exit_code);
-        if(!res.stderr_output.empty()) out::error("Stderr: {}", res.stderr_output);
+    if (const auto res = Execution::execute(cmd); res.exit_code != 0) {
+        out::error("Failed to install executable '{}'. Exit code: {}", target_name, res.exit_code);
+        if (!res.stderr_output.empty()) out::error("Error: {}", res.stderr_output);
         return 1;
     }
 
-    out::success("Installed target '{}' successfully.", target_name);
+    out::success("Installed executable '{}' to {}/{}", target_name, install_dir, target_name);
     return 0;
 }
+
+int CLIHandler::install_dynamic_library(const fs::path& target_path, const std::string& target_name) {
+    const std::string lib_dir = "/usr/local/lib";
+    const std::string include_dir = "/usr/local/include";
+
+    // Install the .so file
+    std::string install_lib_cmd;
+    if (Execution::isCommandExecutable("install")) {
+        install_lib_cmd = fmt::format("install -m 644 {} {}/", target_path, lib_dir);
+    } else {
+        install_lib_cmd = fmt::format("cp -f {} {}/", target_path, lib_dir);
+    }
+
+    if (const auto res = Execution::execute(install_lib_cmd); res.exit_code != 0) {
+        out::error("Failed to install dynamic library '{}'. Exit code: {}", target_name, res.exit_code);
+        return 1;
+    }
+
+    // Install headers if they exist
+    install_headers(include_dir, target_name);
+
+    if (Execution::isCommandExecutable("ldconfig")) {
+        if (const auto res = Execution::execute("ldconfig"); res.exit_code != 0) {
+            out::error("Failed to run 'ldconfig'");
+            return 1;
+        }
+        out::info("Updated library cache with ldconfig");
+    }
+
+    out::success("Installed dynamic library '{}' to {}", target_name, lib_dir);
+    return 0;
+}
+
+int CLIHandler::install_static_library(const fs::path& target_path, const std::string& target_name) {
+    const std::string lib_dir = "/usr/local/lib";
+    const std::string include_dir = "/usr/local/include";
+
+    // Install the .a file
+    std::string install_lib_cmd;
+    if (Execution::isCommandExecutable("install")) {
+        install_lib_cmd = fmt::format("install -m 644 {} {}/", target_path, lib_dir);
+    } else {
+        install_lib_cmd = fmt::format("cp -f {} {}/", target_path, lib_dir);
+    }
+
+    if (const auto res = Execution::execute(install_lib_cmd); res.exit_code != 0) {
+        out::error("Failed to install static library '{}'. Exit code: {}", target_name, res.exit_code);
+        return 1;
+    }
+
+    // Install headers
+    install_headers(include_dir, target_name);
+
+    out::success("Installed static library '{}' to {}", target_name, lib_dir);
+    return 0;
+}
+
+void CLIHandler::install_headers(const std::string& include_dir, const std::string& target_name) {
+    // Look for common header directories
+    for (const std::vector<std::string> header_dirs = {"include", "inc", "headers"}; const auto& dir : header_dirs) {
+        if (fs::exists(dir) && fs::is_directory(dir)) {
+            std::string target_include_dir = fmt::format("{}/{}", include_dir, target_name);
+
+            // Create target include directory
+            std::string mkdir_cmd = fmt::format("mkdir -p {}", target_include_dir);
+            if (const auto res = Execution::execute(mkdir_cmd); res.exit_code != 0) {
+                out::error("Failed to create directory '{}'. Exit code: {}", target_include_dir, res.exit_code);
+                return;
+            }
+            // Copy headers
+            std::string copy_cmd;
+            if (Execution::isCommandExecutable("rsync")) {
+                copy_cmd = fmt::format("rsync -av {}/ {}/", dir, target_include_dir);
+            } else {
+                copy_cmd = fmt::format("cp -r {}/* {}/", dir, target_include_dir);
+            }
+
+            if (const auto res = Execution::execute(copy_cmd); res.exit_code == 0) {
+                out::info("Installed headers from '{}' to '{}'", dir, target_include_dir);
+                return; // Only install from first found directory
+            }
+        }
+    }
+
+    out::warn("No header directory found. Consider creating an 'include/' directory for your headers.");
+}
+
 
 int main(const int argc, char* argv[]) {
     const CLIHandler cli;

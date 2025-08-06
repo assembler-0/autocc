@@ -496,23 +496,110 @@ public:
 };
 
 class MemoryMappedFile {
-    void* data;
-    size_t size;
+
 public:
-    explicit MemoryMappedFile(const fs::path& path) {
-        const int fd = open(path.c_str(), O_RDONLY);
-        struct stat sb;
-        fstat(fd, &sb);
-        size = sb.st_size;
-        data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
+    explicit MemoryMappedFile(const fs::path& path) noexcept {
+        try {
+            fd = open(path.c_str(), O_RDONLY);
+            if (fd == -1) {
+                return; // Invalid file, valid = false
+            }
+
+            struct stat sb{};
+            if (fstat(fd, &sb) == -1) {
+                close(fd);
+                fd = -1;
+                return;
+            }
+
+            size = static_cast<size_t>(sb.st_size);
+
+            // Handle empty files
+            if (size == 0) {
+                close(fd);
+                fd = -1;
+                valid = true; // Empty file is valid
+                return;
+            }
+
+            data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (data == MAP_FAILED) {
+                data = nullptr;
+                close(fd);
+                fd = -1;
+                return;
+            }
+
+            // Advise kernel about access pattern
+            madvise(data, size, MADV_SEQUENTIAL);
+
+            valid = true;
+        } catch (...) {
+            cleanup();
+        }
     }
 
-    std::string_view content() const {
-        return {static_cast<char*>(data), size};
+    // Non-copyable, movable
+    MemoryMappedFile(const MemoryMappedFile&) = delete;
+    MemoryMappedFile& operator=(const MemoryMappedFile&) = delete;
+
+    MemoryMappedFile(MemoryMappedFile&& other) noexcept
+        : data(other.data), size(other.size), fd(other.fd), valid(other.valid) {
+        other.data = nullptr;
+        other.size = 0;
+        other.fd = -1;
+        other.valid = false;
     }
 
-    ~MemoryMappedFile() { munmap(data, size); }
+    MemoryMappedFile& operator=(MemoryMappedFile&& other) noexcept {
+        if (this != &other) {
+            cleanup();
+            data = other.data;
+            size = other.size;
+            fd = other.fd;
+            valid = other.valid;
+
+            other.data = nullptr;
+            other.size = 0;
+            other.fd = -1;
+            other.valid = false;
+        }
+        return *this;
+    }
+
+    ~MemoryMappedFile() {
+        cleanup();
+    }
+
+    [[nodiscard]] bool is_valid() const noexcept { return valid; }
+    [[nodiscard]] bool empty() const noexcept { return size == 0; }
+    [[nodiscard]] size_t file_size() const noexcept { return size; }
+
+    [[nodiscard]] std::string_view content() const noexcept {
+        if (!valid || !data || size == 0) {
+            return {};
+        }
+        return {static_cast<const char*>(data), size};
+    }
+
+private:
+    void* data = nullptr;
+    size_t size = 0;
+    int fd = -1;
+    bool valid = false;
+
+    void cleanup() noexcept {
+        if (data && data != MAP_FAILED) {
+            munmap(data, size);
+        }
+        if (fd != -1) {
+            close(fd);
+        }
+        data = nullptr;
+        size = 0;
+        fd = -1;
+        valid = false;
+    }
 };
 
 
