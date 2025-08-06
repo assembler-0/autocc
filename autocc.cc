@@ -27,6 +27,8 @@
 #include "utils.hpp"
 #include "json.hpp"
 #include "httplib.h"
+#include "structs.hpp"
+#include "SafeInstall.hpp"
 
 #ifdef USE_TUI
 #include <ftxui/component/component.hpp>
@@ -50,7 +52,6 @@ static constexpr auto CONFIG_FILE_NAME = "autocc.toml";
 static constexpr auto DEP_CACHE_FILE_NAME = "deps.cache";
 static constexpr auto PCH_HEADER_NAME = "autocc_pch.hpp";
 static constexpr auto DB_FILE_NAME = "autocc.base.json";
-static constexpr auto AUTOINSTALL_SCRIPT_PATH = "scripts/autoinstall";
 static constexpr auto BASE_DB_URL = "https://raw.githubusercontent.com/assembler-0/autocc/refs/heads/main/autocc.base.json";
 static constexpr auto PROJECT_ROOT = ".";
 static constexpr auto AUTOCC_LOG_FILE_NAME = "autocc.log";
@@ -64,41 +65,6 @@ static const std::unordered_set<std::string_view> HEADER_EXTENSIONS{".h", ".hpp"
 std::ofstream g_log_file(AUTOCC_LOG_FILE_NAME);
 #endif
 std::mutex g_output_mutex;
-
-template <>
-struct fmt::formatter<fs::path> : formatter<std::string_view> {
-    auto format(const fs::path& p, format_context& ctx) const{
-        return formatter<std::string_view>::format(p.string(), ctx);
-    }
-};
-
-struct Target {
-    std::string type = "Executable";
-    std::string name;
-    std::string main_file;
-    std::vector<std::string> sources;
-    std::string output_name;
-    std::vector<std::string> exclude_patterns;
-    std::optional<std::string> cflags = "-std=c11";
-    std::optional<std::string> cxxflags = "-std=c++20";
-    std::optional<std::string> ldflags;
-    std::vector<std::string> external_libs; // Per-target external libraries
-};
-
-struct Config {
-    std::string cc = "clang";
-    std::string cxx = "clang++";
-    std::string as = "nasm";
-    std::string launcher;
-    std::string ar = "ar";
-    std::string shared = "clang++";
-    std::string build_dir = ".autocc_build";
-    bool use_pch = true;
-    std::vector<std::string> include_dirs;
-    std::vector<std::string> exclude_patterns;
-    std::vector<Target> targets;
-    std::string default_target;
-};
 
 class Validation {
 public:
@@ -3087,10 +3053,6 @@ private:
     static int handle_version(const std::vector<std::string>& args);
     static int handle_clean(const std::vector<std::string>& args);
     static int handle_install(const std::vector<std::string>& args);
-    static void install_headers(const std::string& include_dir, const std::string& target_name);
-    static int install_executable(const fs::path& target_path, const std::string& target_name);
-    static int install_static_library(const fs::path& target_path, const std::string& target_name);
-    static int install_dynamic_library(const fs::path& target_path, const std::string& target_name);
     bool is_project_setup() const;
     bool sync_config_if_needed() const;
     int do_setup() const;
@@ -3381,13 +3343,36 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
     if (!Validation::validateVersion()) {
         out::warn("Your config file might not be up-to-date with current autocc version.");
     }
+
     if (!AutoCC::read_config_cache_static(config)) {
         out::error("Project cache not found. Please run 'autocc setup' first.");
         return 1;
     }
 
+    // Parse installation options from command line
+    InstallOptions options;
+    std::string target_name;
+
+    // Simple argument parsing (could be enhanced with a proper CLI library)
+    for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--dry-run") {
+            options.dry_run = true;
+        } else if (args[i] == "--force") {
+            options.force = true;
+        } else if (args[i] == "--user") {
+            options.system_install = false;
+        } else if (args[i].starts_with("--prefix=")) {
+            options.prefix = args[i].substr(9);
+        } else if (target_name.empty()) {
+            target_name = args[i];
+        }
+    }
+
     // Determine target
-    std::string target_name = args.size() > 2 ? args[2] : config.default_target;
+    if (target_name.empty()) {
+        target_name = config.default_target;
+    }
+
     if (target_name.empty()) {
         out::error("No default target is set. Cannot run install.");
         return 1;
@@ -3407,130 +3392,9 @@ int CLIHandler::handle_install(const std::vector<std::string>& args) {
     const auto& target = *target_it;
     const fs::path target_path = fs::path(config.build_dir) / target.output_name;
 
-    if (!fs::exists(target_path)) {
-        out::error("Target '{}' not found at '{}'. Please build it first with 'autocc {}'.",
-                  target_name, target_path, target_name);
-        return 1;
-    }
-
-    // Handle different target types
-    if (target.type == "Executable")
-        return install_executable(target_path, target_name);
-    if (target.type == "DLibrary")
-        return install_dynamic_library(target_path, target_name);
-    if (target.type == "SLibrary")
-        return install_static_library(target_path, target_name);
-    out::error("Unknown target type: {}", target.type);
-    return 1;
-}
-
-int CLIHandler::install_executable(const fs::path& target_path, const std::string& target_name) {
-    const std::string install_dir = "/usr/local/bin";
-
-    std::string cmd;
-    if (fs::exists(AUTOINSTALL_SCRIPT_PATH)) {
-        cmd = fmt::format("./{} {}", AUTOINSTALL_SCRIPT_PATH, target_path.string());
-    } else if (Execution::isCommandExecutable("install")) {
-        cmd = fmt::format("install -m 755 {} {}/{}", target_path, install_dir, target_name);
-    } else {
-        cmd = fmt::format("cp -f {} {}/{} && chmod +x {}/{}",
-                        target_path, install_dir, target_name, install_dir, target_name);
-    }
-
-    if (const auto res = Execution::execute(cmd); res.exit_code != 0) {
-        out::error("Failed to install executable '{}'. Exit code: {}", target_name, res.exit_code);
-        if (!res.stderr_output.empty()) out::error("Error: {}", res.stderr_output);
-        return 1;
-    }
-
-    out::success("Installed executable '{}' to {}/{}", target_name, install_dir, target_name);
-    return 0;
-}
-
-int CLIHandler::install_dynamic_library(const fs::path& target_path, const std::string& target_name) {
-    const std::string lib_dir = "/usr/local/lib";
-    const std::string include_dir = "/usr/local/include";
-
-    // Install the .so file
-    std::string install_lib_cmd;
-    if (Execution::isCommandExecutable("install")) {
-        install_lib_cmd = fmt::format("install -m 644 {} {}/", target_path, lib_dir);
-    } else {
-        install_lib_cmd = fmt::format("cp -f {} {}/", target_path, lib_dir);
-    }
-
-    if (const auto res = Execution::execute(install_lib_cmd); res.exit_code != 0) {
-        out::error("Failed to install dynamic library '{}'. Exit code: {}", target_name, res.exit_code);
-        return 1;
-    }
-
-    // Install headers if they exist
-    install_headers(include_dir, target_name);
-
-    if (Execution::isCommandExecutable("ldconfig")) {
-        if (const auto res = Execution::execute("ldconfig"); res.exit_code != 0) {
-            out::error("Failed to run 'ldconfig'");
-            return 1;
-        }
-        out::info("Updated library cache with ldconfig");
-    }
-
-    out::success("Installed dynamic library '{}' to {}", target_name, lib_dir);
-    return 0;
-}
-
-int CLIHandler::install_static_library(const fs::path& target_path, const std::string& target_name) {
-    const std::string lib_dir = "/usr/local/lib";
-    const std::string include_dir = "/usr/local/include";
-
-    // Install the .a file
-    std::string install_lib_cmd;
-    if (Execution::isCommandExecutable("install")) {
-        install_lib_cmd = fmt::format("install -m 644 {} {}/", target_path, lib_dir);
-    } else {
-        install_lib_cmd = fmt::format("cp -f {} {}/", target_path, lib_dir);
-    }
-
-    if (const auto res = Execution::execute(install_lib_cmd); res.exit_code != 0) {
-        out::error("Failed to install static library '{}'. Exit code: {}", target_name, res.exit_code);
-        return 1;
-    }
-
-    // Install headers
-    install_headers(include_dir, target_name);
-
-    out::success("Installed static library '{}' to {}", target_name, lib_dir);
-    return 0;
-}
-
-void CLIHandler::install_headers(const std::string& include_dir, const std::string& target_name) {
-    // Look for common header directories
-    for (const std::vector<std::string> header_dirs = {"include", "inc", "headers"}; const auto& dir : header_dirs) {
-        if (fs::exists(dir) && fs::is_directory(dir)) {
-            std::string target_include_dir = fmt::format("{}/{}", include_dir, target_name);
-
-            // Create target include directory
-            std::string mkdir_cmd = fmt::format("mkdir -p {}", target_include_dir);
-            if (const auto res = Execution::execute(mkdir_cmd); res.exit_code != 0) {
-                out::error("Failed to create directory '{}'. Exit code: {}", target_include_dir, res.exit_code);
-                return;
-            }
-            // Copy headers
-            std::string copy_cmd;
-            if (Execution::isCommandExecutable("rsync")) {
-                copy_cmd = fmt::format("rsync -av {}/ {}/", dir, target_include_dir);
-            } else {
-                copy_cmd = fmt::format("cp -r {}/* {}/", dir, target_include_dir);
-            }
-
-            if (const auto res = Execution::execute(copy_cmd); res.exit_code == 0) {
-                out::info("Installed headers from '{}' to '{}'", dir, target_include_dir);
-                return; // Only install from first found directory
-            }
-        }
-    }
-
-    out::warn("No header directory found. Consider creating an 'include/' directory for your headers.");
+    // Use the safe installer
+    SafeInstaller installer(options);
+    return installer.install_target(target, target_path);
 }
 
 

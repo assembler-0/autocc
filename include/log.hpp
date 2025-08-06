@@ -7,7 +7,7 @@
 #include <chrono>
 #include <ctime>
 #include <sstream>
-
+#include <filesystem>
 // ====== CONFIGURATION: Compile-time flags ======
 // Define these in CMake or via compiler flags (-DLOG_DISABLE, etc.)
 
@@ -58,7 +58,13 @@
 #endif
 
 // ===============================================
-
+namespace fs = std::filesystem;
+template <>
+struct fmt::formatter<fs::path> : formatter<std::string_view> {
+    auto format(const fs::path& p, format_context& ctx) const{
+        return formatter<std::string_view>::format(p.string(), ctx);
+    }
+};
 // Forward declare file sink if enabled
 #ifdef LOG_ENABLE_FILE
 #include <fstream>
