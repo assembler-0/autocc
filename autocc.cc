@@ -1271,8 +1271,17 @@ public:
             if (entry.is_regular_file()) {
                 const auto ext = entry.path().extension().string();
                 if (HEADER_EXTENSIONS.contains(ext)) {
+                    // SKIP HUGE FILES
+                    if (std::error_code ec; entry.file_size(ec) > 70'000) continue; // Skip files > 70KB
+                    if (const std::string filename = entry.path().filename().string();
+                        filename.ends_with("_generated.h") ||
+                        filename.ends_with(".pb.h") ||        // Protobuf
+                        filename.starts_with("moc_") ||       // Qt MOC
+                        filename.contains("_autogen")) {
+                        continue;
+                    }
+
                     if (std::error_code ec; entry.file_size(ec) > 10'000) {
-                        // Your brilliant content peek optimization
                         std::ifstream peek(entry.path());
                         std::string first_chunk(1000, '\0');
                         peek.read(first_chunk.data(), 1000);
