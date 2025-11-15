@@ -2904,7 +2904,7 @@ public:
 
         out::info("Discovering potential build targets...");
         const auto ignored_dirs = std::unordered_set<std::string> {".git", config.build_dir, CACHE_DIR_NAME};
-        auto all_sources = FindSources(".", ignored_dirs, config.exclude_patterns);
+        auto all_sources = TargetDiscovery::FindSources(".", ignored_dirs, config.exclude_patterns);
         auto discovered = TargetDiscovery::DiscoverPotentialTargets(all_sources);
 
         if (discovered.empty()) {
